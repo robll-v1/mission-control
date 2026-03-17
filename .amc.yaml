@@ -1,0 +1,28 @@
+repo:
+  path: .
+  base_branch: main
+
+backend:
+  default: opencode
+  opencode:
+    model: ''
+    variant: ''
+
+context:
+  include_recent_commits: 8
+  candidate_files_limit: 12
+
+execution:
+  idle_timeout_sec: 180
+
+validation:
+  default_mode: standard
+  checks:
+    build:
+      command: ''
+      required: false
+      modes: ['standard', 'full']
+    test:
+      command: ''
+      required: false
+      modes: ['standard', 'full']

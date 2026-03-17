@@ -1,0 +1,35 @@
+Metadata-Version: 2.4
+Name: agent-mission-control
+Version: 0.1.0
+Summary: Local-first mission console for AI coding agents
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.116.0
+Requires-Dist: uvicorn>=0.35.0
+Requires-Dist: pydantic>=2.11.0
+Requires-Dist: pyyaml>=6.0.2
+
+# Agent Mission Control
+
+Agent Mission Control is a local-first mission console for AI coding agents.
+
+## v0 Scope
+- Ingest a GitHub issue URL or local task description
+- Compile task context for a target repository
+- Run a coding agent through a backend adapter
+- Stream execution events to a live mission console
+- Capture artifacts such as logs, diffs, summaries, and validation results
+
+## Planned Stack
+- Backend: FastAPI
+- Frontend: React + Vite
+- Database: SQLite
+- Realtime: Server-Sent Events (SSE)
+- First backend adapter: opencode
+
+## Initial Milestones
+1. Repository skeleton and docs
+2. Task, run, event, artifact, and validation models
+3. Streaming opencode adapter
+4. Mission detail UI with live timeline
+5. Validation and export flow

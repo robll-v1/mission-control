@@ -1,0 +1,29 @@
+repo:
+  path: /Users/moukeyu/matrixone
+  base_branch: main
+
+backend:
+  default: opencode
+  opencode:
+    model: ''
+    variant: ''
+
+context:
+  include_recent_commits: 8
+  candidate_files_limit: 20
+
+execution:
+  idle_timeout_sec: 180
+
+validation:
+  default_mode: standard
+  checks:
+    build_mo_service:
+      command: "go build ./cmd/mo-service"
+      required: true
+      modes: ['standard', 'full']
+
+    build_repo:
+      command: "make build"
+      required: false
+      modes: ['full']

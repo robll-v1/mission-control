@@ -1,0 +1,23 @@
+[project]
+name = 'agent-mission-control'
+version = '0.1.0'
+description = 'Local-first mission console for AI coding agents'
+readme = 'README.md'
+requires-python = '>=3.11'
+dependencies = [
+  'fastapi>=0.116.0',
+  'uvicorn>=0.35.0',
+  'pydantic>=2.11.0',
+  'pyyaml>=6.0.2',
+]
+
+[build-system]
+requires = ['setuptools>=68', 'wheel']
+build-backend = 'setuptools.build_meta'
+
+
+[tool.setuptools]
+package-dir = {"" = "backend"}
+
+[tool.setuptools.packages.find]
+where = ["backend"]
