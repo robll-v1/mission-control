@@ -14,7 +14,9 @@ from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
 from app.core.mission_engine import MissionEngine
 from app.core.models import EventLevel, Run, TaskStatus
+from app.core.review_policy import prepare_static_review_env
 from app.core.worktree import WorktreeManager
+from app.services.review_result_service import ReviewResultService
 
 
 class IdleTimeoutError(RuntimeError):
@@ -47,39 +49,57 @@ class ExecutionService:
         self._lock = threading.Lock()
         self._active: dict[str, ActiveProcess] = {}
 
-    def start_task(self, task_id: str, prompt: str | None = None) -> Run:
+    def start_task(self, task_id: str, prompt: str | None = None, review_note: str | None = None) -> Run:
         task = self.db.get_task(task_id)
         if task is None:
             raise KeyError(f'task not found: {task_id}')
         if task.backend not in self.adapters:
             raise KeyError(f'backend adapter not found: {task.backend}')
+        with self._lock:
+            if task_id in self._active:
+                raise RuntimeError('a review round is already in progress for this PR')
 
-        self.mission.set_stage(task.id, status=TaskStatus.INGESTING, stage='compile_context')
-        branch_name, worktree_path = self.worktrees.ensure_worktree(task)
+        self.mission.set_stage(task.id, status=TaskStatus.INGESTING, stage='prepare_review')
+        branch_name, worktree_path, revision = self.worktrees.ensure_worktree(task)
         task.branch_name = branch_name
         task.worktree_path = worktree_path
         compiled = self.contexts.compile_task(task, worktree_path=worktree_path)
         self.mission.append_event(
             task_id=task.id,
-            kind='task.context_compiled',
+            kind='task.review_context_compiled',
             payload={
                 'markdown_path': compiled.markdown_path,
                 'json_path': compiled.json_path,
                 'candidate_files': len(compiled.payload.get('candidate_files', [])),
                 'worktree_path': worktree_path,
+                'review_revision': revision,
             },
         )
 
         idle_timeout_sec = self._idle_timeout_seconds(task.repo_path)
-        run = Run(task_id=task.id, backend=task.backend, started_at=time.time(), status='running')
+        round_index = len(self.db.list_runs(task.id)) + 1
+        run = Run(
+            task_id=task.id,
+            backend=task.backend,
+            round_index=round_index,
+            review_note=(review_note or '').strip(),
+            started_at=time.time(),
+            status='running',
+        )
         self.db.save_run(run)
         task.last_run_id = run.id
         task.updated_at = time.time()
         self.db.save_task(task)
-        self.mission.set_stage(task.id, status=TaskStatus.RUNNING, stage='run_agent')
+        self.mission.set_stage(task.id, status=TaskStatus.RUNNING, stage='review_in_progress')
         worker = threading.Thread(
             target=self._run_task,
-            args=(task.id, run.id, prompt or self.contexts.build_prompt(task, compiled), idle_timeout_sec),
+            args=(
+                task.id,
+                run.id,
+                round_index,
+                prompt or self.contexts.build_prompt(task, compiled, review_note=review_note),
+                idle_timeout_sec,
+            ),
             daemon=True,
         )
         placeholder = ActiveProcess(task_id=task.id, run_id=run.id, process=None, worker=worker)
@@ -103,7 +123,23 @@ class ExecutionService:
         )
         return True
 
-    def _run_task(self, task_id: str, run_id: str, prompt: str, idle_timeout_sec: int) -> None:
+    def cleanup_task_worktree(self, task_id: str, *, reason: str = 'manual') -> dict[str, object]:
+        task = self.db.get_task(task_id)
+        if task is None:
+            raise KeyError(f'task not found: {task_id}')
+        with self._lock:
+            if task_id in self._active:
+                raise RuntimeError('cannot cleanup worktree while a review round is running')
+        runs = self.db.list_runs(task_id)
+        latest_run = runs[-1] if runs else None
+        return self._cleanup_task_worktree(
+            task,
+            run_id=latest_run.id if latest_run is not None else None,
+            round_index=latest_run.round_index if latest_run is not None else None,
+            reason=reason,
+        )
+
+    def _run_task(self, task_id: str, run_id: str, round_index: int, prompt: str, idle_timeout_sec: int) -> None:
         task = self.db.get_task(task_id)
         run = next((item for item in self.db.list_runs(task_id) if item.id == run_id), None)
         if task is None or run is None:
@@ -116,12 +152,13 @@ class ExecutionService:
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
-                kind='agent.started',
+                kind='review.round_started',
                 payload={
-                    'command': cmd,
+                    'entrypoint': cmd[:4],
                     'backend': task.backend,
                     'worktree_path': task.worktree_path,
                     'idle_timeout_sec': idle_timeout_sec,
+                    'round_index': round_index,
                 },
             )
             proc = subprocess.Popen(
@@ -132,6 +169,7 @@ class ExecutionService:
                 text=True,
                 bufsize=1,
                 start_new_session=True,
+                env=prepare_static_review_env(self.worktrees.runtime_root),
             )
             with self._lock:
                 self._active[task.id] = ActiveProcess(task_id=task.id, run_id=run.id, process=proc, worker=threading.current_thread())
@@ -164,8 +202,9 @@ class ExecutionService:
                             kind='warning',
                             level=EventLevel.WARNING,
                             payload={
-                                'message': f'No new output for {idle_timeout_sec}s; terminating stalled run',
+                                'message': f'No new output for {idle_timeout_sec}s; terminating stalled review round',
                                 'reason': 'idle_timeout',
+                                'round_index': round_index,
                             },
                         )
                         self._terminate_process(proc)
@@ -190,19 +229,44 @@ class ExecutionService:
             run.ended_at = time.time()
             run.exit_code = exit_code
             run.status = 'completed' if exit_code == 0 else 'failed'
+            run.review_result = ReviewResultService.extract_result(events=self.db.list_events(task_id), run=run)
             self.db.save_run(run)
+            task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task.id))
+            self.db.save_task(task)
 
             if exit_code == 0:
-                self.mission.set_stage(task.id, status=TaskStatus.WAITING_HUMAN, stage='handoff')
+                self.mission.set_stage(task.id, status=TaskStatus.WAITING_HUMAN, stage='awaiting_next_round')
             else:
-                self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='run_agent')
+                self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
+
+            if run.review_result is not None:
+                self.mission.append_event(
+                    task_id=task.id,
+                    run_id=run.id,
+                    kind='review.result_extracted',
+                    level=EventLevel.WARNING if run.review_result.verdict == 'concerns' else EventLevel.INFO,
+                    payload={
+                        'round_index': round_index,
+                        'verdict': run.review_result.verdict,
+                        'finding_count': run.review_result.finding_count,
+                        'severity_counts': run.review_result.severity_counts,
+                        'summary': run.review_result.summary,
+                    },
+                )
 
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
-                kind='agent.finished',
+                kind='review.round_finished',
                 level=EventLevel.INFO if exit_code == 0 else EventLevel.ERROR,
-                payload={'exit_code': exit_code, 'session_id': run.backend_session_id},
+                payload={
+                    'exit_code': exit_code,
+                    'session_id': run.backend_session_id,
+                    'round_index': round_index,
+                    'verdict': run.review_result.verdict if run.review_result is not None else None,
+                    'finding_count': run.review_result.finding_count if run.review_result is not None else 0,
+                    'severity_counts': run.review_result.severity_counts if run.review_result is not None else {},
+                },
             )
         except Exception as exc:
             if proc is not None and proc.poll() is None:
@@ -210,29 +274,44 @@ class ExecutionService:
             run.ended_at = time.time()
             run.exit_code = -2 if isinstance(exc, IdleTimeoutError) else -1
             run.status = 'failed'
+            run.review_result = ReviewResultService.extract_result(events=self.db.list_events(task_id), run=run)
             self.db.save_run(run)
+            task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task.id))
+            self.db.save_task(task)
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
                 kind='error',
                 level=EventLevel.ERROR,
-                payload={'message': str(exc), 'type': exc.__class__.__name__},
+                payload={'message': str(exc), 'type': exc.__class__.__name__, 'round_index': round_index},
             )
-            self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='run_agent')
+            self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
-                kind='agent.finished',
+                kind='review.round_finished',
                 level=EventLevel.ERROR,
                 payload={
                     'exit_code': run.exit_code,
                     'session_id': run.backend_session_id,
                     'reason': 'idle_timeout' if isinstance(exc, IdleTimeoutError) else 'exception',
+                    'round_index': round_index,
+                    'verdict': run.review_result.verdict if run.review_result is not None else 'failed',
+                    'finding_count': run.review_result.finding_count if run.review_result is not None else 0,
                 },
             )
         finally:
-            with self._lock:
-                self._active.pop(task.id, None)
+            try:
+                if task is not None and self._should_auto_cleanup_worktree(task.repo_path):
+                    self._cleanup_task_worktree(
+                        task,
+                        run_id=run.id if run is not None else None,
+                        round_index=round_index,
+                        reason='round_finished',
+                    )
+            finally:
+                with self._lock:
+                    self._active.pop(task.id, None)
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen[str]) -> None:
@@ -265,3 +344,43 @@ class ExecutionService:
         except (TypeError, ValueError):
             timeout = 180
         return max(timeout, 30)
+
+    @staticmethod
+    def _should_auto_cleanup_worktree(repo_path: str) -> bool:
+        cfg = load_repo_config(repo_path)
+        worktree_cfg = cfg.get('worktree', {}) if isinstance(cfg, dict) else {}
+        return bool(worktree_cfg.get('auto_cleanup', True))
+
+    def _cleanup_task_worktree(
+        self,
+        task,
+        *,
+        run_id: str | None,
+        round_index: int | None,
+        reason: str,
+    ) -> dict[str, object]:
+        result = self.worktrees.cleanup_worktree(task)
+        fresh_task = self.db.get_task(task.id) or task
+        if not result.get('exists_after'):
+            fresh_task.worktree_path = None
+        if result.get('branch_removed') and (fresh_task.branch_name or '') == f'review/{task.id}':
+            fresh_task.branch_name = None
+        fresh_task.updated_at = time.time()
+        self.db.save_task(fresh_task)
+
+        self.mission.append_event(
+            task_id=task.id,
+            run_id=run_id,
+            kind='task.worktree_cleaned' if not result['errors'] else 'task.worktree_cleanup_failed',
+            level=EventLevel.INFO if not result['errors'] else EventLevel.WARNING,
+            payload={
+                'reason': reason,
+                'round_index': round_index,
+                'worktree_path': result['worktree_path'],
+                'removed': result['removed'],
+                'branch_name': result['branch_name'],
+                'branch_removed': result['branch_removed'],
+                'errors': result['errors'],
+            },
+        )
+        return result

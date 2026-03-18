@@ -16,9 +16,17 @@ class MissionEngine:
         title: str,
         repo_path: str,
         description: str = '',
-        source_type: str = 'manual',
+        source_type: str = 'pull_request',
         source_url: str | None = None,
         backend: str = 'opencode',
+        review_focus: str = '',
+        pr_owner: str | None = None,
+        pr_repo: str | None = None,
+        pr_number: int | None = None,
+        pr_head_ref: str | None = None,
+        pr_head_sha: str | None = None,
+        pr_base_ref: str | None = None,
+        review_paths: list[str] | None = None,
     ) -> Task:
         now = time.time()
         task = Task(
@@ -28,6 +36,14 @@ class MissionEngine:
             source_url=source_url,
             repo_path=repo_path,
             backend=backend,
+            review_focus=review_focus,
+            pr_owner=pr_owner,
+            pr_repo=pr_repo,
+            pr_number=pr_number,
+            pr_head_ref=pr_head_ref,
+            pr_head_sha=pr_head_sha,
+            pr_base_ref=pr_base_ref,
+            review_paths=review_paths or [],
             created_at=now,
             updated_at=now,
         )
@@ -35,7 +51,12 @@ class MissionEngine:
         self.append_event(
             task_id=task.id,
             kind='task.created',
-            payload={'title': task.title, 'repo_path': task.repo_path},
+            payload={
+                'title': task.title,
+                'repo_path': task.repo_path,
+                'source_url': task.source_url,
+                'pr_number': task.pr_number,
+            },
         )
         return task
 

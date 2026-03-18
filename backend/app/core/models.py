@@ -25,18 +25,52 @@ class EventLevel(StrEnum):
     ERROR = 'error'
 
 
+class ReviewVerdict(StrEnum):
+    CLEAR = 'clear'
+    CONCERNS = 'concerns'
+    FAILED = 'failed'
+    INCONCLUSIVE = 'inconclusive'
+
+
+class ReviewFinding(BaseModel):
+    severity: str
+    summary: str
+    path: str | None = None
+    line: int | None = None
+    detail: str = ''
+
+
+class ReviewResult(BaseModel):
+    verdict: ReviewVerdict = ReviewVerdict.INCONCLUSIVE
+    summary: str = ''
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    severity_counts: dict[str, int] = Field(default_factory=dict)
+    finding_count: int = 0
+    source_event_seq: int | None = None
+    supersedes_round_index: int | None = None
+
+
 class Task(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     title: str
     description: str = ''
-    source_type: str = 'manual'
+    source_type: str = 'pull_request'
     source_url: str | None = None
     repo_path: str
     backend: str = 'opencode'
+    review_focus: str = ''
+    pr_owner: str | None = None
+    pr_repo: str | None = None
+    pr_number: int | None = None
+    pr_head_ref: str | None = None
+    pr_head_sha: str | None = None
+    pr_base_ref: str | None = None
+    review_paths: list[str] = Field(default_factory=list)
     status: TaskStatus = TaskStatus.CREATED
     current_stage: str = 'created'
     branch_name: str | None = None
     worktree_path: str | None = None
+    latest_review_result: ReviewResult | None = None
     created_at: float
     updated_at: float
     last_run_id: str | None = None
@@ -46,8 +80,11 @@ class Run(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     task_id: str
     backend: str
+    round_index: int = 1
+    review_note: str = ''
     backend_session_id: str | None = None
     status: str = 'created'
+    review_result: ReviewResult | None = None
     started_at: float
     ended_at: float | None = None
     exit_code: int | None = None

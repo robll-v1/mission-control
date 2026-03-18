@@ -21,12 +21,15 @@ STOPWORDS = {
     'feature', 'request', 'existing', 'checked', 'related', 'problem', 'describe', 'implementation',
     'considered', 'documentation', 'adoption', 'migration', 'strategy', 'additional', 'information',
     'markdown', 'response', 'public', 'private', 'support', 'needs', 'like', 'would', 'response',
+    'pull', 'review', 'reviewer', 'conversation',
 }
 SKIP_DIRS = {'.git', 'node_modules', '.venv', 'dist', 'build', 'runtime', 'worktrees', '__pycache__', 'vendor'}
 TEXT_FILE_SUFFIXES = {
     '.go', '.py', '.ts', '.tsx', '.js', '.jsx', '.java', '.c', '.cc', '.cpp', '.h', '.hpp', '.rs',
     '.md', '.txt', '.yaml', '.yml', '.toml', '.sql', '.sh', '.proto', '.json', '.xml', '.ini', '.cfg',
 }
+DOC_DIRS = {'docs', '.github'}
+DOC_BASENAMES = {'readme.md', 'build.md', 'agents.md', 'code_of_conduct.md', 'contributing.md'}
 SPECIAL_KEYWORD_ALIASES = {
     'usr1': ['sigusr1', 'signal', 'signal.notify'],
     'sigusr1': ['usr1', 'signal', 'signal.notify'],
@@ -83,7 +86,8 @@ class ContextCompiler:
         context_cfg = repo_cfg.get('context', {}) if isinstance(repo_cfg, dict) else {}
         recent_commit_limit = int(context_cfg.get('include_recent_commits', 8) or 8)
         candidate_limit = int(context_cfg.get('candidate_files_limit', 12) or 12)
-        keywords = self._keywords(task.title, task.description)
+        keywords = self._keywords(task.title, task.description, task.review_paths)
+        pr_context = self._pull_request_context(task.id)
 
         payload: dict[str, Any] = {
             'task': {
@@ -93,6 +97,19 @@ class ContextCompiler:
                 'source_type': task.source_type,
                 'source_url': task.source_url,
                 'backend': task.backend,
+                'review_focus': task.review_focus,
+            },
+            'review': {
+                'owner': task.pr_owner,
+                'repo': task.pr_repo,
+                'pr_number': task.pr_number,
+                'base_ref': task.pr_base_ref,
+                'head_ref': task.pr_head_ref,
+                'head_sha': task.pr_head_sha,
+                'changed_files': task.review_paths,
+                'file_patches': pr_context.get('file_patches', []),
+                'review_count': pr_context.get('review_count', 0),
+                'comment_count': pr_context.get('comment_count', 0),
             },
             'repo': {
                 'path': task.repo_path,
@@ -102,9 +119,8 @@ class ContextCompiler:
                 'remote_url': self._git_one_line(task.repo_path, ['config', '--get', 'remote.origin.url']),
                 'recent_commits': self._recent_commits(task.repo_path, recent_commit_limit),
             },
-            'validation': self._validation_checks(repo_cfg),
             'keywords': keywords,
-            'candidate_files': self._candidate_files(target_root, keywords, candidate_limit),
+            'candidate_files': self._candidate_files(target_root, keywords, task.review_paths, candidate_limit),
             'artifacts': self._existing_context_artifacts(task.id),
         }
 
@@ -114,11 +130,20 @@ class ContextCompiler:
         return CompiledContext(markdown_path=markdown_path, json_path=json_path, markdown=markdown, payload=payload)
 
     @staticmethod
-    def build_prompt(task: Task, compiled: CompiledContext) -> str:
+    def build_prompt(task: Task, compiled: CompiledContext, review_note: str | None = None) -> str:
+        extra_note = f'\n\n本轮补充说明：\n{review_note.strip()}\n' if review_note and review_note.strip() else ''
         return (
-            'You are executing a repository task. Use the compiled context below as the primary source of truth. '
-            'Inspect the repository, make careful changes, and explain important steps as you go.\n\n'
-            f'{compiled.markdown}\n'
+            '你正在执行静态 PR Review。请把下面的编译上下文当作主要事实来源。'
+            '只检查 PR diff 及其周边代码，不要修改文件。'
+            '除非用户明确要求，否则不要启动服务、不要跑 build、不要跑单元测试、不要跑集成测试、不要做交叉编译。'
+            '除非 PR 直接改到了这些文档，或者代码确实依赖它们，否则避免主动阅读 README、AGENTS、BUILD 文档、docs/、.github/ 这类仓库文档和配置。'
+            '优先基于已提供的 patch 和附近代码做只读审查。'
+            '如果某个判断必须依赖运行时证据，请把它写成风险或待确认问题，不要尝试启动服务去验证。'
+            '最终输出必须使用中文。第一段给出中文结论摘要。'
+            '如果发现问题，请按固定格式列出：`- 严重:`、`- 高:`、`- 中:`、`- 低:`。'
+            '如果没有发现实质性问题，请明确写出：`未发现明显正确性或回归问题。`'
+            '每条问题尽量带文件路径和行号，并优先关注 bug、回归风险、危险假设和缺失测试。'
+            f'{extra_note}\n\n{compiled.markdown}\n'
         )
 
     def _existing_context_artifacts(self, task_id: str) -> list[dict[str, str]]:
@@ -127,6 +152,43 @@ class ContextCompiler:
             if item['relative_path'].startswith('context/') and item['relative_path'] not in {'context/context.md', 'context/context.json'}:
                 files.append(item)
         return files
+
+    def _pull_request_context(self, task_id: str) -> dict[str, Any]:
+        path = self.artifacts.task_dir(task_id) / 'context' / 'pull_request.json'
+        if not path.exists():
+            return {'file_patches': [], 'review_count': 0, 'comment_count': 0}
+        try:
+            payload = json.loads(path.read_text())
+        except Exception:
+            return {'file_patches': [], 'review_count': 0, 'comment_count': 0}
+
+        files = payload.get('files', []) if isinstance(payload, dict) else []
+        patches: list[dict[str, Any]] = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            patches.append({
+                'path': str(item.get('filename', '')).strip(),
+                'status': str(item.get('status', '')).strip(),
+                'additions': int(item.get('additions', 0) or 0),
+                'deletions': int(item.get('deletions', 0) or 0),
+                'patch': self._truncate_patch(str(item.get('patch', '') or '').strip()),
+            })
+        return {
+            'file_patches': [item for item in patches if item.get('path')],
+            'review_count': len(payload.get('reviews', [])) if isinstance(payload.get('reviews', []), list) else 0,
+            'comment_count': (
+                len(payload.get('issue_comments', [])) if isinstance(payload.get('issue_comments', []), list) else 0
+            ) + (
+                len(payload.get('review_comments', [])) if isinstance(payload.get('review_comments', []), list) else 0
+            ),
+        }
+
+    @staticmethod
+    def _truncate_patch(patch: str, limit: int = 1800) -> str:
+        if len(patch) <= limit:
+            return patch
+        return patch[:limit].rstrip() + '\n... [truncated]'
 
     @staticmethod
     def _top_level_entries(repo_root: Path) -> list[str]:
@@ -169,22 +231,6 @@ class ContextCompiler:
         return result.stdout.strip()
 
     @staticmethod
-    def _validation_checks(repo_cfg: dict[str, Any]) -> list[dict[str, Any]]:
-        validation_cfg = repo_cfg.get('validation', {}) if isinstance(repo_cfg, dict) else {}
-        checks = validation_cfg.get('checks', {}) if isinstance(validation_cfg, dict) else {}
-        items = []
-        for name, config in checks.items():
-            if not isinstance(config, dict):
-                continue
-            items.append({
-                'name': name,
-                'command': str(config.get('command', '')).strip(),
-                'required': bool(config.get('required', False)),
-                'modes': list(config.get('modes', ['standard'])),
-            })
-        return items
-
-    @staticmethod
     def _iter_repo_files(root: Path) -> list[Path]:
         try:
             result = subprocess.run(
@@ -223,12 +269,33 @@ class ContextCompiler:
                 break
         return files
 
-    def _candidate_files(self, root: Path, keywords: list[str], limit: int) -> list[dict[str, Any]]:
+    def _candidate_files(self, root: Path, keywords: list[str], review_paths: list[str], limit: int) -> list[dict[str, Any]]:
         if not root.exists():
             return []
+        preferred_paths = {path.strip().lstrip('./') for path in review_paths if path.strip()}
+        preferred: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        for rel_path in review_paths:
+            normalized = rel_path.strip().lstrip('./')
+            if not normalized or normalized in seen_paths:
+                continue
+            full_path = root / normalized
+            if full_path.is_file():
+                preferred.append({
+                    'path': normalized,
+                    'score': 100,
+                    'path_score': 100,
+                    'structure_score': 0,
+                    'content_score': 0,
+                })
+                seen_paths.add(normalized)
         scored: list[tuple[int, str, dict[str, int]]] = []
         for full_path in self._iter_repo_files(root):
             rel_path = os.path.relpath(full_path, root)
+            if rel_path in seen_paths:
+                continue
+            if self._is_documentation_or_config(rel_path) and rel_path not in preferred_paths:
+                continue
             path_score = self._score_path(rel_path, keywords)
             structure_score = self._score_structure(rel_path, keywords)
             content_score = self._score_content(full_path, keywords)
@@ -243,10 +310,10 @@ class ContextCompiler:
         if not scored:
             fallback = []
             for candidate in ('README.md', 'package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod'):
-                if (root / candidate).exists():
+                if (root / candidate).exists() and (candidate in preferred_paths or not self._is_documentation_or_config(candidate)):
                     fallback.append({'path': candidate, 'score': 1})
-            return fallback[:limit]
-        return [
+            return (preferred + fallback)[:limit]
+        combined = preferred + [
             {
                 'path': path,
                 'score': score,
@@ -256,8 +323,9 @@ class ContextCompiler:
             }
             for score, path, breakdown in scored[:limit]
         ]
+        return combined[:limit]
 
-    def _keywords(self, title: str, description: str) -> list[str]:
+    def _keywords(self, title: str, description: str, review_paths: list[str]) -> list[str]:
         raw_text = f'{title}\n{description}'
         cleaned = self._clean_issue_template(raw_text)
         raw_tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_.-]{1,}', cleaned.lower())
@@ -270,6 +338,16 @@ class ContextCompiler:
                 continue
             if normalized not in tokens:
                 tokens.append(normalized)
+
+        for rel_path in review_paths:
+            for token in re.findall(r'[A-Za-z_][A-Za-z0-9_.-]{1,}', rel_path.lower()):
+                normalized = token.strip('._-')
+                if len(normalized) < 2:
+                    continue
+                if normalized in STOPWORDS:
+                    continue
+                if normalized not in tokens:
+                    tokens.append(normalized)
 
         for phrase, hints in PHRASE_HINTS.items():
             if phrase in raw_text.lower() or phrase in raw_text:
@@ -355,24 +433,73 @@ class ContextCompiler:
         return score
 
     @staticmethod
+    def _is_documentation_or_config(path: str) -> bool:
+        rel = Path(path)
+        lowered = rel.as_posix().lower()
+        if any(part.lower() in DOC_DIRS for part in rel.parts):
+            return True
+        basename = rel.name.lower()
+        if basename in DOC_BASENAMES:
+            return True
+        if rel.suffix.lower() in {'.md', '.txt'}:
+            return True
+        return False
+
+    @staticmethod
     def _render_markdown(payload: dict[str, Any]) -> str:
         task = payload['task']
+        review = payload['review']
         repo = payload['repo']
-        validations = payload['validation']
         candidates = payload['candidate_files']
         artifacts = payload.get('artifacts', [])
         keywords = payload.get('keywords', [])
         lines = [
-            '# Compiled Task Context',
+            '# Compiled PR Review Context',
             '',
-            '## Task',
+            '## Review Target',
             f'- Title: {task["title"]}',
-            f'- Source Type: {task["source_type"]}',
-            f'- Source URL: {task.get("source_url") or "(none)"}',
+            f'- PR URL: {task.get("source_url") or "(none)"}',
+            f'- Repository: {review.get("owner") or ""}/{review.get("repo") or ""}',
+            f'- PR Number: #{review.get("pr_number") or "?"}',
             f'- Backend: {task["backend"]}',
             '',
-            '## Goal',
+            '## Review Mode',
+            '- Mode: static logic review',
+            '- Service startup: disabled by default',
+            '- Build/test execution: disabled by default',
+            '',
+            '## Review Brief',
             task['description'] or '(empty)',
+            '',
+            '## Pull Request',
+            f'- Base Ref: {review.get("base_ref") or "(unknown)"}',
+            f'- Head Ref: {review.get("head_ref") or "(unknown)"}',
+            f'- Head SHA: {review.get("head_sha") or "(unknown)"}',
+            f'- Existing Reviews: {review.get("review_count", 0)}',
+            f'- Existing Comments: {review.get("comment_count", 0)}',
+            '',
+            '### Changed Files',
+        ]
+        changed_files = review.get('changed_files', []) or []
+        if changed_files:
+            lines.extend(f'- {item}' for item in changed_files)
+        else:
+            lines.append('- (none)')
+        file_patches = review.get('file_patches', []) or []
+        if file_patches:
+            lines.extend(['', '### Changed File Patches'])
+            for item in file_patches:
+                lines.append(
+                    f"- {item['path']} [{item.get('status') or 'modified'}] (+{item.get('additions', 0)} -{item.get('deletions', 0)})"
+                )
+                patch = item.get('patch') or ''
+                if patch:
+                    lines.append('```diff')
+                    lines.append(patch)
+                    lines.append('```')
+                else:
+                    lines.append('- (patch unavailable)')
+        lines.extend([
             '',
             '## Repo Snapshot',
             f'- Repo Path: {repo.get("path") or ""}',
@@ -381,7 +508,7 @@ class ContextCompiler:
             f'- Remote URL: {repo.get("remote_url") or "(unknown)"}',
             '',
             '### Top-Level Entries',
-        ]
+        ])
         entries = repo.get('top_level_entries', []) or []
         if entries:
             lines.extend(f'- {entry}' for entry in entries)
@@ -405,20 +532,16 @@ class ContextCompiler:
             lines.extend(f'- {commit}' for commit in commits)
         else:
             lines.append('- (none)')
-        lines.extend(['', '## Validation Commands'])
-        if validations:
-            for item in validations:
-                lines.append(f'- {item["name"]}: `{item["command"] or "(empty)"}` required={item["required"]}')
-        else:
-            lines.append('- (none configured)')
         if artifacts:
             lines.extend(['', '## Existing Context Artifacts'])
             lines.extend(f'- {item["relative_path"]}' for item in artifacts)
         lines.extend([
             '',
-            '## Guidance',
-            '- Start with the smallest relevant repository area.',
-            '- Prefer candidate files that score on both structure and content, not only filename overlap.',
-            '- Use the smallest relevant validation commands before broader checks.',
+            '## Review Guidance',
+            '- Focus on correctness, regressions, risky assumptions, and missing tests.',
+            '- Start with files changed by the PR, then expand only when the change requires more context.',
+            '- Do not modify files; produce review findings only.',
+            '- Do not start services, run builds, run unit tests, run integration tests, or cross-compile unless the user explicitly asks.',
+            '- If runtime evidence would be needed, surface it as an open question instead of trying to prove it by execution.',
         ])
         return '\n'.join(lines).strip() + '\n'

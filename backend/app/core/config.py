@@ -14,6 +14,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     'execution': {
         'idle_timeout_sec': 180,
     },
+    'worktree': {
+        'auto_cleanup': True,
+        'prune_on_start': True,
+    },
     'validation': {
         'default_mode': 'standard',
         'checks': {},

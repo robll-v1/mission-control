@@ -2,9 +2,7 @@ from pydantic import BaseModel
 
 
 class CreateTaskRequest(BaseModel):
-    title: str = ''
     repo_path: str
-    description: str = ''
-    source_type: str = 'manual'
-    source_url: str | None = None
+    pr_url: str
+    review_focus: str = ''
     backend: str = 'opencode'

@@ -1,7 +1,7 @@
 [project]
 name = 'agent-mission-control'
 version = '0.1.0'
-description = 'Local-first mission console for AI coding agents'
+description = 'Local-first console for multi-round GitHub pull request review'
 readme = 'README.md'
 requires-python = '>=3.11'
 dependencies = [

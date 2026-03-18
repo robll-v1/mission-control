@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Agent Mission Control</title>
+    <title>PR Review Control</title>
     <style>
       :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #0b1020; color: #e7ecf3; }
       * { box-sizing: border-box; }
@@ -36,6 +36,11 @@
       .badge-running, .badge-ingesting, .badge-validating { color: #ffd36c; }
       .badge-completed { color: #73dca8; }
       .badge-failed, .badge-aborted { color: #ff7a92; }
+      .pill { border-radius: 999px; padding: 3px 9px; font-size: 12px; border: 1px solid currentColor; }
+      .pill-success { color: #73dca8; }
+      .pill-warning { color: #ffd36c; }
+      .pill-danger { color: #ff7a92; }
+      .pill-neutral { color: #87c7ff; }
       .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
       .summary-card { background: rgba(18, 25, 43, 0.86); border: 1px solid #22304b; border-radius: 18px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
       .summary-card span { color: #93a0ba; font-size: 12px; }
@@ -49,6 +54,7 @@
       .event-preview { line-height: 1.5; }
       .event-details summary { cursor: pointer; color: #87c7ff; margin-top: 8px; }
       .event-body, .event-details pre { margin-top: 8px; }
+      .result-summary { line-height: 1.6; color: #d5def0; }
       .error-banner { background: rgba(127, 40, 57, 0.24); color: #ffb4c1; border: 1px solid #8b3848; border-radius: 14px; padding: 12px 14px; }
       .empty-main { padding: 28px; border: 1px dashed #2b3a59; border-radius: 16px; background: rgba(15, 21, 35, 0.6); }
       @media (max-width: 1100px) { .app-shell { grid-template-columns: 1fr; } .summary-grid, .detail-grid { grid-template-columns: 1fr; } .timeline-scroll, .compact-scroll { max-height: none; } }
@@ -58,25 +64,24 @@
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand-block">
-          <h1>Agent Mission Control</h1>
-          <p>Visible, controllable runs for coding agents.</p>
+          <h1>PR Review Control</h1>
+          <p>Visible, controllable review rounds for pull requests.</p>
         </div>
         <section class="panel">
-          <h2>New Mission</h2>
-          <label>Title (optional if Issue URL is set)<input id="title" placeholder="Fix issue #123" /></label>
+          <h2>New PR Review</h2>
           <label>Repo Path<input id="repo-path" placeholder="/path/to/repo" /></label>
-          <label>Issue URL (optional)<input id="source-url" placeholder="https://github.com/org/repo/issues/1" /></label>
-          <label>Description<textarea id="description" rows="5"></textarea></label>
-          <button id="create-task">Create Task</button>
+          <label>PR URL<input id="pr-url" placeholder="https://github.com/org/repo/pull/123" /></label>
+          <label>Review Focus<textarea id="review-focus" rows="5"></textarea></label>
+          <button id="create-task">Create Review</button>
         </section>
         <section class="panel grow">
-          <div class="panel-header"><h2>Tasks</h2><button id="refresh">Refresh</button></div>
+          <div class="panel-header"><h2>Reviews</h2><button id="refresh">Refresh</button></div>
           <div class="task-list" id="task-list"></div>
         </section>
       </aside>
       <main class="main-panel">
         <div id="error"></div>
-        <div class="empty-main" id="empty-main">Select or create a task to inspect its mission timeline.</div>
+        <div class="empty-main" id="empty-main">Select or create a PR review to inspect its review timeline.</div>
         <div id="detail-root" style="display:none"></div>
       </main>
     </div>
@@ -87,6 +92,8 @@
       const esc = (value) => { const div = document.createElement('div'); div.textContent = value ?? ''; return div.innerHTML }
       const payloadText = (payload) => payload && typeof payload.text === 'string' ? payload.text : JSON.stringify(payload ?? {}, null, 2)
       const truncateText = (text, limit = 260) => text.length <= limit ? text : `${text.slice(0, limit)}…`
+      const verdictLabel = (verdict) => verdict === 'clear' ? '未发现明显问题' : verdict === 'concerns' ? '需要关注' : verdict === 'failed' ? '评审失败' : '暂无结果'
+      const verdictTone = (verdict) => verdict === 'clear' ? 'success' : verdict === 'concerns' ? 'warning' : verdict === 'failed' ? 'danger' : 'neutral'
       const api = async (path, init = {}) => {
         const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...init })
         if (!response.ok) throw new Error(await response.text() || `Request failed: ${response.status}`)
@@ -98,7 +105,7 @@
       }
       function renderTasks() {
         const list = document.getElementById('task-list')
-        if (!state.tasks.length) { list.innerHTML = '<div class="empty-state">No tasks yet.</div>'; return }
+        if (!state.tasks.length) { list.innerHTML = '<div class="empty-state">No PR reviews yet.</div>'; return }
         list.innerHTML = state.tasks.map((task) => `
           <button class="task-item ${task.id === state.selectedTaskId ? 'active' : ''}" data-task-id="${task.id}">
             <div class="task-item-top"><span>${esc(task.title)}</span><span class="badge badge-${esc(task.status)}">${esc(task.status)}</span></div>
@@ -121,49 +128,58 @@
         const empty = document.getElementById('empty-main')
         const detailRoot = document.getElementById('detail-root')
         if (!state.detail) { empty.style.display = 'block'; detailRoot.style.display = 'none'; detailRoot.innerHTML = ''; return }
-        const { task, events, runs, checks, artifacts } = state.detail
-        const visibleEvents = state.showAllEvents ? events : events.slice(-EVENT_LIMIT)
+        const { task, events, artifacts } = state.detail
+        const importantEvents = state.detail.important_events || events
+        const eventStats = state.detail.event_stats || { all_count: events.length, important_count: importantEvents.length, hidden_count: Math.max(events.length - importantEvents.length, 0) }
+        const result = state.detail.latest_review_result || task.latest_review_result || null
+        const runs = state.detail.review_rounds || state.detail.runs || []
+        const visibleEvents = state.showAllEvents ? events : importantEvents.slice(-EVENT_LIMIT)
         empty.style.display = 'none'
         detailRoot.style.display = 'block'
         detailRoot.innerHTML = `
           <section class="panel hero-panel">
             <div>
               <h2>${esc(task.title)}</h2>
-              <p>${esc(task.description || 'No description provided.')}</p>
-              <div class="hero-meta"><span>Repo: ${esc(task.repo_path)}</span><span>Backend: ${esc(task.backend)}</span><span>Stage: ${esc(task.current_stage)}</span><span>Updated: ${esc(timeText(task.updated_at))}</span></div>
+              <p>${esc(task.description || 'No review brief provided.')}</p>
+              <div class="hero-meta"><span>PR: ${esc(task.source_url || '-')}</span><span>Repo: ${esc(task.repo_path)}</span><span>Rounds: ${runs.length}</span><span>Stage: ${esc(task.current_stage)}</span><span>Updated: ${esc(timeText(task.updated_at))}</span></div>
             </div>
             <div class="hero-actions">
-              <button id="start-task" ${task.status === 'running' ? 'disabled' : ''}>Start</button>
-              <button id="validate-task">Validate</button>
-              <button id="export-summary">Export Summary</button>
-              <button class="danger" id="abort-task" ${task.status !== 'running' ? 'disabled' : ''}>Abort</button>
+              <button id="start-task" ${task.status === 'running' ? 'disabled' : ''}>${runs.length ? 'Start Next Review Round' : 'Start First Review Round'}</button>
+              <button id="export-summary">Export Review Summary</button>
+              <button class="danger" id="abort-task" ${task.status !== 'running' ? 'disabled' : ''}>Abort Round</button>
             </div>
           </section>
           <div class="summary-grid">
-            <div class="summary-card"><span>Task Status</span><strong>${esc(task.status)}</strong></div>
-            <div class="summary-card"><span>Current Stage</span><strong>${esc(task.current_stage)}</strong></div>
-            <div class="summary-card"><span>Total Events</span><strong>${events.length}</strong></div>
-            <div class="summary-card"><span>Artifacts</span><strong>${artifacts.length}</strong></div>
+            <div class="summary-card"><span>Review Status</span><strong>${esc(task.status)}</strong></div>
+            <div class="summary-card"><span>最新结论</span><strong class="pill pill-${esc(verdictTone(result && result.verdict))}">${esc(verdictLabel(result && result.verdict))}</strong></div>
+            <div class="summary-card"><span>问题数</span><strong>${result ? result.finding_count : 0}</strong></div>
+            <div class="summary-card"><span>评审轮次</span><strong>${runs.length}</strong></div>
           </div>
           <div class="detail-grid">
             <section class="panel">
               <div class="panel-header">
-                <div><h3>Timeline</h3><div class="panel-note">Default view shows the latest ${EVENT_LIMIT} events so the page stays readable.</div></div>
-                <div class="toolbar-group"><span>${events.length} events</span>${events.length > EVENT_LIMIT ? `<button id="toggle-events">${state.showAllEvents ? 'Show Recent 50' : 'Show All'}</button>` : ''}</div>
+                <div><h3>评审事件</h3><div class="panel-note">${result ? esc(result.summary || '已有结构化评审结论。') : '暂无结构化评审结论。'}</div></div>
+                <div class="toolbar-group"><span>${state.showAllEvents ? `${eventStats.all_count} 条事件` : `${eventStats.important_count} 条重要事件`}</span>${eventStats.hidden_count > 0 ? `<button id="toggle-events">${state.showAllEvents ? '仅看重要事件' : '显示全部'}</button>` : ''}</div>
               </div>
               <div class="timeline-scroll">${visibleEvents.length ? visibleEvents.map(eventCard).join('') : '<div class="empty-state">No events yet.</div>'}</div>
             </section>
             <section class="panel">
-              <div class="panel-header"><h3>Runs</h3></div>
-              <div class="stack-list compact-scroll">${runs.length ? runs.map((run) => `<div class="stack-card"><div><strong>${esc(String(run.backend))}</strong></div><div>Status: ${esc(String(run.status))}</div><div>Session: ${esc(String(run.backend_session_id ?? '-'))}</div><div>Exit: ${esc(String(run.exit_code ?? '-'))}</div></div>`).join('') : '<div class="empty-state">No runs yet.</div>'}</div>
-              <div class="panel-header"><h3>Checks</h3></div>
-              <div class="stack-list compact-scroll">${checks.length ? checks.map((check) => `<div class="stack-card"><div><strong>${esc(String(check.name ?? 'check'))}</strong></div><div>Status: ${esc(String(check.status ?? '-'))}</div><div>Exit: ${esc(String(check.exit_code ?? '-'))}</div></div>`).join('') : '<div class="empty-state">No validation runs yet.</div>'}</div>
-              <div class="panel-header"><h3>Artifacts</h3></div>
-              <div class="stack-list compact-scroll">${artifacts.length ? artifacts.map((item) => `<div class="stack-card"><div><strong>${esc(String(item.relative_path))}</strong></div><div class="artifact-path">${esc(String(item.path))}</div></div>`).join('') : '<div class="empty-state">No artifacts yet.</div>'}</div>
+              <div class="panel-header"><h3>最新评审结论</h3></div>
+              <div class="stack-list compact-scroll">${result ? `
+                <div class="stack-card">
+                  <div><strong>${esc(verdictLabel(result.verdict))}</strong></div>
+                  <div class="result-summary">${esc(result.summary || '暂无摘要。')}</div>
+                  <div>问题数: ${esc(String(result.finding_count || 0))}</div>
+                </div>
+                ${(result.findings || []).map((finding) => `<div class="stack-card"><div><strong>[${esc(finding.severity)}] ${esc(finding.path || '路径缺失')}${finding.line ? `:${esc(String(finding.line))}` : ''}</strong></div><div>${esc(finding.summary || '')}</div></div>`).join('')}
+              ` : '<div class="empty-state">暂无结构化评审结论。</div>'}</div>
+              <div class="panel-header"><h3>评审轮次</h3></div>
+              <div class="stack-list compact-scroll">${runs.length ? runs.map((run) => `<div class="stack-card"><div><strong>第 ${esc(String(run.round_index ?? '?'))} 轮</strong></div><div>后端: ${esc(String(run.backend))}</div><div>状态: ${esc(String(run.status))}</div><div>结论: ${esc(verdictLabel(run.review_result && run.review_result.verdict))}</div><div>问题数: ${esc(String((run.review_result && run.review_result.finding_count) || 0))}</div><div>Session: ${esc(String(run.backend_session_id ?? '-'))}</div><div>退出码: ${esc(String(run.exit_code ?? '-'))}</div></div>`).join('') : '<div class="empty-state">暂无评审轮次。</div>'}</div>
+              <div class="panel-header"><h3>产物</h3></div>
+              <div class="stack-list compact-scroll">${artifacts.length ? artifacts.map((item) => `<div class="stack-card"><div><strong>${esc(String(item.relative_path))}</strong></div><div class="artifact-path">${esc(String(item.path))}</div></div>`).join('') : '<div class="empty-state">暂无产物。</div>'}</div>
             </section>
           </div>`
         document.getElementById('start-task').addEventListener('click', () => startTask(task.id))
-        document.getElementById('validate-task').addEventListener('click', () => validateTask(task.id))
         document.getElementById('export-summary').addEventListener('click', () => exportSummary(task.id))
         document.getElementById('abort-task').addEventListener('click', () => abortTask(task.id))
         const toggleButton = document.getElementById('toggle-events')
@@ -173,7 +189,7 @@
         try { state.tasks = (await api('/api/tasks')).sort((a, b) => b.updated_at - a.updated_at); renderTasks(); if (!keepError) renderError('') } catch (error) { renderError(error.message || 'Failed to load tasks') }
       }
       async function loadTask(taskId) {
-        try { state.detail = await api(`/api/tasks/${taskId}`); renderDetail(); renderError('') } catch (error) { renderError(error.message || 'Failed to load task detail') }
+        try { state.detail = await api(`/api/tasks/${taskId}`); renderDetail(); renderError('') } catch (error) { renderError(error.message || 'Failed to load review detail') }
       }
       function connectStream(taskId) {
         if (state.eventSource) { state.eventSource.close(); state.eventSource = null }
@@ -193,22 +209,19 @@
       async function selectTask(taskId) { state.selectedTaskId = taskId; state.showAllEvents = false; renderTasks(); await loadTask(taskId); connectStream(taskId) }
       async function createTask() {
         try {
-          const title = document.getElementById('title').value.trim()
           const repoPath = document.getElementById('repo-path').value.trim()
-          const sourceUrl = document.getElementById('source-url').value.trim()
-          const description = document.getElementById('description').value.trim()
-          if (!repoPath || (!title && !sourceUrl)) { renderError('Provide a repo path plus either a task title or a GitHub issue URL.'); return }
-          const task = await api('/api/tasks', { method: 'POST', body: JSON.stringify({ title, repo_path: repoPath, source_url: sourceUrl || null, description, source_type: sourceUrl ? 'issue_url' : 'manual' }) })
+          const prUrl = document.getElementById('pr-url').value.trim()
+          const reviewFocus = document.getElementById('review-focus').value.trim()
+          if (!repoPath || !prUrl) { renderError('Provide a repo path and a GitHub pull request URL.'); return }
+          const task = await api('/api/tasks', { method: 'POST', body: JSON.stringify({ repo_path: repoPath, pr_url: prUrl, review_focus: reviewFocus }) })
           await refreshTasks(); await selectTask(task.id)
-          document.getElementById('title').value = ''
-          document.getElementById('description').value = ''
-          document.getElementById('source-url').value = ''
-        } catch (error) { renderError(error.message || 'Failed to create task') }
+          document.getElementById('review-focus').value = ''
+          document.getElementById('pr-url').value = ''
+        } catch (error) { renderError(error.message || 'Failed to create review task') }
       }
-      async function startTask(taskId) { try { await api(`/api/tasks/${taskId}/start`, { method: 'POST', body: JSON.stringify({}) }); await loadTask(taskId); await refreshTasks() } catch (error) { renderError(error.message || 'Failed to start task') } }
-      async function validateTask(taskId) { try { await api(`/api/tasks/${taskId}/validate`, { method: 'POST', body: JSON.stringify({}) }); await loadTask(taskId); await refreshTasks() } catch (error) { renderError(error.message || 'Failed to start validation') } }
-      async function exportSummary(taskId) { try { const result = await api(`/api/tasks/${taskId}/export-summary`, { method: 'POST' }); renderError(`Summary exported to: ${result.path}`) } catch (error) { renderError(error.message || 'Failed to export summary') } }
-      async function abortTask(taskId) { try { await api(`/api/tasks/${taskId}/abort`, { method: 'POST' }); await loadTask(taskId); await refreshTasks() } catch (error) { renderError(error.message || 'Failed to abort task') } }
+      async function startTask(taskId) { try { await api(`/api/tasks/${taskId}/start`, { method: 'POST', body: JSON.stringify({}) }); await loadTask(taskId); await refreshTasks() } catch (error) { renderError(error.message || 'Failed to start review round') } }
+      async function exportSummary(taskId) { try { const result = await api(`/api/tasks/${taskId}/export-summary`, { method: 'POST' }); renderError(`Review summary exported to: ${result.path}`) } catch (error) { renderError(error.message || 'Failed to export review summary') } }
+      async function abortTask(taskId) { try { await api(`/api/tasks/${taskId}/abort`, { method: 'POST' }); await loadTask(taskId); await refreshTasks() } catch (error) { renderError(error.message || 'Failed to abort review round') } }
       document.getElementById('create-task').addEventListener('click', createTask)
       document.getElementById('refresh').addEventListener('click', () => refreshTasks())
       refreshTasks()
