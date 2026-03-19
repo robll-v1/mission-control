@@ -30,7 +30,7 @@ adapters = {
 worktrees = WorktreeManager(RUNTIME_ROOT)
 artifacts = ArtifactStore(RUNTIME_ROOT)
 contexts = ContextCompiler(artifacts)
-execution = ExecutionService(db=db, mission=engine, adapters=adapters, worktrees=worktrees, contexts=contexts)
+execution = ExecutionService(db=db, mission=engine, adapters=adapters, worktrees=worktrees, artifacts=artifacts, contexts=contexts)
 validation = ValidationService(db=db, mission=engine, artifacts=artifacts)
 diffs = DiffService(artifacts)
 summaries = SummaryService(db, artifacts)

@@ -92,6 +92,7 @@
       const esc = (value) => { const div = document.createElement('div'); div.textContent = value ?? ''; return div.innerHTML }
       const payloadText = (payload) => payload && typeof payload.text === 'string' ? payload.text : JSON.stringify(payload ?? {}, null, 2)
       const truncateText = (text, limit = 260) => text.length <= limit ? text : `${text.slice(0, limit)}…`
+      const shortSha = (value) => value ? String(value).slice(0, 12) : '-'
       const verdictLabel = (verdict) => verdict === 'clear' ? '未发现明显问题' : verdict === 'concerns' ? '需要关注' : verdict === 'failed' ? '评审失败' : '暂无结果'
       const verdictTone = (verdict) => verdict === 'clear' ? 'success' : verdict === 'concerns' ? 'warning' : verdict === 'failed' ? 'danger' : 'neutral'
       const api = async (path, init = {}) => {
@@ -141,7 +142,7 @@
             <div>
               <h2>${esc(task.title)}</h2>
               <p>${esc(task.description || 'No review brief provided.')}</p>
-              <div class="hero-meta"><span>PR: ${esc(task.source_url || '-')}</span><span>Repo: ${esc(task.repo_path)}</span><span>Rounds: ${runs.length}</span><span>Stage: ${esc(task.current_stage)}</span><span>Updated: ${esc(timeText(task.updated_at))}</span></div>
+              <div class="hero-meta"><span>PR: ${esc(task.source_url || '-')}</span><span>Repo: ${esc(task.repo_path)}</span><span>Rounds: ${runs.length}</span><span>Latest Commit: ${esc(shortSha((runs[runs.length - 1] && runs[runs.length - 1].review_revision) || task.pr_head_sha || '-'))}</span><span>Stage: ${esc(task.current_stage)}</span><span>Updated: ${esc(timeText(task.updated_at))}</span></div>
             </div>
             <div class="hero-actions">
               <button id="start-task" ${task.status === 'running' ? 'disabled' : ''}>${runs.length ? 'Start Next Review Round' : 'Start First Review Round'}</button>
@@ -174,7 +175,7 @@
                 ${(result.findings || []).map((finding) => `<div class="stack-card"><div><strong>[${esc(finding.severity)}] ${esc(finding.path || '路径缺失')}${finding.line ? `:${esc(String(finding.line))}` : ''}</strong></div><div>${esc(finding.summary || '')}</div></div>`).join('')}
               ` : '<div class="empty-state">暂无结构化评审结论。</div>'}</div>
               <div class="panel-header"><h3>评审轮次</h3></div>
-              <div class="stack-list compact-scroll">${runs.length ? runs.map((run) => `<div class="stack-card"><div><strong>第 ${esc(String(run.round_index ?? '?'))} 轮</strong></div><div>后端: ${esc(String(run.backend))}</div><div>状态: ${esc(String(run.status))}</div><div>结论: ${esc(verdictLabel(run.review_result && run.review_result.verdict))}</div><div>问题数: ${esc(String((run.review_result && run.review_result.finding_count) || 0))}</div><div>Session: ${esc(String(run.backend_session_id ?? '-'))}</div><div>退出码: ${esc(String(run.exit_code ?? '-'))}</div></div>`).join('') : '<div class="empty-state">暂无评审轮次。</div>'}</div>
+              <div class="stack-list compact-scroll">${runs.length ? runs.map((run) => `<div class="stack-card"><div><strong>第 ${esc(String(run.round_index ?? '?'))} 轮</strong></div><div>后端: ${esc(String(run.backend))}</div><div>状态: ${esc(String(run.status))}</div><div>结论: ${esc(verdictLabel(run.review_result && run.review_result.verdict))}</div><div>问题数: ${esc(String((run.review_result && run.review_result.finding_count) || 0))}</div><div>Commit: ${esc(shortSha(run.review_revision || '-'))}</div><div>Session: ${esc(String(run.backend_session_id ?? '-'))}</div><div>退出码: ${esc(String(run.exit_code ?? '-'))}</div></div>`).join('') : '<div class="empty-state">暂无评审轮次。</div>'}</div>
               <div class="panel-header"><h3>产物</h3></div>
               <div class="stack-list compact-scroll">${artifacts.length ? artifacts.map((item) => `<div class="stack-card"><div><strong>${esc(String(item.relative_path))}</strong></div><div class="artifact-path">${esc(String(item.path))}</div></div>`).join('') : '<div class="empty-state">暂无产物。</div>'}</div>
             </section>

@@ -12,14 +12,20 @@ from app.adapters.base import RunnerAdapter
 from app.core.config import load_repo_config
 from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
+from app.core.github_ingest import fetch_pull_request
 from app.core.mission_engine import MissionEngine
-from app.core.models import EventLevel, Run, TaskStatus
+from app.core.models import EventLevel, Run, Task, TaskStatus
 from app.core.review_policy import prepare_static_review_env
 from app.core.worktree import WorktreeManager
+from app.services.artifact_store import ArtifactStore
 from app.services.review_result_service import ReviewResultService
 
 
 class IdleTimeoutError(RuntimeError):
+    pass
+
+
+class PullRequestRefreshError(RuntimeError):
     pass
 
 
@@ -39,12 +45,14 @@ class ExecutionService:
         mission: MissionEngine,
         adapters: dict[str, RunnerAdapter],
         worktrees: WorktreeManager,
+        artifacts: ArtifactStore,
         contexts: ContextCompiler,
     ):
         self.db = db
         self.mission = mission
         self.adapters = adapters
         self.worktrees = worktrees
+        self.artifacts = artifacts
         self.contexts = contexts
         self._lock = threading.Lock()
         self._active: dict[str, ActiveProcess] = {}
@@ -59,7 +67,8 @@ class ExecutionService:
             if task_id in self._active:
                 raise RuntimeError('a review round is already in progress for this PR')
 
-        self.mission.set_stage(task.id, status=TaskStatus.INGESTING, stage='prepare_review')
+        task = self._refresh_pull_request_snapshot(task)
+        task = self.mission.set_stage(task.id, status=TaskStatus.INGESTING, stage='prepare_review')
         branch_name, worktree_path, revision = self.worktrees.ensure_worktree(task)
         task.branch_name = branch_name
         task.worktree_path = worktree_path
@@ -73,6 +82,7 @@ class ExecutionService:
                 'candidate_files': len(compiled.payload.get('candidate_files', [])),
                 'worktree_path': worktree_path,
                 'review_revision': revision,
+                'pr_head_sha': task.pr_head_sha,
             },
         )
 
@@ -83,6 +93,7 @@ class ExecutionService:
             backend=task.backend,
             round_index=round_index,
             review_note=(review_note or '').strip(),
+            review_revision=revision,
             started_at=time.time(),
             status='running',
         )
@@ -159,6 +170,8 @@ class ExecutionService:
                     'worktree_path': task.worktree_path,
                     'idle_timeout_sec': idle_timeout_sec,
                     'round_index': round_index,
+                    'review_revision': run.review_revision,
+                    'pr_head_sha': task.pr_head_sha,
                 },
             )
             proc = subprocess.Popen(
@@ -353,7 +366,7 @@ class ExecutionService:
 
     def _cleanup_task_worktree(
         self,
-        task,
+        task: Task,
         *,
         run_id: str | None,
         round_index: int | None,
@@ -384,3 +397,56 @@ class ExecutionService:
             },
         )
         return result
+
+    def _refresh_pull_request_snapshot(self, task: Task) -> Task:
+        if task.source_type != 'pull_request' or not task.source_url:
+            return task
+
+        previous_head_sha = task.pr_head_sha
+        previous_changed_files = len(task.review_paths)
+        try:
+            pull_request = fetch_pull_request(task.source_url)
+        except Exception as exc:
+            self.mission.append_event(
+                task_id=task.id,
+                kind='task.pull_request_refresh_failed',
+                level=EventLevel.ERROR,
+                payload={'source_url': task.source_url, 'message': str(exc)},
+            )
+            raise PullRequestRefreshError(f'failed to refresh latest PR snapshot: {exc}') from exc
+
+        raw_pr = pull_request.raw_pr
+        task.title = pull_request.task_title
+        task.description = pull_request.to_description(review_focus=task.review_focus)
+        task.pr_owner = pull_request.owner
+        task.pr_repo = pull_request.repo
+        task.pr_number = pull_request.pr_number
+        task.pr_head_ref = str(raw_pr.get('head', {}).get('ref') or '') or None
+        task.pr_head_sha = str(raw_pr.get('head', {}).get('sha') or '') or None
+        task.pr_base_ref = str(raw_pr.get('base', {}).get('ref') or '') or None
+        task.review_paths = pull_request.changed_files
+        task.updated_at = time.time()
+        self.db.save_task(task)
+
+        pr_json_path = self.artifacts.write_text(task.id, 'context/pull_request.json', pull_request.to_json())
+        pr_md_path = self.artifacts.write_text(
+            task.id,
+            'context/pull_request.md',
+            task.description,
+        )
+        self.mission.append_event(
+            task_id=task.id,
+            kind='task.pull_request_refreshed',
+            payload={
+                'source_url': task.source_url,
+                'previous_head_sha': previous_head_sha,
+                'head_sha': task.pr_head_sha,
+                'head_changed': previous_head_sha != task.pr_head_sha,
+                'changed_files': len(task.review_paths),
+                'previous_changed_files': previous_changed_files,
+                'reviews': len(pull_request.reviews),
+                'comments': len(pull_request.issue_comments) + len(pull_request.review_comments),
+                'artifact_paths': [pr_json_path, pr_md_path],
+            },
+        )
+        return self.db.get_task(task.id) or task

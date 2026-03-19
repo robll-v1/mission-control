@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.core.execution import ExecutionService
+from app.core.execution import ExecutionService, PullRequestRefreshError
 
 
 def get_execution() -> ExecutionService:
@@ -23,6 +23,8 @@ def start_task(task_id: str, request: StartTaskRequest, execution: ExecutionServ
         run = execution.start_task(task_id, prompt=request.prompt, review_note=request.review_note)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PullRequestRefreshError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return run.model_dump()

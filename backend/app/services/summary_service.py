@@ -58,6 +58,7 @@ class SummaryService:
             lines.extend(
                 (
                     f'- 第 {run.round_index} 轮：status={run.status} exit={run.exit_code} '
+                    f'revision={run.review_revision or "-"} '
                     f'session={run.backend_session_id or "-"} verdict='
                     f'{run.review_result.verdict if run.review_result is not None else "inconclusive"} '
                     f'findings={run.review_result.finding_count if run.review_result is not None else 0}'

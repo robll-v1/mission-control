@@ -44,6 +44,7 @@ type Task = {
   pr_number?: number | null
   pr_owner?: string | null
   pr_repo?: string | null
+  pr_head_sha?: string | null
   latest_review_result?: ReviewResult | null
   updated_at: number
   last_run_id?: string | null
@@ -68,6 +69,7 @@ type ReviewRound = {
   backend: string
   round_index: number
   review_note: string
+  review_revision?: string | null
   status: string
   backend_session_id?: string | null
   exit_code?: number | null
@@ -152,6 +154,11 @@ const relativeTimeText = (ts?: number) => {
   const diffHour = Math.floor(diffMin / 60)
   if (diffHour < 24) return `${diffHour}h ago`
   return `${Math.floor(diffHour / 24)}d ago`
+}
+
+const shortSha = (value?: string | null) => {
+  if (!value) return '-'
+  return value.slice(0, 12)
 }
 
 const stringifyPayload = (payload: Record<string, unknown>) => {
@@ -495,6 +502,7 @@ export function App() {
                 <span>PR<strong>{selectedTask.source_url || '-'}</strong></span>
                 <span>Repo<strong>{selectedTask.repo_path}</strong></span>
                 <span>Rounds<strong>{detail.reviewRounds.length}</strong></span>
+                <span>Latest Commit<strong>{shortSha(latestRound?.review_revision ?? selectedTask.pr_head_sha)}</strong></span>
                 <span>Stage<strong>{stageLabel(selectedTask.current_stage)}</strong></span>
                 <span>Updated<strong>{relativeTimeText(selectedTask.updated_at)}</strong></span>
               </div>
@@ -609,6 +617,7 @@ export function App() {
                           <div>结论: {verdictLabel(round.review_result?.verdict)}</div>
                           <div>问题数: {round.review_result?.finding_count ?? 0}</div>
                           <div>摘要: {round.review_result?.summary || '-'}</div>
+                          <div>Commit: {shortSha(round.review_revision)}</div>
                           <div>Session: {round.backend_session_id ?? '-'}</div>
                           <div>退出码: {String(round.exit_code ?? '-')}</div>
                           <div>开始时间: {timeText(round.started_at)}</div>

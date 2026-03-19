@@ -82,6 +82,7 @@ class Run(BaseModel):
     backend: str
     round_index: int = 1
     review_note: str = ''
+    review_revision: str | None = None
     backend_session_id: str | None = None
     status: str = 'created'
     review_result: ReviewResult | None = None
