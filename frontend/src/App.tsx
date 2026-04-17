@@ -140,7 +140,7 @@ const normalizeTaskDetail = (payload: TaskDetailResponse): TaskDetail => {
   }
 }
 
-const timeText = (ts?: number) => {
+const timeText = (ts?: number | null) => {
   if (!ts) return '-'
   return new Date(ts * 1000).toLocaleString()
 }

@@ -59,7 +59,16 @@ jobs:
       - name: Start backend and health check
         run: |
           amc start --no-browser --no-ui &
-          sleep 10
+          # Wait for ports.json to appear (up to 30s)
+          for i in $(seq 1 30); do
+            [ -f .run/ports.json ] && break
+            sleep 1
+          done
+          if [ ! -f .run/ports.json ]; then
+            echo "ERROR: ports.json not found after 30s"
+            cat .run/backend.log 2>/dev/null || true
+            exit 1
+          fi
           PORT=$(python -c "import json; print(json.load(open('.run/ports.json'))['backend'])")
           curl -sf http://127.0.0.1:$PORT/api/health | python -c "
           import json, sys
