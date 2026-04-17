@@ -21,3 +21,6 @@ package-dir = {"" = "backend"}
 
 [tool.setuptools.packages.find]
 where = ["backend"]
+
+[project.scripts]
+amc = "app.cli:main"

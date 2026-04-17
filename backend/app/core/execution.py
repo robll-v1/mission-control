@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -22,6 +24,10 @@ from app.services.review_result_service import ReviewResultService
 
 
 class IdleTimeoutError(RuntimeError):
+    pass
+
+
+class PreflightError(RuntimeError):
     pass
 
 
@@ -66,6 +72,8 @@ class ExecutionService:
         with self._lock:
             if task_id in self._active:
                 raise RuntimeError('a review round is already in progress for this PR')
+
+        self._preflight_check(task)
 
         task = self._refresh_pull_request_snapshot(task)
         task = self.mission.set_stage(task.id, status=TaskStatus.INGESTING, stage='prepare_review')
@@ -181,7 +189,8 @@ class ExecutionService:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                start_new_session=True,
+                start_new_session=(sys.platform != 'win32'),
+                **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {}),
                 env=prepare_static_review_env(self.worktrees.runtime_root),
             )
             with self._lock:
@@ -328,6 +337,22 @@ class ExecutionService:
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen[str]) -> None:
+        if sys.platform == 'win32':
+            # Windows: no process groups via os.killpg
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            return
+
+        # Unix: terminate the whole process group
         try:
             os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -347,6 +372,45 @@ class ExecutionService:
                     proc.kill()
                 except OSError:
                     pass
+
+    def _preflight_check(self, task: Task) -> None:
+        adapter = self.adapters.get(task.backend)
+        if adapter is None:
+            raise PreflightError(f'backend adapter not configured: {task.backend}')
+
+        backend_name = adapter.name
+        executable = backend_name
+        if not shutil.which(executable):
+            raise PreflightError(
+                f'{executable} is not installed or not in PATH. '
+                f'Install it before starting a review.'
+            )
+
+        try:
+            result = subprocess.run(
+                [executable, 'run', '--format', 'json', 'Reply with exactly one word: OK'],
+                capture_output=True, text=True, timeout=60,
+                cwd=task.repo_path,
+            )
+            if result.returncode != 0:
+                stderr_preview = (result.stderr or '').strip()[:300]
+                raise PreflightError(
+                    f'{executable} preflight test failed (exit {result.returncode}). '
+                    f'Check your API key and configuration. stderr: {stderr_preview}'
+                )
+        except subprocess.TimeoutExpired:
+            raise PreflightError(
+                f'{executable} preflight test timed out after 60s. '
+                f'The LLM backend may be unreachable.'
+            )
+        except FileNotFoundError:
+            raise PreflightError(f'{executable} executable not found.')
+
+        self.mission.append_event(
+            task_id=task.id,
+            kind='task.preflight_passed',
+            payload={'backend': backend_name},
+        )
 
     @staticmethod
     def _idle_timeout_seconds(repo_path: str) -> int:
