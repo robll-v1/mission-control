@@ -145,8 +145,24 @@ def admin_shutdown():
             aborted.append(task_id)
         except Exception:
             pass
-    # Schedule SIGTERM to self after response is sent
-    os.kill(os.getpid(), signal.SIGTERM)
+    # Kill the parent process (reloader in --reload mode) for clean exit
+    parent_pid = os.getppid()
+    my_pid = os.getpid()
+    # Schedule both SIGTERM signals after response is sent
+    def _deferred_kill():
+        import time as _time
+        _time.sleep(0.5)
+        try:
+            os.kill(parent_pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            os.kill(my_pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    import threading
+    threading.Thread(target=_deferred_kill, daemon=True).start()
     return {'ok': True, 'aborted_tasks': aborted}
 
 

@@ -1,19 +1,64 @@
-# PR Review Control
+# Mission Control
 
 Local-first console for multi-round GitHub pull request review, powered by AI agents.
 
+## Quick Start
+
+```bash
+# macOS / Linux — one command does everything
+make start
+
+# Or use the cross-platform Python CLI (also works on Windows)
+pip install -e .
+amc start
+```
+
+That's it. The system will:
+1. Create a virtual environment and install dependencies (first run only)
+2. Install frontend packages if Node.js is available
+3. Find free ports automatically (avoids conflicts)
+4. Start the backend API and frontend dev server
+5. Wait for health check, then open the browser
+
+### Stop / Status
+
+```bash
+amc stop      # graceful shutdown — aborts active reviews first
+amc status    # show running services and endpoints
+```
+
+### CLI Options
+
+```bash
+amc start --port 9000          # custom backend port
+amc start --ui-port 9173       # custom frontend port
+amc start --no-ui              # backend only (no frontend)
+amc start --no-browser         # don't auto-open browser
+make start PORT=9000           # same via Makefile
+```
+
 ## What It Does
 
-PR Review Control automates code review by ingesting GitHub PRs, compiling relevant context from your local repo, and running structured review rounds through an AI agent (opencode). It tracks findings, enforces review policies, and produces exportable summaries.
+Mission Control automates code review by ingesting GitHub PRs, compiling relevant context from your local repo, and running structured review rounds through an AI agent ([OpenCode](https://github.com/opencode-ai/opencode)). It tracks findings, enforces review policies, and produces exportable summaries.
 
-## Scope
-- Ingest a GitHub pull request URL and a local repository path
-- Compile review context from PR metadata, diff, and candidate source files
-- Run repeated review rounds through a configurable backend adapter
-- Stream review events in real-time via SSE
-- Extract structured review results (verdict, findings with severity/path/line)
-- Enforce static review policy (block dangerous commands during review)
-- Capture artifacts such as context snapshots, diffs, and exported review summaries
+### Key Features
+- **Multi-round review**: run repeated review rounds, each building on previous findings
+- **Context-aware**: keyword extraction + file scoring to build focused review prompts
+- **Static review policy**: blocks dangerous commands (go, docker, npm, etc.) during review
+- **Real-time streaming**: SSE event stream for live review progress
+- **Structured results**: verdict (clear/concerns/failed), findings with severity/path/line
+- **Preflight check**: verifies AI backend is installed and responsive before starting review
+- **Graceful shutdown**: `amc stop` aborts active reviews cleanly, no orphaned processes
+- **Crash recovery**: on restart, detects and marks stale tasks from previous crashes
+
+## Prerequisites
+
+| Tool | Required | Notes |
+|------|----------|-------|
+| Python 3.11+ | ✅ | Backend runtime |
+| [OpenCode](https://github.com/opencode-ai/opencode) | ✅ | AI review agent |
+| Node.js 18+ | Optional | Frontend dev server (UI) |
+| `GITHUB_TOKEN` | Recommended | Higher GitHub API rate limits |
 
 ## Architecture
 
@@ -26,27 +71,25 @@ backend/
     core/          Engine, execution, models, context compiler, worktree, review policy
     services/      Summary, diff, artifact store, review result extraction
     schemas/       Pydantic request/response schemas
-scripts/           Dev and verification scripts
+    cli.py         Cross-platform CLI (amc start/stop/status)
+scripts/           Shell helper scripts (macOS/Linux)
 runtime/           Generated at runtime — worktrees, task artifacts, policy bins
+data/              SQLite database (auto-created)
 ```
 
 ## Review Flow
-1. Create a review task from a GitHub PR URL and a local repository path.
-2. Context compiler extracts keywords, scores candidate files, and builds a review prompt.
-3. A git worktree is created at the PR head SHA for isolated review.
-4. The agent runs a review round in static mode (dangerous commands blocked).
-5. Review results are extracted: verdict (clear/concerns/failed), findings with severity.
-6. Continue with additional review rounds or run validation checks.
-7. Export the review summary when ready to hand off.
 
-## Local Development
-- Bootstrap everything: `./scripts/bootstrap.sh`
-- Start backend service: `./scripts/dev-backend.sh`
-- Start backend with built-in static console: `./scripts/dev-static.sh`
-- Start React frontend: `./scripts/dev-frontend.sh`
-- Run local verification: `./scripts/verify.sh`
+1. Create a review task from a GitHub PR URL and a local repository path
+2. **Preflight check** — verify OpenCode is installed and the LLM is reachable
+3. Context compiler extracts keywords, scores candidate files, builds review prompt
+4. A git worktree is created at the PR head SHA for isolated review
+5. The agent runs a review round in static mode (dangerous commands blocked)
+6. Review results are extracted: verdict + findings with severity
+7. Continue with additional review rounds or run validation checks
+8. Export the review summary when ready to hand off
 
-## Endpoints
+## API Endpoints
+
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/health` | Health check |
@@ -59,15 +102,20 @@ runtime/           Generated at runtime — worktrees, task artifacts, policy bi
 | POST | `/api/tasks/{id}/validate` | Run validation checks |
 | POST | `/api/tasks/{id}/export-summary` | Export review summary |
 | POST | `/api/tasks/{id}/export-diff` | Export worktree diff |
+| POST | `/api/admin/shutdown` | Graceful shutdown (abort tasks + exit) |
 
 ## Configuration (`.amc.yaml`)
 
 ```yaml
+repo:
+  path: .                        # Repository path
+  base_branch: main              # Base branch for PR context
+
 backend:
-  default: opencode        # Agent backend
+  default: opencode              # Agent backend
   opencode:
-    model: ''              # Model override (empty = opencode default)
-    variant: ''            # Variant override
+    model: ''                    # Model override (empty = opencode default)
+    variant: ''                  # Variant override
 
 context:
   include_recent_commits: 8      # Recent commits for context
@@ -85,11 +133,36 @@ validation:
       command: ''                # e.g. 'go test ./...'
 ```
 
-## Review Policy
+## Reliability
 
-In static review mode, the system creates a restricted `PATH` that blocks potentially dangerous commands (go, docker, npm, make, etc.), ensuring the agent only reads and analyzes code without executing it.
+### Preflight Check
+Before every review round, the system verifies that the AI backend (OpenCode) is installed and can respond. If not, it fails fast with a clear error message instead of starting a broken review.
+
+### Graceful Shutdown
+When you run `amc stop` or press Ctrl+C during `amc start`:
+1. CLI calls `POST /api/admin/shutdown` to notify the backend
+2. Backend aborts all active review tasks (kills OpenCode subprocesses, updates task status)
+3. Backend exits cleanly via SIGTERM
+4. CLI force-kills any remaining processes as fallback
+
+### Crash Recovery
+If the server is killed unexpectedly (power loss, `kill -9`, etc.):
+- On next startup, `_recover_stale_tasks()` scans the database
+- Any tasks stuck in `running` or `ingesting` status are marked as `FAILED`
+- A `task.recovered` event is logged for auditability
+
+## Cross-Platform Support
+
+| Feature | macOS/Linux | Windows |
+|---------|-------------|---------|
+| `make start` | ✅ | ❌ (no make) |
+| `amc start` | ✅ | ✅ |
+| Process management | `killpg` / `SIGTERM` | `taskkill /T` / `terminate()` |
+| Port detection | `socket.connect_ex` | `socket.connect_ex` |
+| Browser opening | `webbrowser.open` | `webbrowser.open` |
 
 ## Notes
-- Set `GITHUB_TOKEN` or `GH_TOKEN` locally for higher GitHub API rate limits.
-- Review tasks keep round history and artifacts under `runtime/tasks/<task-id>/`.
-- Worktrees are created under `runtime/worktrees/<task-id>/` and auto-cleaned after review.
+- Set `GITHUB_TOKEN` or `GH_TOKEN` for higher GitHub API rate limits
+- Review tasks keep round history and artifacts under `runtime/tasks/<task-id>/`
+- Worktrees are created under `runtime/worktrees/<task-id>/` and auto-cleaned after review
+- Logs are saved to `.run/backend.log` and `.run/frontend.log` during dev mode
