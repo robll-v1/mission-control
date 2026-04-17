@@ -329,6 +329,8 @@ def cmd_start(args: argparse.Namespace) -> None:
     def _shutdown(signum=None, frame=None):
         print()
         _info('Shutting down...')
+        _graceful_shutdown_backend()
+        time.sleep(1)
         for pid in pids:
             _kill_pid(pid)
         import shutil
@@ -350,11 +352,50 @@ def cmd_start(args: argparse.Namespace) -> None:
         _shutdown()
 
 
+def _graceful_shutdown_backend() -> bool:
+    """Ask backend to gracefully abort active tasks and shut down. Returns True on success."""
+    ports_file = _run_dir() / 'ports.json'
+    if not ports_file.exists():
+        return False
+    try:
+        ports = json.loads(ports_file.read_text())
+        backend_port = ports.get('backend')
+        if not backend_port:
+            return False
+        import urllib.request
+        req = urllib.request.Request(
+            f'http://127.0.0.1:{backend_port}/api/admin/shutdown',
+            method='POST',
+            data=b'',
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        if resp.status == 200:
+            result = json.loads(resp.read())
+            aborted = result.get('aborted_tasks', [])
+            if aborted:
+                _info(f'Gracefully aborted {len(aborted)} active task(s)')
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def cmd_stop(_args: argparse.Namespace) -> None:
     run_dir = _run_dir()
     if not run_dir.exists():
         _ok('No services running.')
         return
+
+    # Try graceful shutdown first (aborts active reviews)
+    backend_pid = _read_pid('backend')
+    if backend_pid and _pid_alive(backend_pid):
+        _info('Requesting graceful shutdown...')
+        if _graceful_shutdown_backend():
+            # Wait a bit for backend to finish aborting tasks
+            for _ in range(8):
+                if not _pid_alive(backend_pid):
+                    break
+                time.sleep(0.5)
 
     stopped = 0
     for pidfile in sorted(run_dir.glob('*.pid')):
