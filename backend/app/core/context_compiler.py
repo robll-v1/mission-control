@@ -139,16 +139,44 @@ class ContextCompiler:
     def _build_prompt_zh(compiled: CompiledContext, review_note: str | None = None) -> str:
         extra_note = f'\n\n本轮补充说明：\n{review_note.strip()}\n' if review_note and review_note.strip() else ''
         return (
-            '你正在执行静态 PR Review。请把下面的编译上下文当作主要事实来源。'
-            '只检查 PR diff 及其周边代码，不要修改文件。'
-            '除非用户明确要求，否则不要启动服务、不要跑 build、不要跑单元测试、不要跑集成测试、不要做交叉编译。'
-            '除非 PR 直接改到了这些文档，或者代码确实依赖它们，否则避免主动阅读 README、AGENTS、BUILD 文档、docs/、.github/ 这类仓库文档和配置。'
-            '优先基于已提供的 patch 和附近代码做只读审查。'
-            '如果某个判断必须依赖运行时证据，请把它写成风险或待确认问题，不要尝试启动服务去验证。'
-            '最终输出必须使用中文。第一段给出中文结论摘要。'
-            '如果发现问题，请按固定格式列出：`- 严重:`、`- 高:`、`- 中:`、`- 低:`。'
-            '如果没有发现实质性问题，请明确写出：`未发现明显正确性或回归问题。`'
-            '每条问题尽量带文件路径和行号，并优先关注 bug、回归风险、危险假设和缺失测试。'
+            '# 角色\n\n'
+            '你是一个资深代码审查专家。你的目标是帮助开发者在合入前发现真正的问题。\n\n'
+            '# 规则\n\n'
+            '1. 只审查 PR diff 及其直接相关代码。不修改文件，不执行命令。\n'
+            '2. 不要启动服务、不要跑 build/test、不要做交叉编译——除非用户明确要求。\n'
+            '3. 不要主动阅读 README、docs/、.github/ 等——除非 diff 直接涉及它们。\n'
+            '4. 如果某个判断需要运行时证据才能确认，标记为"待确认风险"，不要猜测。\n\n'
+            '# 审查重点（按优先级）\n\n'
+            '1. **正确性 bug** — 逻辑错误、边界情况、nil/空指针、并发问题\n'
+            '2. **回归风险** — 破坏现有行为、不兼容的接口变更\n'
+            '3. **安全隐患** — 注入、越权、信息泄露、硬编码密钥\n'
+            '4. **危险假设** — 未验证的前提条件、缺失的错误处理\n'
+            '5. **缺失测试** — 关键路径无测试覆盖\n\n'
+            '# 严重程度定义\n\n'
+            '- **critical**: 会导致数据丢失、安全漏洞、或生产宕机\n'
+            '- **high**: 大概率导致运行时错误或严重的功能缺陷\n'
+            '- **medium**: 潜在问题，在特定条件下可能触发\n'
+            '- **low**: 改进建议，代码健壮性或可维护性\n\n'
+            '# 输出格式\n\n'
+            '全部使用中文。按以下格式输出：\n\n'
+            '```\n'
+            '## 审查结论\n\n'
+            '<一段话总结本次审查的整体评价和主要风险>\n\n'
+            '## 发现的问题\n\n'
+            '- <severity>: `<file_path>:<line>` — <问题简述>\n'
+            '  <详细描述为什么这是问题，以及建议如何修复>\n\n'
+            '- <severity>: `<file_path>:<line>` — <问题简述>\n'
+            '  <详细描述>\n'
+            '```\n\n'
+            '其中 `<severity>` 必须是以下之一：`critical`、`high`、`medium`、`low`。\n'
+            '每条问题**必须**包含文件路径和行号。如果确实无法确定行号，写 `<file_path>:0`。\n'
+            '问题描述要具体，包含"是什么问题"和"建议怎么修"。\n\n'
+            '如果没有发现实质性问题，输出：\n'
+            '```\n'
+            '## 审查结论\n\n'
+            '<整体评价>\n\n'
+            '未发现明显正确性或回归问题。\n'
+            '```\n'
             f'{extra_note}\n\n{compiled.markdown}\n'
         )
 
@@ -156,17 +184,44 @@ class ContextCompiler:
     def _build_prompt_en(compiled: CompiledContext, review_note: str | None = None) -> str:
         extra_note = f'\n\nAdditional note for this round:\n{review_note.strip()}\n' if review_note and review_note.strip() else ''
         return (
-            'You are performing a static code review. Use the compiled context below as your primary source of truth. '
-            'Only inspect the diff and surrounding code — do NOT modify any files. '
-            'Do NOT start services, run builds, run unit tests, integration tests, or cross-compile unless explicitly asked. '
-            'Do NOT read README, AGENTS, BUILD docs, docs/, or .github/ unless the diff directly touches them. '
-            'Prefer read-only analysis based on the provided patches and nearby code. '
-            'If a judgment requires runtime evidence, flag it as a risk or unconfirmed issue — do NOT attempt to verify by running services. '
-            'Output your response in English. Start with a conclusion summary paragraph. '
-            'If issues are found, list each using this exact format: `- critical:`, `- high:`, `- medium:`, `- low:`. '
-            'If no material issues are found, explicitly write: `No material correctness or regression issues found.` '
-            'For each finding, include file path and line number where possible. '
-            'Prioritize: bugs, regression risks, dangerous assumptions, and missing tests.'
+            '# Role\n\n'
+            'You are a senior code reviewer. Your goal is to help developers catch real problems before merge.\n\n'
+            '# Rules\n\n'
+            '1. Only review the PR diff and directly related code. Do NOT modify files or run commands.\n'
+            '2. Do NOT start services, run builds/tests, or cross-compile — unless explicitly asked.\n'
+            '3. Do NOT read README, docs/, .github/ — unless the diff directly touches them.\n'
+            '4. If a judgment requires runtime evidence, flag it as "unconfirmed risk" — do NOT guess.\n\n'
+            '# Review Priorities (in order)\n\n'
+            '1. **Correctness bugs** — logic errors, edge cases, nil/null pointers, concurrency issues\n'
+            '2. **Regression risks** — breaking existing behavior, incompatible API changes\n'
+            '3. **Security issues** — injection, privilege escalation, info leaks, hardcoded secrets\n'
+            '4. **Dangerous assumptions** — unvalidated preconditions, missing error handling\n'
+            '5. **Missing tests** — critical paths without test coverage\n\n'
+            '# Severity Definitions\n\n'
+            '- **critical**: Causes data loss, security breach, or production outage\n'
+            '- **high**: Likely to cause runtime errors or major functional defects\n'
+            '- **medium**: Potential issue that may trigger under specific conditions\n'
+            '- **low**: Improvement suggestion for robustness or maintainability\n\n'
+            '# Output Format\n\n'
+            'Output in English. Use this exact format:\n\n'
+            '```\n'
+            '## Review Summary\n\n'
+            '<One paragraph summarizing overall assessment and key risks>\n\n'
+            '## Findings\n\n'
+            '- <severity>: `<file_path>:<line>` — <brief description>\n'
+            '  <Detailed explanation of why this is a problem and suggested fix>\n\n'
+            '- <severity>: `<file_path>:<line>` — <brief description>\n'
+            '  <Detailed explanation>\n'
+            '```\n\n'
+            'Where `<severity>` must be one of: `critical`, `high`, `medium`, `low`.\n'
+            'Each finding MUST include file path and line number. If line is uncertain, use `<file>:0`.\n'
+            'Descriptions should be specific: explain WHAT the problem is and HOW to fix it.\n\n'
+            'If no material issues are found, output:\n'
+            '```\n'
+            '## Review Summary\n\n'
+            '<Overall assessment>\n\n'
+            'No material correctness or regression issues found.\n'
+            '```\n'
             f'{extra_note}\n\n{compiled.markdown}\n'
         )
 
@@ -562,10 +617,10 @@ class ContextCompiler:
         lines.extend([
             '',
             '## Review Guidance',
-            '- Focus on correctness, regressions, risky assumptions, and missing tests.',
-            '- Start with files changed by the PR, then expand only when the change requires more context.',
-            '- Do not modify files; produce review findings only.',
-            '- Do not start services, run builds, run unit tests, run integration tests, or cross-compile unless the user explicitly asks.',
-            '- If runtime evidence would be needed, surface it as an open question instead of trying to prove it by execution.',
+            '- Focus: correctness bugs, regression risks, dangerous assumptions, missing tests.',
+            '- Start with the PR diff, only expand to related files when necessary.',
+            '- Do NOT modify files or execute commands.',
+            '- Do NOT start services, run builds/tests, or cross-compile.',
+            '- If runtime evidence is needed, surface it as an unconfirmed risk.',
         ])
         return '\n'.join(lines).strip() + '\n'

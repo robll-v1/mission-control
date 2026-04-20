@@ -22,8 +22,12 @@ SEVERITY_PATTERN = re.compile(
     r'^\s*[-*]\s*\*{0,2}(critical|high|medium|low|严重|高|中|低)\*{0,2}\s*[:：\-]\s*(.+)$',
     re.IGNORECASE,
 )
+# Match `path/to/file.go:123` — backtick-wrapped path with line number
 PATH_LINE_PATTERN = re.compile(r'`([^`:\s]+):(\d+)`')
+# Match `path/to/file.go` — backtick-wrapped path without line number
 PATH_PATTERN = re.compile(r'`([^`/\s]+/[^`:\s]+)`')
+# Match bare path:line without backticks (e.g. cmd/main.go:42)
+BARE_PATH_LINE_PATTERN = re.compile(r'(\S+/\S+?):(\d+)')
 NOISE_TEXT_PREFIXES = ('[mnemo]',)
 NOISY_EVENT_KINDS = {'agent.step_start', 'agent.step_finish'}
 
@@ -147,9 +151,16 @@ class ReviewResultService:
                 severity = SEVERITY_ALIASES.get(raw_severity, raw_severity)
                 body = match.group(2).strip()
                 path, line_no = ReviewResultService._extract_path_and_line(body)
+                # Extract summary: text after `—` or `--` separator if present
+                summary = body
+                for sep in (' — ', ' -- ', ' - '):
+                    if sep in body:
+                        parts = body.split(sep, 1)
+                        summary = parts[1].strip() if parts[1].strip() else body
+                        break
                 current_finding = ReviewFinding(
                     severity=severity,
-                    summary=body,
+                    summary=summary,
                     path=path,
                     line=line_no,
                     detail=body,
@@ -164,6 +175,9 @@ class ReviewResultService:
     @staticmethod
     def _extract_path_and_line(body: str) -> tuple[str | None, int | None]:
         match = PATH_LINE_PATTERN.search(body)
+        if match:
+            return match.group(1), int(match.group(2))
+        match = BARE_PATH_LINE_PATTERN.search(body)
         if match:
             return match.group(1), int(match.group(2))
         match = PATH_PATTERN.search(body)
@@ -194,7 +208,7 @@ class ReviewResultService:
     @staticmethod
     def _derive_summary(*, text: str, findings: list[ReviewFinding], verdict: ReviewVerdict) -> str:
         for paragraph in [segment.strip() for segment in text.split('\n\n') if segment.strip()]:
-            if not paragraph.startswith(('- ', '* ')):
+            if not paragraph.startswith(('- ', '* ', '#')):
                 return paragraph
         if findings:
             return findings[0].summary
