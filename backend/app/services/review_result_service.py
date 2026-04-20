@@ -208,3 +208,41 @@ class ReviewResultService:
     def update_task_result(*, task: Task, rounds: list[Run]) -> Task:
         task.latest_review_result = ReviewResultService.latest_result(rounds)
         return task
+
+    @staticmethod
+    def parse_raw_text(text: str) -> ReviewResult:
+        """Parse raw LLM response text into a ReviewResult (no Run needed).
+
+        Used by the direct API / inline review path.
+        """
+        findings = ReviewResultService._parse_findings(text)
+        counts = Counter(finding.severity for finding in findings)
+
+        # Derive verdict without a Run object
+        if findings:
+            verdict = ReviewVerdict.CONCERNS
+        else:
+            lowered = text.lower()
+            if (
+                'no material correctness or regression issues' in lowered
+                or 'found no material issues' in lowered
+                or '未发现明显正确性或回归问题' in text
+                or '未发现明显问题' in text
+                or '没有发现明显问题' in text
+                or '未发现实质性问题' in text
+            ):
+                verdict = ReviewVerdict.CLEAR
+            elif lowered.strip():
+                verdict = ReviewVerdict.INCONCLUSIVE
+            else:
+                verdict = ReviewVerdict.INCONCLUSIVE
+
+        summary = ReviewResultService._derive_summary(text=text, findings=findings, verdict=verdict)
+        return ReviewResult(
+            verdict=verdict,
+            summary=summary,
+            findings=findings,
+            severity_counts={s: counts.get(s, 0) for s in SEVERITY_ORDER if counts.get(s, 0)},
+            finding_count=len(findings),
+            source_event_seq=None,
+        )

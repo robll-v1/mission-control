@@ -93,7 +93,11 @@ class ReviewEngine:
 
         self._db = Database(db_path)
         self._engine = MissionEngine(self._db)
-        self._adapters = {self.backend_name: get_adapter(self.backend_name, model=self.model)}
+        # direct_api backend doesn't use subprocess adapters
+        if backend == 'direct_api':
+            self._adapters = {}
+        else:
+            self._adapters = {self.backend_name: get_adapter(self.backend_name, model=self.model)}
         self._worktrees = WorktreeManager(runtime_root)
         self._artifacts = ArtifactStore(runtime_root)
         self._contexts = ContextCompiler(self._artifacts)
@@ -558,6 +562,148 @@ class ReviewEngine:
             resolved_findings=resolved_findings,
             is_incremental=is_incremental,
             previous_sha=previous_sha,
+            inferred_focus=inferred_focus,
+        )
+
+    # ------------------------------------------------------------------
+    # Inline review (direct LLM API — no subprocess)
+    # ------------------------------------------------------------------
+
+    def review_inline(
+        self,
+        repo_path: str,
+        *,
+        pr_url: str | None = None,
+        base: str | None = None,
+        review_focus: str = '',
+        context: dict | None = None,
+        timeout_sec: float = 300,
+    ) -> ReviewReport:
+        """One-shot review using direct LLM API call (no agent subprocess).
+
+        This is the preferred mode for MCP integration — avoids nested
+        subprocess issues (e.g., opencode-inside-opencode).
+
+        Uses the same context compilation and findings parsing as the
+        subprocess path, but calls the LLM HTTP API directly.
+        """
+        from app.adapters.direct_api_adapter import (
+            DirectAPIAdapter,
+            resolve_direct_api_config,
+        )
+        from app.core.config import load_repo_config
+
+        start_time = time.time()
+        repo = Path(repo_path).resolve()
+
+        # Resolve API config
+        amc_cfg = load_repo_config(str(repo))
+        api_config = resolve_direct_api_config(amc_cfg)
+        if not api_config.is_valid():
+            return ReviewReport(
+                task_id='',
+                verdict=ReviewVerdict.FAILED,
+                passed=False,
+                error={
+                    'code': 'config_error',
+                    'message': 'Direct API config incomplete. Need base_url, api_key, and model. '
+                               'Configure in ~/.codex/config.toml or ~/.config/amc/config.yaml (backend.direct_api section).',
+                    'recoverable': False,
+                },
+            )
+
+        # Infer review focus
+        inferred_focus = review_focus
+        if not review_focus and not pr_url:
+            base_branch = base or self._detect_default_branch(str(repo))
+            inferred_focus = self._infer_review_focus(str(repo), base_branch)
+
+        # Create task (reuse existing logic for diff collection)
+        try:
+            task = self.create_task(
+                repo_path,
+                pr_url=pr_url,
+                base=base,
+                review_focus=inferred_focus,
+                context=context,
+            )
+        except Exception as exc:
+            return ReviewReport(
+                task_id='',
+                verdict=ReviewVerdict.FAILED,
+                passed=False,
+                error={'code': 'create_failed', 'message': str(exc), 'recoverable': False},
+            )
+
+        # Compile context and build prompt
+        try:
+            compiled = self._contexts.compile_task(task, worktree_path=task.repo_path)
+            prompt = self._contexts.build_prompt(task, compiled, language=self.language)
+        except Exception as exc:
+            return ReviewReport(
+                task_id=task.id,
+                verdict=ReviewVerdict.FAILED,
+                passed=False,
+                error={'code': 'compile_failed', 'message': str(exc), 'recoverable': False},
+            )
+
+        # Call LLM API directly
+        try:
+            api_config.timeout = timeout_sec
+            adapter = DirectAPIAdapter(api_config)
+            response_text = adapter.call_llm(prompt)
+        except Exception as exc:
+            return ReviewReport(
+                task_id=task.id,
+                verdict=ReviewVerdict.FAILED,
+                passed=False,
+                duration_sec=time.time() - start_time,
+                error={'code': 'api_error', 'message': str(exc), 'recoverable': True},
+            )
+
+        if not response_text.strip():
+            return ReviewReport(
+                task_id=task.id,
+                verdict=ReviewVerdict.INCONCLUSIVE,
+                passed=False,
+                duration_sec=time.time() - start_time,
+                error={'code': 'empty_response', 'message': 'LLM returned empty response', 'recoverable': True},
+            )
+
+        # Parse findings from raw text
+        result = ReviewResultService.parse_raw_text(response_text)
+
+        # Store events for audit trail
+        self._engine.append_event(
+            task_id=task.id,
+            kind='agent.text',
+            payload={'text': response_text[:5000]},
+        )
+        self._engine.append_event(
+            task_id=task.id,
+            kind='review.result_extracted',
+            payload={
+                'verdict': result.verdict.value if hasattr(result.verdict, 'value') else str(result.verdict),
+                'finding_count': result.finding_count,
+                'mode': 'direct_api',
+            },
+        )
+
+        # Update task status
+        self._engine.set_stage(task.id, status=TaskStatus.COMPLETED, stage='review_done')
+
+        passed = result.verdict == ReviewVerdict.CLEAR
+        return ReviewReport(
+            task_id=task.id,
+            verdict=result.verdict,
+            passed=passed,
+            findings=result.findings,
+            finding_count=result.finding_count,
+            severity_counts=result.severity_counts,
+            summary=result.summary,
+            rounds_executed=1,
+            duration_sec=time.time() - start_time,
+            can_continue=False,
             inferred_focus=inferred_focus,
         )
 
