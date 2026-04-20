@@ -19,7 +19,7 @@ SEVERITY_ALIASES = {
     '低': 'low',
 }
 SEVERITY_PATTERN = re.compile(
-    r'^\s*[-*]\s*(critical|high|medium|low|严重|高|中|低)\s*[:：\-]\s*(.+)$',
+    r'^\s*[-*]\s*\*{0,2}(critical|high|medium|low|严重|高|中|低)\*{0,2}\s*[:：\-]\s*(.+)$',
     re.IGNORECASE,
 )
 PATH_LINE_PATTERN = re.compile(r'`([^`:\s]+):(\d+)`')
