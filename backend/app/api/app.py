@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
-from app.adapters.opencode_adapter import OpenCodeAdapter
+from app.adapters import get_adapter, AVAILABLE_BACKENDS
 from app.api.routes_artifacts import router as artifact_router
 from app.api.routes_control import router as control_router
 from app.api.routes_stream import router as stream_router
@@ -30,9 +30,7 @@ logger = logging.getLogger(__name__)
 RUNTIME_ROOT = 'runtime'
 db = Database('data/amc.db')
 engine = MissionEngine(db)
-adapters = {
-    'opencode': OpenCodeAdapter(),
-}
+adapters = {name: get_adapter(name) for name in AVAILABLE_BACKENDS}
 worktrees = WorktreeManager(RUNTIME_ROOT)
 artifacts = ArtifactStore(RUNTIME_ROOT)
 contexts = ContextCompiler(artifacts)

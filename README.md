@@ -81,7 +81,7 @@ Mission Control automates code review by:
 backend/
   app/
     api/           FastAPI routes + SSE streaming
-    adapters/      Agent backends (opencode)
+    adapters/      Agent backends (opencode, claude-code, copilot, codex)
     core/          Engine, execution, context compiler, worktree, review policy
     services/      Diff, artifact store, result extraction
     cli.py         CLI entry point (amc start/stop/status/review/mcp)
@@ -105,6 +105,11 @@ amc review
 # Review a GitHub PR
 amc review https://github.com/org/repo/pull/123
 
+# Use a specific backend
+amc review --backend claude-code
+amc review --backend copilot
+amc review --backend codex
+
 # JSON output + exit code for CI
 amc review --format json --exit-code
 
@@ -118,6 +123,8 @@ amc review [PR_URL] [OPTIONS]
   PR_URL              GitHub PR URL (omit for local diff)
   --repo, -r PATH     Repository path (default: cwd)
   --base, -b BRANCH   Base branch (default: auto-detect)
+  --backend NAME      Agent backend: opencode, claude-code, copilot, codex
+  --model, -m MODEL   Model override
   --rounds N          Max rounds (default: 1)
   --format FMT        markdown | json
   --focus, -f TEXT    Review focus area
@@ -326,6 +333,11 @@ amc review
 # 审查 GitHub PR
 amc review https://github.com/org/repo/pull/123
 
+# 指定后端 Agent
+amc review --backend claude-code
+amc review --backend copilot
+amc review --backend codex
+
 # JSON 输出 + 退出码（适合 CI）
 amc review --format json --exit-code
 
@@ -339,6 +351,8 @@ amc review [PR_URL] [选项]
   PR_URL              GitHub PR URL（省略则为本地 diff 模式）
   --repo, -r PATH     仓库路径（默认：当前目录）
   --base, -b BRANCH   基准分支（默认：自动检测）
+  --backend NAME      Agent 后端：opencode, claude-code, copilot, codex
+  --model, -m MODEL   模型覆盖
   --rounds N          最大轮数（默认：1）
   --format FMT        markdown | json
   --focus, -f TEXT    审查重点

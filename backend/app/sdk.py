@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
-from app.adapters.opencode_adapter import OpenCodeAdapter
+from app.adapters import get_adapter, AVAILABLE_BACKENDS
 from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
 from app.core.execution import ExecutionService
@@ -88,12 +88,12 @@ class ReviewEngine:
         self.language = language
         self.backend_name = backend
 
-        # Model resolution: explicit param > env var > .amc.yaml > None (use OpenCode default)
+        # Model resolution: explicit param > env var > .amc.yaml > None (use backend default)
         self.model = model or self._resolve_model()
 
         self._db = Database(db_path)
         self._engine = MissionEngine(self._db)
-        self._adapters = {'opencode': OpenCodeAdapter(model=self.model)}
+        self._adapters = {self.backend_name: get_adapter(self.backend_name, model=self.model)}
         self._worktrees = WorktreeManager(runtime_root)
         self._artifacts = ArtifactStore(runtime_root)
         self._contexts = ContextCompiler(self._artifacts)

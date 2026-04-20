@@ -486,7 +486,7 @@ def cmd_review(args: argparse.Namespace) -> None:
     print(f'   Repo: {repo_path}')
     print(f'   Max rounds: {max_rounds}')
 
-    engine = ReviewEngine(language='en', backend='opencode', model=model)
+    engine = ReviewEngine(language='en', backend=args.backend, model=model)
     if engine.model:
         print(f'   Model: {engine.model}')
     print()
@@ -654,6 +654,7 @@ def main() -> None:
     review_p.add_argument('pr_url', nargs='?', default=None, help='GitHub PR URL (optional; omit for local diff)')
     review_p.add_argument('--repo', '-r', default=None, help='Repository path (default: cwd)')
     review_p.add_argument('--base', '-b', default=None, help='Base branch for local diff (default: auto-detect)')
+    review_p.add_argument('--backend', default='opencode', help='Backend agent (opencode, claude-code, copilot, codex)')
     review_p.add_argument('--model', '-m', default=None, help='Model override (priority: --model > $AMC_MODEL > .amc.yaml)')
     review_p.add_argument('--rounds', type=int, default=1, help='Max review rounds (default: 1)')
     review_p.add_argument('--format', choices=['markdown', 'json'], default='markdown', help='Output format')
