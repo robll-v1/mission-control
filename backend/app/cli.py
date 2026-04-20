@@ -498,12 +498,7 @@ def cmd_review(args: argparse.Namespace) -> None:
 
     # Output result
     if output_format == 'json':
-        import dataclasses
-        output = dataclasses.asdict(report)
-        # Convert enum values to strings
-        output['verdict'] = str(output['verdict'])
-        for f in output.get('findings', []):
-            pass  # already serializable
+        output = _report_to_json(report)
         print(json.dumps(output, indent=2, ensure_ascii=False))
     else:
         _print_review_markdown(report)
@@ -513,11 +508,64 @@ def cmd_review(args: argparse.Namespace) -> None:
         sys.exit(0 if report.passed else 1)
 
 
+def _report_to_json(report) -> dict:
+    """Convert ReviewReport to JSON-serializable dict."""
+    output = {
+        'task_id': report.task_id,
+        'verdict': str(report.verdict.value) if hasattr(report.verdict, 'value') else str(report.verdict),
+        'passed': report.passed,
+        'finding_count': report.finding_count,
+        'findings': [
+            {
+                'severity': f.severity,
+                'path': f.path,
+                'line': f.line,
+                'summary': f.summary,
+            }
+            for f in report.findings
+        ],
+        'summary': report.summary,
+        'rounds_executed': report.rounds_executed,
+        'duration_sec': report.duration_sec,
+        'can_continue': report.can_continue,
+    }
+
+    # Incremental info
+    if report.is_incremental:
+        output['incremental'] = {
+            'is_incremental': True,
+            'previous_sha': report.previous_sha,
+            'inferred_focus': report.inferred_focus,
+            'new_findings': [
+                {'severity': fs.finding.severity, 'path': fs.finding.path, 'line': fs.finding.line, 'summary': fs.finding.summary}
+                for fs in report.finding_statuses if fs.status == 'new'
+            ],
+            'persistent_findings': [
+                {'severity': fs.finding.severity, 'path': fs.finding.path, 'line': fs.finding.line, 'summary': fs.finding.summary}
+                for fs in report.finding_statuses if fs.status == 'persistent'
+            ],
+            'resolved_findings': [
+                {'severity': f.severity, 'path': f.path, 'line': f.line, 'summary': f.summary}
+                for f in report.resolved_findings
+            ],
+        }
+
+    if report.error:
+        output['error'] = report.error
+
+    return output
+
+
 def _print_review_markdown(report) -> None:
     """Pretty-print review report to terminal."""
     icon = '✅' if report.passed else '❌'
     print(f'{icon} Verdict: {report.verdict}')
     print(f'   Rounds: {report.rounds_executed} | Duration: {report.duration_sec:.1f}s')
+
+    if report.is_incremental:
+        print(f'   Mode: incremental (since {report.previous_sha[:7]})')
+    if report.inferred_focus:
+        print(f'   Auto-focus: {report.inferred_focus}')
     print()
 
     if report.error:
@@ -528,16 +576,40 @@ def _print_review_markdown(report) -> None:
         print(f'📋 Summary: {report.summary}')
         print()
 
+    # Show findings with status if incremental
     if report.findings:
-        print(f'🔎 Findings ({report.finding_count}):')
-        for f in report.findings:
-            loc = f''
-            if f.path:
-                loc = f' ({f.path}'
-                if f.line:
-                    loc += f':{f.line}'
-                loc += ')'
-            print(f'   - [{f.severity}]{loc} {f.summary}')
+        if report.is_incremental and report.finding_statuses:
+            new_count = sum(1 for fs in report.finding_statuses if fs.status == 'new')
+            persistent_count = sum(1 for fs in report.finding_statuses if fs.status == 'persistent')
+            print(f'🔎 Findings ({report.finding_count}): {new_count} new, {persistent_count} persistent')
+            for fs in report.finding_statuses:
+                f = fs.finding
+                status_icon = '🆕' if fs.status == 'new' else '🔄'
+                loc = ''
+                if f.path:
+                    loc = f' ({f.path}'
+                    if f.line:
+                        loc += f':{f.line}'
+                    loc += ')'
+                print(f'   {status_icon} [{f.severity}]{loc} {f.summary}')
+        else:
+            print(f'🔎 Findings ({report.finding_count}):')
+            for f in report.findings:
+                loc = ''
+                if f.path:
+                    loc = f' ({f.path}'
+                    if f.line:
+                        loc += f':{f.line}'
+                    loc += ')'
+                print(f'   - [{f.severity}]{loc} {f.summary}')
+        print()
+
+    # Show resolved findings
+    if report.resolved_findings:
+        print(f'✅ Resolved ({len(report.resolved_findings)}):')
+        for f in report.resolved_findings:
+            loc = f' ({f.path}:{f.line})' if f.path else ''
+            print(f'   ✓ [{f.severity}]{loc} {f.summary}')
         print()
 
     if report.can_continue:

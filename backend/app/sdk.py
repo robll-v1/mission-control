@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -34,6 +35,12 @@ from app.core.models import (
 from app.core.validation import ValidationService
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
+from app.services.review_history import (
+    FindingStatus,
+    ReviewHistoryStore,
+    ReviewRecord,
+    StoredFinding,
+)
 from app.services.review_result_service import ReviewResultService
 
 
@@ -51,6 +58,12 @@ class ReviewReport:
     duration_sec: float = 0.0
     can_continue: bool = False
     error: dict | None = None
+    # Incremental review fields
+    finding_statuses: list[FindingStatus] = field(default_factory=list)
+    resolved_findings: list[StoredFinding] = field(default_factory=list)
+    is_incremental: bool = False
+    previous_sha: str | None = None
+    inferred_focus: str = ''
 
 
 class ReviewEngine:
@@ -342,6 +355,7 @@ class ReviewEngine:
         context: dict | None = None,
         max_rounds: int = 1,
         timeout_sec: float = 600,
+        incremental: bool = True,
     ) -> ReviewReport:
         """One-shot review: create task → execute → return structured result.
 
@@ -353,18 +367,41 @@ class ReviewEngine:
             context: Optional dict with intent, requirements, constraints.
             max_rounds: Maximum review rounds (default 1).
             timeout_sec: Per-round timeout in seconds.
+            incremental: Use incremental review (skip already-reviewed code). Default True.
 
         Returns:
             ReviewReport with verdict, findings, and metadata.
         """
         start_time = time.time()
+        repo = Path(repo_path).resolve()
+        history = ReviewHistoryStore(str(repo))
+
+        # --- Incremental: detect last reviewed SHA ---
+        previous_sha = None
+        is_incremental = False
+        if incremental and not pr_url:
+            previous_sha = history.get_last_reviewed_sha()
+            if previous_sha:
+                # Check if we have new commits since last review
+                current_sha = self._get_head_sha(str(repo))
+                if current_sha and current_sha != previous_sha:
+                    is_incremental = True
+                    # Use last reviewed SHA as base for incremental diff
+                    base = previous_sha
+                else:
+                    is_incremental = False  # no new changes
+
+        # --- Context auto-inference ---
+        inferred_focus = review_focus
+        if not review_focus and not pr_url:
+            inferred_focus = self._infer_review_focus(str(repo), base or 'main')
 
         try:
             task = self.create_task(
                 repo_path,
                 pr_url=pr_url,
                 base=base,
-                review_focus=review_focus,
+                review_focus=inferred_focus,
                 context=context,
             )
         except Exception as exc:
@@ -421,6 +458,52 @@ class ReviewEngine:
         passed = result.verdict == ReviewVerdict.CLEAR
         can_continue = not passed and rounds_executed < max_rounds
 
+        # --- Finding dedup against history ---
+        finding_statuses: list[FindingStatus] = []
+        resolved_findings: list[StoredFinding] = []
+
+        if is_incremental:
+            new_stored = [
+                StoredFinding(
+                    severity=f.severity,
+                    path=f.path or '',
+                    line=f.line,
+                    summary=f.summary,
+                )
+                for f in result.findings
+            ]
+            comparison = history.compare_findings(new_stored)
+            finding_statuses = comparison['new'] + comparison['persistent']
+            resolved_findings = [fs.finding for fs in comparison['resolved']]
+
+        # --- Save review to history ---
+        current_sha = self._get_head_sha(str(repo)) or ''
+        base_ref = base or self._detect_default_branch(str(repo))
+        record = ReviewRecord(
+            review_id=str(uuid.uuid4())[:8],
+            timestamp=time.time(),
+            head_sha=current_sha,
+            base_ref=base_ref,
+            mode='pr' if pr_url else 'local_diff',
+            pr_url=pr_url,
+            focus=inferred_focus,
+            verdict=result.verdict.value if hasattr(result.verdict, 'value') else str(result.verdict),
+            findings=[
+                StoredFinding(
+                    severity=f.severity,
+                    path=f.path or '',
+                    line=f.line,
+                    summary=f.summary,
+                )
+                for f in result.findings
+            ],
+            finding_count=result.finding_count,
+            duration_sec=time.time() - start_time,
+            changed_files=list(task.review_paths) if task.review_paths else [],
+            commit_range=f'{previous_sha[:7]}..{current_sha[:7]}' if previous_sha and current_sha else '',
+        )
+        history.save_review(record)
+
         return ReviewReport(
             task_id=task.id,
             verdict=result.verdict,
@@ -432,6 +515,11 @@ class ReviewEngine:
             rounds_executed=rounds_executed,
             duration_sec=time.time() - start_time,
             can_continue=can_continue,
+            finding_statuses=finding_statuses,
+            resolved_findings=resolved_findings,
+            is_incremental=is_incremental,
+            previous_sha=previous_sha,
+            inferred_focus=inferred_focus,
         )
 
     # ------------------------------------------------------------------
@@ -489,3 +577,67 @@ class ReviewEngine:
         if result.returncode != 0:
             return []
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def _get_head_sha(repo_path: str) -> str | None:
+        """Get current HEAD commit SHA."""
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, cwd=repo_path, timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return None
+
+    @staticmethod
+    def _infer_review_focus(repo_path: str, base: str) -> str:
+        """Auto-infer review focus from recent commit messages and changed files.
+
+        Looks for patterns like:
+        - "fix: ..." → focus on correctness/regression
+        - "feat: ..." → focus on design/completeness
+        - "security" in messages → focus on security
+        - "perf" in messages → focus on performance
+        """
+        # Get recent commit messages
+        result = subprocess.run(
+            ['git', 'log', '--oneline', '-10', f'{base}..HEAD'],
+            capture_output=True, text=True, cwd=repo_path, timeout=10,
+        )
+        if result.returncode != 0:
+            return ''
+
+        messages = result.stdout.lower()
+
+        # Pattern matching for focus areas
+        focus_parts = []
+
+        if 'security' in messages or 'auth' in messages or 'token' in messages:
+            focus_parts.append('security')
+        if 'perf' in messages or 'optim' in messages or 'speed' in messages:
+            focus_parts.append('performance')
+        if 'fix' in messages or 'bug' in messages or 'patch' in messages:
+            focus_parts.append('correctness')
+        if 'refactor' in messages:
+            focus_parts.append('maintainability')
+        if 'test' in messages:
+            focus_parts.append('test coverage')
+
+        # Also check what types of files changed
+        file_result = subprocess.run(
+            ['git', 'diff', '--name-only', f'{base}..HEAD'],
+            capture_output=True, text=True, cwd=repo_path, timeout=10,
+        )
+        if file_result.returncode == 0:
+            files = file_result.stdout.lower()
+            if 'test' in files and 'test' not in ' '.join(focus_parts):
+                focus_parts.append('test quality')
+            if 'migration' in files or 'schema' in files:
+                focus_parts.append('data integrity')
+            if 'api' in files or 'route' in files:
+                focus_parts.append('API design')
+
+        if not focus_parts:
+            return ''
+
+        return ', '.join(focus_parts[:3])  # Max 3 focus areas
