@@ -516,15 +516,24 @@ def _prompt_input(question: str, default: str = '') -> str:
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    """Interactive setup: generates .amc.yaml in the current directory."""
-    config_path = Path.cwd() / '.amc.yaml'
+    """Interactive setup: generates config file."""
+    is_global = getattr(args, 'global_config', False)
 
-    print('🚀 Mission Control — Interactive Setup')
+    if is_global:
+        from app.core.config import _global_config_path
+        config_path = _global_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        scope_label = 'Global'
+    else:
+        config_path = Path.cwd() / '.amc.yaml'
+        scope_label = 'Project'
+
+    print(f'🚀 Mission Control — {scope_label} Setup')
     print('=' * 42)
 
     if config_path.exists():
         try:
-            overwrite = input(f'\n⚠️  .amc.yaml already exists. Overwrite? [y/N]: ').strip().lower()
+            overwrite = input(f'\n⚠️  {config_path.name} already exists. Overwrite? [y/N]: ').strip().lower()
         except (EOFError, KeyboardInterrupt):
             print('\nAborted.')
             return
@@ -555,29 +564,43 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f'   Examples: gpt-5.4, claude-sonnet-4, glm-5.1, deepseek-r1')
     model = _prompt_input('   Model name (leave empty to use agent default)', '')
 
-    # Step 4: Base branch
-    default_branch = 'main'
-    try:
-        result = subprocess.run(
-            ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
-            capture_output=True, text=True, cwd=str(Path.cwd()),
-        )
-        if result.returncode == 0:
-            default_branch = result.stdout.strip().split('/')[-1]
-    except Exception:
-        pass
-    base_branch = _prompt_input(f'\n🌿 Base branch for diff comparison', default_branch)
+    if is_global:
+        # Global config: only backend + model preferences
+        config_content = f"""# Mission Control global config
+# Project-level .amc.yaml overrides these settings
 
-    # Step 5: Generate .amc.yaml
-    config_content = f"""repo:
+backend:
+  default: {backend}
+  {backend}:
+    model: '{model}'
+"""
+        config_path.write_text(config_content)
+        print(f'\n✅ Created {config_path}')
+        print(f'\n💡 This sets your default backend and model globally.')
+        print(f'   Per-project .amc.yaml can override these.')
+        print(f'   Run `amc init` (without --global) in a project to create project config.')
+    else:
+        # Project config: full settings
+        default_branch = 'main'
+        try:
+            result = subprocess.run(
+                ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
+                capture_output=True, text=True, cwd=str(Path.cwd()),
+            )
+            if result.returncode == 0:
+                default_branch = result.stdout.strip().split('/')[-1]
+        except Exception:
+            pass
+        base_branch = _prompt_input(f'\n🌿 Base branch for diff comparison', default_branch)
+
+        config_content = f"""repo:
   path: .
   base_branch: {base_branch}
 
 backend:
   default: {backend}
-  opencode:
-    model: '{model if backend == "opencode" else ""}'
-    variant: ''
+  {backend}:
+    model: '{model}'
 
 context:
   include_recent_commits: 8
@@ -598,18 +621,18 @@ validation:
       required: false
       modes: ['standard', 'full']
 """
-    config_path.write_text(config_content)
-    print(f'\n✅ Created {config_path}')
+        config_path.write_text(config_content)
+        print(f'\n✅ Created {config_path}')
 
-    # Step 6: Show next steps
-    print(f'\n🎉 Setup complete! Next steps:')
-    print(f'   1. Make some code changes')
-    review_cmd = 'amc review'
-    if model:
-        review_cmd += f' --model {model}'
-    print(f'   2. Run: {review_cmd}')
-    print(f'   3. Or configure MCP for your agent:')
-    print(f'      {{"mcpServers": {{"mission-control": {{"command": "amc", "args": ["mcp"]}}}}}}')
+        # Show next steps
+        print(f'\n🎉 Setup complete! Next steps:')
+        print(f'   1. Make some code changes')
+        review_cmd = 'amc review'
+        if model:
+            review_cmd += f' --model {model}'
+        print(f'   2. Run: {review_cmd}')
+        print(f'   3. Or configure MCP for your agent:')
+        print(f'      {{"mcpServers": {{"mission-control": {{"command": "amc", "args": ["mcp"]}}}}}}')
     print()
 
 
@@ -807,7 +830,9 @@ def main() -> None:
     sub.add_parser('status', help='Show service status')
 
     # init subcommand
-    sub.add_parser('init', help='Interactive setup (generates .amc.yaml)')
+    init_p = sub.add_parser('init', help='Interactive setup (generates .amc.yaml)')
+    init_p.add_argument('--global', dest='global_config', action='store_true',
+                        help='Write to ~/.config/amc/config.yaml (user-wide defaults)')
 
     # review subcommand
     review_p = sub.add_parser('review', help='Run code review (no server needed)')

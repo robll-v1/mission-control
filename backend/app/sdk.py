@@ -124,19 +124,27 @@ class ReviewEngine:
         if env_model:
             return env_model
 
-        # Check .amc.yaml in current directory
+        # Check merged config (global + project .amc.yaml)
         from app.core.config import load_repo_config
         try:
-            config = load_repo_config('.')
+            config = load_repo_config(self.repo_path if hasattr(self, 'repo_path') else '.')
             backend_config = config.get('backend', {})
-            opencode_config = backend_config.get('opencode', {})
-            yaml_model = opencode_config.get('model', '').strip()
+            # Try backend-specific model first, then fall back to default backend's model
+            agent_config = backend_config.get(self.backend_name, {})
+            yaml_model = ''
+            if isinstance(agent_config, dict):
+                yaml_model = agent_config.get('model', '').strip()
+            if not yaml_model:
+                default_backend = backend_config.get('default', 'opencode')
+                default_config = backend_config.get(default_backend, {})
+                if isinstance(default_config, dict):
+                    yaml_model = default_config.get('model', '').strip()
             if yaml_model:
                 return yaml_model
         except Exception:
             pass
 
-        return None  # Use OpenCode's own default
+        return None  # Use backend's own default
 
     # ------------------------------------------------------------------
     # Task creation
