@@ -1,5 +1,9 @@
 # Mission Control
 
+[![CI](https://github.com/robll-v1/mission-control/actions/workflows/ci.yml/badge.svg)](https://github.com/robll-v1/mission-control/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 > **Local-first, AI-powered code review console.**
 > Use it as a Web UI, a CLI tool, or an AI agent skill (MCP).
 
