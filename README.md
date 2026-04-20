@@ -22,7 +22,9 @@ There are two ways to use Mission Control:
 ```bash
 # Install
 git clone https://github.com/robll-v1/mission-control.git
-cd mission-control && pip install -e .
+cd mission-control
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
 
 # One-time global setup (interactive)
 amc init --global
@@ -30,7 +32,7 @@ amc init --global
 # → Choose your preferred backend and model
 # → Saves to ~/.config/amc/config.yaml
 
-# Use in any project
+# Use in any project (activate venv first, or use full path .venv/bin/amc)
 cd ~/your-project
 amc review                    # review local changes
 amc review --model glm-5.1   # override model for one run
@@ -310,7 +312,9 @@ validation:
 ```bash
 # 安装
 git clone https://github.com/robll-v1/mission-control.git
-cd mission-control && pip install -e .
+cd mission-control
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
 
 # 一次性全局配置（交互式）
 amc init --global
@@ -318,7 +322,7 @@ amc init --global
 # → 选择后端和模型
 # → 保存到 ~/.config/amc/config.yaml
 
-# 在任何项目中使用
+# 在任何项目中使用（需先 activate venv，或用 .venv/bin/amc）
 cd ~/your-project
 amc review                    # 审查本地改动
 amc review --model glm-5.1   # 临时指定模型
