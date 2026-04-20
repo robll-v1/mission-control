@@ -15,6 +15,29 @@
 
 ## Quick Start
 
+There are two ways to use Mission Control:
+
+### Path A: CLI Only (Recommended for AI Agent Users)
+
+```bash
+# Install
+git clone https://github.com/robll-v1/mission-control.git
+cd mission-control && pip install -e .
+
+# One-time global setup (interactive)
+amc init --global
+# → Detects available backends (opencode, claude-code, copilot, codex)
+# → Choose your preferred backend and model
+# → Saves to ~/.config/amc/config.yaml
+
+# Use in any project
+cd ~/your-project
+amc review                    # review local changes
+amc review --model glm-5.1   # override model for one run
+```
+
+### Path B: Web UI (Full Dashboard)
+
 ```bash
 # One command — installs deps, starts backend + UI, opens browser
 make start
@@ -71,9 +94,29 @@ Mission Control automates code review by:
 | Tool | Required | Notes |
 |------|----------|-------|
 | Python 3.11+ | ✅ | Backend runtime |
-| [OpenCode](https://github.com/opencode-ai/opencode) | ✅ | AI review agent |
+| AI Agent CLI (one of:) | ✅ | Review execution engine |
+| › [OpenCode](https://github.com/opencode-ai/opencode) | | Supports any LLM (GPT, Claude, GLM, DeepSeek...) |
+| › [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | | Anthropic's CLI agent |
+| › [Copilot CLI](https://gh.io/copilot-cli) | | GitHub Copilot (via `gh copilot`) |
+| › [Codex CLI](https://github.com/openai/codex) | | OpenAI's terminal agent |
 | Node.js 18+ | Optional | Frontend UI |
 | `GITHUB_TOKEN` | Recommended | Higher API rate limits |
+
+## Configuration
+
+Two-level config system (like Git's global + local):
+
+```bash
+# Global defaults (all projects)
+amc init --global
+# → ~/.config/amc/config.yaml
+
+# Project-specific overrides
+cd my-project && amc init
+# → .amc.yaml (in project root)
+```
+
+Priority: `--model` flag > `$AMC_MODEL` env > `.amc.yaml` > `~/.config/amc/config.yaml` > backend default
 
 ## Architecture
 
@@ -260,6 +303,29 @@ validation:
 
 ## 快速开始
 
+两种使用方式：
+
+### 路径 A: 纯 CLI（推荐给 AI Agent 用户）
+
+```bash
+# 安装
+git clone https://github.com/robll-v1/mission-control.git
+cd mission-control && pip install -e .
+
+# 一次性全局配置（交互式）
+amc init --global
+# → 自动检测已安装的 agent CLI (opencode, claude, copilot, codex)
+# → 选择后端和模型
+# → 保存到 ~/.config/amc/config.yaml
+
+# 在任何项目中使用
+cd ~/your-project
+amc review                    # 审查本地改动
+amc review --model glm-5.1   # 临时指定模型
+```
+
+### 路径 B: Web UI（完整仪表盘）
+
 ```bash
 # 一键启动（自动安装依赖、启动服务、打开浏览器）
 make start
@@ -316,9 +382,29 @@ Mission Control 自动化代码审查流程：
 | 工具 | 必需 | 说明 |
 |------|------|------|
 | Python 3.11+ | ✅ | 后端运行时 |
-| [OpenCode](https://github.com/opencode-ai/opencode) | ✅ | AI 审查 Agent |
+| AI Agent CLI（任选一个）| ✅ | 审查执行引擎 |
+| › [OpenCode](https://github.com/opencode-ai/opencode) | | 支持任意 LLM（GPT、Claude、GLM、DeepSeek…） |
+| › [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | | Anthropic 的 CLI Agent |
+| › [Copilot CLI](https://gh.io/copilot-cli) | | GitHub Copilot（通过 `gh copilot`） |
+| › [Codex CLI](https://github.com/openai/codex) | | OpenAI 的终端 Agent |
 | Node.js 18+ | 可选 | 前端 UI |
 | `GITHUB_TOKEN` | 推荐 | 提高 API 限额 |
+
+## 配置
+
+两级配置系统（类似 Git 的全局 + 项目级）：
+
+```bash
+# 全局默认（所有项目共享）
+amc init --global
+# → ~/.config/amc/config.yaml
+
+# 项目级覆盖
+cd my-project && amc init
+# → .amc.yaml（在项目根目录）
+```
+
+优先级：`--model` 参数 > `$AMC_MODEL` 环境变量 > `.amc.yaml` > `~/.config/amc/config.yaml` > 后端默认
 
 ## Agent 技能
 
