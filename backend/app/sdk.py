@@ -83,13 +83,17 @@ class ReviewEngine:
         runtime_root: str = 'runtime',
         language: str = 'en',
         backend: str = 'opencode',
+        model: str | None = None,
     ):
         self.language = language
         self.backend_name = backend
 
+        # Model resolution: explicit param > env var > .amc.yaml > None (use OpenCode default)
+        self.model = model or self._resolve_model()
+
         self._db = Database(db_path)
         self._engine = MissionEngine(self._db)
-        self._adapters = {'opencode': OpenCodeAdapter()}
+        self._adapters = {'opencode': OpenCodeAdapter(model=self.model)}
         self._worktrees = WorktreeManager(runtime_root)
         self._artifacts = ArtifactStore(runtime_root)
         self._contexts = ContextCompiler(self._artifacts)
@@ -106,6 +110,33 @@ class ReviewEngine:
             mission=self._engine,
             artifacts=self._artifacts,
         )
+
+    @staticmethod
+    def _resolve_model() -> str | None:
+        """Resolve model from env var or .amc.yaml config.
+
+        Priority: $AMC_MODEL > .amc.yaml backend.opencode.model > None
+        """
+        import os
+
+        # Check environment variable
+        env_model = os.environ.get('AMC_MODEL', '').strip()
+        if env_model:
+            return env_model
+
+        # Check .amc.yaml in current directory
+        from app.core.config import load_repo_config
+        try:
+            config = load_repo_config('.')
+            backend_config = config.get('backend', {})
+            opencode_config = backend_config.get('opencode', {})
+            yaml_model = opencode_config.get('model', '').strip()
+            if yaml_model:
+                return yaml_model
+        except Exception:
+            pass
+
+        return None  # Use OpenCode's own default
 
     # ------------------------------------------------------------------
     # Task creation
