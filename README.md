@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 > **Local-first, AI-powered code review console.**
-> Use it as a Web UI, a CLI tool, or an AI agent skill (MCP).
+> Use it as a **Web UI** or a **CLI tool**.
 
 **[English](#english)** | **[中文](#中文)**
 
@@ -89,7 +89,7 @@ Mission Control automates code review by:
 | **Reliability** | Graceful shutdown, crash recovery, idle timeout |
 | **Output** | Verdict (clear/concerns/failed), severity ratings, exportable summaries |
 | **Streaming** | Real-time SSE events for live progress |
-| **Agent Skill** | MCP server, CLI, Python SDK — no browser needed |
+| **Agent Skill** | CLI, Python SDK — no browser needed |
 
 ## Prerequisites
 
@@ -129,9 +129,9 @@ backend/
     adapters/      Agent backends (opencode, claude-code, copilot, codex)
     core/          Engine, execution, context compiler, worktree, review policy
     services/      Diff, artifact store, result extraction
-    cli.py         CLI entry point (amc start/stop/status/review/mcp)
+    cli.py         CLI entry point (amc start/stop/status/review)
     sdk.py         Python SDK (ReviewEngine)
-    mcp_server.py  MCP tool server
+    mcp_server.py  MCP tool server (blocked — see README)
 frontend/          React + Vite UI
 runtime/           Generated: worktrees, task artifacts
 data/              SQLite database (auto-created)
@@ -177,7 +177,14 @@ amc review [PR_URL] [OPTIONS]
   --exit-code         Exit 1 if concerns found
 ```
 
-### MCP Server (`amc mcp`)
+### MCP Server (`amc mcp`) — ⚠️ Blocked
+
+> **Status: Blocked.** MCP mode works technically but is not recommended for daily use.
+> The Web UI (`amc start`) and CLI (`amc review`) are the supported interfaces.
+> MCP code is preserved for future reference but not actively maintained.
+
+<details>
+<summary>MCP details (archived)</summary>
 
 Start as stdio MCP tool server:
 
@@ -204,6 +211,8 @@ Agent configuration (Claude Desktop / OpenCode / etc.):
 | `review_code` | Run code review (PR or local diff) |
 | `get_review_findings` | Get findings from recent review |
 | `abort_review` | Cancel running review |
+
+</details>
 
 ### Python SDK
 
@@ -379,7 +388,7 @@ Mission Control 自动化代码审查流程：
 | **可靠性** | 优雅停机、崩溃恢复、空闲超时 |
 | **输出** | 判定（通过/关注/阻止）、严重程度分级、可导出摘要 |
 | **实时** | SSE 事件流，实时查看审查进度 |
-| **Agent 技能** | MCP 服务器、CLI、Python SDK — 无需浏览器 |
+| **Agent 技能** | CLI、Python SDK — 无需浏览器 |
 
 ## 环境要求
 
@@ -450,7 +459,14 @@ amc review [PR_URL] [选项]
   --exit-code         有问题时退出码为 1
 ```
 
-### MCP 服务器 (`amc mcp`)
+### MCP 服务器 (`amc mcp`) — ⚠️ 已阻塞
+
+> **状态：已阻塞。** MCP 模式技术上可用，但不推荐日常使用。
+> Web UI（`amc start`）和 CLI（`amc review`）是目前支持的接口。
+> MCP 代码保留供未来参考，但不再主动维护。
+
+<details>
+<summary>MCP 详情（存档）</summary>
 
 以 stdio 模式启动 MCP 工具服务器：
 
@@ -477,6 +493,8 @@ Agent 配置示例（Claude Desktop / OpenCode 等）：
 | `review_code` | 执行代码审查（PR 或本地 diff） |
 | `get_review_findings` | 获取最近审查的发现 |
 | `abort_review` | 取消正在运行的审查 |
+
+</details>
 
 ### Python SDK
 
