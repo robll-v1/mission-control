@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
+import time
 from typing import Annotated
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 
 # ── Server setup ──────────────────────────────────────────────────────
 
@@ -61,6 +63,7 @@ async def review_code(
     max_rounds: Annotated[int, "Maximum review rounds (default: 1)"] = 1,
     timeout: Annotated[int, "Per-round timeout in seconds (default: 600)"] = 600,
     context: Annotated[str | None, "Additional context (requirements, intent) as JSON string"] = None,
+    ctx: Context | None = None,
 ) -> str:
     """Perform AI-powered code review on a repository.
 
@@ -76,15 +79,37 @@ async def review_code(
     - For local changes: omit pr_url (reviews uncommitted diff against base branch)
     - Set focus to narrow review scope (e.g. "security" or "error handling")
     """
+
+    async def _log(msg: str):
+        """Send progress to both stderr and MCP log."""
+        print(f"[mission-control] {msg}", file=sys.stderr, flush=True)
+        if ctx:
+            try:
+                await ctx.info(msg)
+            except Exception:
+                pass
+
+    await _log(f"Starting review: {repo_path}")
+    await _log(f"Mode: {'PR' if pr_url else 'local-diff'} | Backend: opencode | Max rounds: {max_rounds}")
+
     engine = _get_engine()
 
     # Parse context if provided
-    ctx = None
+    ctx_data = None
     if context:
         try:
-            ctx = json.loads(context)
+            ctx_data = json.loads(context)
         except json.JSONDecodeError:
-            ctx = {"intent": context}
+            ctx_data = {"intent": context}
+
+    await _log("Compiling diff context...")
+    if ctx:
+        try:
+            await ctx.report_progress(progress=0.1, total=1.0)
+        except Exception:
+            pass
+
+    start_time = time.time()
 
     # Run review (synchronous SDK call in thread)
     report = await asyncio.to_thread(
@@ -95,8 +120,16 @@ async def review_code(
         review_focus=focus or '',
         max_rounds=max_rounds,
         timeout_sec=timeout,
-        context=ctx,
+        context=ctx_data,
     )
+
+    elapsed = time.time() - start_time
+    await _log(f"Review complete in {elapsed:.1f}s — verdict: {report.verdict}")
+    if ctx:
+        try:
+            await ctx.report_progress(progress=1.0, total=1.0)
+        except Exception:
+            pass
 
     # Build response
     result = {
@@ -122,6 +155,33 @@ async def review_code(
         result["error"] = report.error
 
     return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_review_status(
+    repo_path: Annotated[str, "Path to the repository to check"],
+) -> str:
+    """Check the status of the most recent review for a repository.
+
+    Returns current status: pending, running, completed, failed, or aborted.
+    Use this to check if a long-running review has finished.
+    """
+    from app.services.database import Database
+    db = Database()
+    tasks = db.query(
+        "SELECT id, status, created_at FROM tasks WHERE repo_path = ? ORDER BY created_at DESC LIMIT 1",
+        (repo_path,),
+    )
+
+    if not tasks:
+        return json.dumps({"status": "no_review", "message": "No review found for this repository"})
+
+    task = tasks[0]
+    return json.dumps({
+        "task_id": task["id"],
+        "status": task["status"],
+        "created_at": task["created_at"],
+    }, indent=2)
 
 
 @mcp.tool()
