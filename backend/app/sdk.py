@@ -579,32 +579,59 @@ class ReviewEngine:
 
     @staticmethod
     def _get_local_changed_files(repo_path: str, base: str) -> list[str]:
-        """Get files changed between base branch and HEAD."""
+        """Get files changed between base branch and HEAD, plus staged changes."""
+        files = set()
+        # Committed changes vs base
         result = subprocess.run(
             ['git', 'diff', '--name-only', f'{base}...HEAD'],
             capture_output=True, text=True, cwd=repo_path, timeout=30,
         )
-        if result.returncode != 0:
-            # Fallback: unstaged changes
+        if result.returncode == 0:
+            files.update(f for f in result.stdout.splitlines() if f.strip())
+        # Staged but uncommitted changes
+        result = subprocess.run(
+            ['git', 'diff', '--cached', '--name-only'],
+            capture_output=True, text=True, cwd=repo_path, timeout=30,
+        )
+        if result.returncode == 0:
+            files.update(f for f in result.stdout.splitlines() if f.strip())
+        # Unstaged changes (working tree)
+        if not files:
             result = subprocess.run(
                 ['git', 'diff', '--name-only'],
                 capture_output=True, text=True, cwd=repo_path, timeout=30,
             )
-        return [f for f in result.stdout.splitlines() if f.strip()]
+            if result.returncode == 0:
+                files.update(f for f in result.stdout.splitlines() if f.strip())
+        return sorted(files)
 
     @staticmethod
     def _get_local_diff(repo_path: str, base: str) -> str:
-        """Get diff text between base and HEAD."""
+        """Get diff text: committed vs base + staged + unstaged."""
+        parts = []
+        # Committed changes vs base
         result = subprocess.run(
             ['git', 'diff', f'{base}...HEAD'],
             capture_output=True, text=True, cwd=repo_path, timeout=60,
         )
-        if result.returncode != 0:
+        if result.returncode == 0 and result.stdout.strip():
+            parts.append(result.stdout)
+        # Staged but uncommitted
+        result = subprocess.run(
+            ['git', 'diff', '--cached'],
+            capture_output=True, text=True, cwd=repo_path, timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts.append(result.stdout)
+        # Unstaged (only if nothing else found)
+        if not parts:
             result = subprocess.run(
                 ['git', 'diff'],
                 capture_output=True, text=True, cwd=repo_path, timeout=60,
             )
-        return result.stdout
+            if result.returncode == 0:
+                parts.append(result.stdout)
+        return '\n'.join(parts)
 
     @staticmethod
     def _get_commit_messages(repo_path: str, base: str) -> list[str]:

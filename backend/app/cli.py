@@ -695,11 +695,15 @@ def cmd_review(args: argparse.Namespace) -> None:
                 ['git', 'diff', '--stat', f'{base}..HEAD'],
                 capture_output=True, text=True, cwd=repo_path,
             )
+            staged = subprocess.run(
+                ['git', 'diff', '--cached', '--stat'],
+                capture_output=True, text=True, cwd=repo_path,
+            )
             unstaged = subprocess.run(
                 ['git', 'diff', '--stat'],
                 capture_output=True, text=True, cwd=repo_path,
             )
-            if not diff_stat.stdout.strip() and not unstaged.stdout.strip():
+            if not diff_stat.stdout.strip() and not staged.stdout.strip() and not unstaged.stdout.strip():
                 print(f'⚠️  No changes detected (base: {base})')
                 print(f'   Nothing to review — your branch is identical to {base}.')
                 print(f'   Make some commits or stage changes, then try again.')

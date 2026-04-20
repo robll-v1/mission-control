@@ -45,11 +45,15 @@ _engine = None
 
 
 def _get_engine():
-    """Lazy-initialize ReviewEngine."""
+    """Lazy-initialize ReviewEngine using user's global config."""
     global _engine
     if _engine is None:
         from app.sdk import ReviewEngine
-        _engine = ReviewEngine(language='en', backend='opencode')
+        from app.core.config import load_repo_config
+        cfg = load_repo_config(os.getcwd())
+        backend_cfg = cfg.get('backend', {})
+        default_backend = backend_cfg.get('default', 'opencode')
+        _engine = ReviewEngine(language='en', backend=default_backend)
     return _engine
 
 
