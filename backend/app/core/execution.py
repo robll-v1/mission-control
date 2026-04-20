@@ -63,7 +63,7 @@ class ExecutionService:
         self._lock = threading.Lock()
         self._active: dict[str, ActiveProcess] = {}
 
-    def start_task(self, task_id: str, prompt: str | None = None, review_note: str | None = None) -> Run:
+    def start_task(self, task_id: str, prompt: str | None = None, review_note: str | None = None, language: str = 'zh') -> Run:
         task = self.db.get_task(task_id)
         if task is None:
             raise KeyError(f'task not found: {task_id}')
@@ -116,7 +116,7 @@ class ExecutionService:
                 task.id,
                 run.id,
                 round_index,
-                prompt or self.contexts.build_prompt(task, compiled, review_note=review_note),
+                prompt or self.contexts.build_prompt(task, compiled, review_note=review_note, language=language),
                 idle_timeout_sec,
             ),
             daemon=True,

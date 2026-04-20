@@ -130,7 +130,13 @@ class ContextCompiler:
         return CompiledContext(markdown_path=markdown_path, json_path=json_path, markdown=markdown, payload=payload)
 
     @staticmethod
-    def build_prompt(task: Task, compiled: CompiledContext, review_note: str | None = None) -> str:
+    def build_prompt(task: Task, compiled: CompiledContext, review_note: str | None = None, language: str = 'zh') -> str:
+        if language == 'en':
+            return ContextCompiler._build_prompt_en(compiled, review_note)
+        return ContextCompiler._build_prompt_zh(compiled, review_note)
+
+    @staticmethod
+    def _build_prompt_zh(compiled: CompiledContext, review_note: str | None = None) -> str:
         extra_note = f'\n\n本轮补充说明：\n{review_note.strip()}\n' if review_note and review_note.strip() else ''
         return (
             '你正在执行静态 PR Review。请把下面的编译上下文当作主要事实来源。'
@@ -143,6 +149,24 @@ class ContextCompiler:
             '如果发现问题，请按固定格式列出：`- 严重:`、`- 高:`、`- 中:`、`- 低:`。'
             '如果没有发现实质性问题，请明确写出：`未发现明显正确性或回归问题。`'
             '每条问题尽量带文件路径和行号，并优先关注 bug、回归风险、危险假设和缺失测试。'
+            f'{extra_note}\n\n{compiled.markdown}\n'
+        )
+
+    @staticmethod
+    def _build_prompt_en(compiled: CompiledContext, review_note: str | None = None) -> str:
+        extra_note = f'\n\nAdditional note for this round:\n{review_note.strip()}\n' if review_note and review_note.strip() else ''
+        return (
+            'You are performing a static code review. Use the compiled context below as your primary source of truth. '
+            'Only inspect the diff and surrounding code — do NOT modify any files. '
+            'Do NOT start services, run builds, run unit tests, integration tests, or cross-compile unless explicitly asked. '
+            'Do NOT read README, AGENTS, BUILD docs, docs/, or .github/ unless the diff directly touches them. '
+            'Prefer read-only analysis based on the provided patches and nearby code. '
+            'If a judgment requires runtime evidence, flag it as a risk or unconfirmed issue — do NOT attempt to verify by running services. '
+            'Output your response in English. Start with a conclusion summary paragraph. '
+            'If issues are found, list each using this exact format: `- critical:`, `- high:`, `- medium:`, `- low:`. '
+            'If no material issues are found, explicitly write: `No material correctness or regression issues found.` '
+            'For each finding, include file path and line number where possible. '
+            'Prioritize: bugs, regression risks, dangerous assumptions, and missing tests.'
             f'{extra_note}\n\n{compiled.markdown}\n'
         )
 

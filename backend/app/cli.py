@@ -459,6 +459,102 @@ def cmd_status(_args: argparse.Namespace) -> None:
     print()
 
 
+# ── review command ─────────────────────────────────────────────────────
+
+def cmd_review(args: argparse.Namespace) -> None:
+    """Run a code review (SDK-based, no server needed)."""
+    # Ensure we're in project dir for relative imports
+    root = _root_dir()
+    os.chdir(root)
+
+    # Import SDK (heavy imports deferred)
+    from app.sdk import ReviewEngine, ReviewReport
+
+    repo_path = args.repo or os.getcwd()
+    pr_url = args.pr_url if args.pr_url else None
+    base = args.base if hasattr(args, 'base') and args.base else None
+    max_rounds = args.rounds
+    timeout = args.timeout
+    output_format = args.format
+
+    print(f'🔍 Starting review...')
+    if pr_url:
+        print(f'   PR: {pr_url}')
+    else:
+        print(f'   Mode: local diff (base: {base or "auto-detect"})')
+    print(f'   Repo: {repo_path}')
+    print(f'   Max rounds: {max_rounds}')
+    print()
+
+    engine = ReviewEngine(language='en', backend='opencode')
+    report = engine.review(
+        repo_path,
+        pr_url=pr_url,
+        base=base,
+        review_focus=args.focus or '',
+        max_rounds=max_rounds,
+        timeout_sec=timeout,
+    )
+
+    # Output result
+    if output_format == 'json':
+        import dataclasses
+        output = dataclasses.asdict(report)
+        # Convert enum values to strings
+        output['verdict'] = str(output['verdict'])
+        for f in output.get('findings', []):
+            pass  # already serializable
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    else:
+        _print_review_markdown(report)
+
+    # Exit code
+    if args.exit_code:
+        sys.exit(0 if report.passed else 1)
+
+
+def _print_review_markdown(report) -> None:
+    """Pretty-print review report to terminal."""
+    icon = '✅' if report.passed else '❌'
+    print(f'{icon} Verdict: {report.verdict}')
+    print(f'   Rounds: {report.rounds_executed} | Duration: {report.duration_sec:.1f}s')
+    print()
+
+    if report.error:
+        print(f'⚠️  Error: {report.error["message"]}')
+        print()
+
+    if report.summary:
+        print(f'📋 Summary: {report.summary}')
+        print()
+
+    if report.findings:
+        print(f'🔎 Findings ({report.finding_count}):')
+        for f in report.findings:
+            loc = f''
+            if f.path:
+                loc = f' ({f.path}'
+                if f.line:
+                    loc += f':{f.line}'
+                loc += ')'
+            print(f'   - [{f.severity}]{loc} {f.summary}')
+        print()
+
+    if report.can_continue:
+        print('💡 Can continue with more rounds to address findings.')
+
+
+# ── mcp command ───────────────────────────────────────────────────────
+
+def cmd_mcp(args: argparse.Namespace) -> None:
+    """Start MCP server (stdio mode)."""
+    root = _root_dir()
+    os.chdir(root)
+
+    from app.mcp_server import serve
+    serve()
+
+
 # ── main ──────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -477,12 +573,28 @@ def main() -> None:
     sub.add_parser('stop', help='Stop all services')
     sub.add_parser('status', help='Show service status')
 
+    # review subcommand
+    review_p = sub.add_parser('review', help='Run code review (no server needed)')
+    review_p.add_argument('pr_url', nargs='?', default=None, help='GitHub PR URL (optional; omit for local diff)')
+    review_p.add_argument('--repo', '-r', default=None, help='Repository path (default: cwd)')
+    review_p.add_argument('--base', '-b', default=None, help='Base branch for local diff (default: auto-detect)')
+    review_p.add_argument('--rounds', type=int, default=1, help='Max review rounds (default: 1)')
+    review_p.add_argument('--format', choices=['markdown', 'json'], default='markdown', help='Output format')
+    review_p.add_argument('--focus', '-f', default=None, help='Review focus (e.g. "security", "performance")')
+    review_p.add_argument('--timeout', type=int, default=600, help='Per-round timeout in seconds (default: 600)')
+    review_p.add_argument('--exit-code', action='store_true', help='Exit with code 1 if review has concerns')
+
+    # mcp subcommand
+    sub.add_parser('mcp', help='Start MCP tool server (stdio)')
+
     args = parser.parse_args()
 
     commands = {
         'start': cmd_start,
         'stop': cmd_stop,
         'status': cmd_status,
+        'review': cmd_review,
+        'mcp': cmd_mcp,
     }
     commands[args.command](args)
 

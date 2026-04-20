@@ -1,0 +1,491 @@
+"""
+ReviewEngine — High-level SDK for Agent Skill integration.
+
+Usage:
+    from app.sdk import ReviewEngine
+
+    engine = ReviewEngine()
+    result = engine.review("/path/to/repo", pr_url="https://github.com/.../pull/123")
+    print(result.verdict, result.findings)
+"""
+from __future__ import annotations
+
+import subprocess
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator
+
+from app.adapters.opencode_adapter import OpenCodeAdapter
+from app.core.context_compiler import ContextCompiler
+from app.core.db import Database
+from app.core.execution import ExecutionService
+from app.core.github_ingest import fetch_pull_request, is_github_pr_url
+from app.core.mission_engine import MissionEngine
+from app.core.models import (
+    Event,
+    ReviewFinding,
+    ReviewResult,
+    ReviewVerdict,
+    Run,
+    Task,
+    TaskStatus,
+)
+from app.core.validation import ValidationService
+from app.core.worktree import WorktreeManager
+from app.services.artifact_store import ArtifactStore
+from app.services.review_result_service import ReviewResultService
+
+
+@dataclass
+class ReviewReport:
+    """Structured output from a complete review session."""
+    task_id: str
+    verdict: ReviewVerdict
+    passed: bool
+    findings: list[ReviewFinding] = field(default_factory=list)
+    finding_count: int = 0
+    severity_counts: dict[str, int] = field(default_factory=dict)
+    summary: str = ''
+    rounds_executed: int = 0
+    duration_sec: float = 0.0
+    can_continue: bool = False
+    error: dict | None = None
+
+
+class ReviewEngine:
+    """High-level SDK wrapping mission-control's core engine.
+
+    Provides a clean interface for:
+    - Creating review tasks (PR or local-diff mode)
+    - Starting and monitoring review rounds
+    - Extracting structured findings
+    - One-shot review convenience method
+    """
+
+    def __init__(
+        self,
+        *,
+        db_path: str = 'data/amc.db',
+        runtime_root: str = 'runtime',
+        language: str = 'en',
+        backend: str = 'opencode',
+    ):
+        self.language = language
+        self.backend_name = backend
+
+        self._db = Database(db_path)
+        self._engine = MissionEngine(self._db)
+        self._adapters = {'opencode': OpenCodeAdapter()}
+        self._worktrees = WorktreeManager(runtime_root)
+        self._artifacts = ArtifactStore(runtime_root)
+        self._contexts = ContextCompiler(self._artifacts)
+        self._execution = ExecutionService(
+            db=self._db,
+            mission=self._engine,
+            adapters=self._adapters,
+            worktrees=self._worktrees,
+            artifacts=self._artifacts,
+            contexts=self._contexts,
+        )
+        self._validation = ValidationService(
+            db=self._db,
+            mission=self._engine,
+            artifacts=self._artifacts,
+        )
+
+    # ------------------------------------------------------------------
+    # Task creation
+    # ------------------------------------------------------------------
+
+    def create_task(
+        self,
+        repo_path: str,
+        *,
+        pr_url: str | None = None,
+        base: str | None = None,
+        review_focus: str = '',
+        context: dict | None = None,
+    ) -> Task:
+        """Create a review task.
+
+        If pr_url is provided, uses PR mode (fetches from GitHub API).
+        If pr_url is None, uses local-diff mode (compares against base branch).
+        """
+        repo = Path(repo_path).resolve()
+        if not repo.exists():
+            raise ValueError(f'repo_path does not exist: {repo_path}')
+
+        if pr_url:
+            return self._create_pr_task(str(repo), pr_url, review_focus)
+        else:
+            return self._create_local_task(str(repo), base, review_focus, context)
+
+    def _create_pr_task(self, repo_path: str, pr_url: str, review_focus: str) -> Task:
+        """Create task from a GitHub PR URL."""
+        if not is_github_pr_url(pr_url):
+            raise ValueError(f'Invalid GitHub PR URL: {pr_url}')
+
+        pull_request = fetch_pull_request(pr_url)
+        title = pull_request.task_title
+        description = pull_request.to_description(review_focus=review_focus)
+        raw_pr = pull_request.raw_pr
+
+        task = self._engine.create_task(
+            title=title,
+            repo_path=repo_path,
+            description=description,
+            source_type='pull_request',
+            source_url=pr_url,
+            backend=self.backend_name,
+            review_focus=review_focus,
+            pr_owner=pull_request.owner,
+            pr_repo=pull_request.repo,
+            pr_number=pull_request.pr_number,
+            pr_head_ref=str(raw_pr.get('head', {}).get('ref') or '') or None,
+            pr_head_sha=str(raw_pr.get('head', {}).get('sha') or '') or None,
+            pr_base_ref=str(raw_pr.get('base', {}).get('ref') or '') or None,
+            review_paths=pull_request.changed_files,
+        )
+
+        # Save PR artifacts
+        self._artifacts.write_text(task.id, 'context/pull_request.json', pull_request.to_json())
+        self._artifacts.write_text(task.id, 'context/pull_request.md', description)
+        self._engine.append_event(
+            task_id=task.id,
+            kind='task.pull_request_ingested',
+            payload={
+                'source_url': pr_url,
+                'changed_files': len(pull_request.changed_files),
+            },
+        )
+        return task
+
+    def _create_local_task(
+        self,
+        repo_path: str,
+        base: str | None,
+        review_focus: str,
+        context: dict | None,
+    ) -> Task:
+        """Create task from local git diff (no PR URL needed)."""
+        base_branch = base or self._detect_default_branch(repo_path)
+        changed_files = self._get_local_changed_files(repo_path, base_branch)
+
+        # Build title and description from local context
+        commits = self._get_commit_messages(repo_path, base_branch)
+        intent = ''
+        if context and context.get('intent'):
+            intent = context['intent']
+        elif commits:
+            intent = commits[0]
+
+        title = f'[Local Review] {intent[:80]}' if intent else '[Local Review]'
+
+        desc_parts = [f'Local diff review against {base_branch}']
+        if intent:
+            desc_parts.append(f'Intent: {intent}')
+        if context and context.get('requirements'):
+            desc_parts.append('Requirements:')
+            for req in context['requirements']:
+                desc_parts.append(f'  - {req}')
+        if commits:
+            desc_parts.append(f'Recent commits ({len(commits)}):')
+            for msg in commits[:5]:
+                desc_parts.append(f'  - {msg}')
+        if review_focus:
+            desc_parts.append(f'Review focus: {review_focus}')
+
+        description = '\n'.join(desc_parts)
+
+        task = self._engine.create_task(
+            title=title,
+            repo_path=repo_path,
+            description=description,
+            source_type='local_diff',
+            source_url=None,
+            backend=self.backend_name,
+            review_focus=review_focus,
+            pr_base_ref=base_branch,
+            review_paths=changed_files,
+        )
+
+        # Save local diff as artifact
+        diff_text = self._get_local_diff(repo_path, base_branch)
+        self._artifacts.write_text(task.id, 'context/local_diff.patch', diff_text)
+        self._engine.append_event(
+            task_id=task.id,
+            kind='task.local_diff_ingested',
+            payload={
+                'base_branch': base_branch,
+                'changed_files': len(changed_files),
+                'diff_size_bytes': len(diff_text),
+            },
+        )
+        return task
+
+    # ------------------------------------------------------------------
+    # Review execution
+    # ------------------------------------------------------------------
+
+    def start_review(
+        self,
+        task_id: str,
+        *,
+        prompt: str | None = None,
+        review_note: str | None = None,
+    ) -> Run:
+        """Start a review round. Returns immediately; review runs in background thread."""
+        return self._execution.start_task(task_id, prompt=prompt, review_note=review_note, language=self.language)
+
+    def poll_status(self, task_id: str) -> dict:
+        """Get current task status and progress."""
+        task = self._db.get_task(task_id)
+        if task is None:
+            raise KeyError(f'task not found: {task_id}')
+        task = ReviewResultService.backfill_task(db=self._db, task=task)
+        events = self._db.list_events(task_id)
+        runs = self._db.list_runs(task_id)
+        latest_event = events[-1] if events else None
+
+        return {
+            'task_id': task_id,
+            'status': task.status,
+            'stage': task.current_stage,
+            'rounds': len(runs),
+            'latest_event': latest_event.kind if latest_event else None,
+            'verdict': task.latest_review_result.verdict if task.latest_review_result else None,
+            'finding_count': task.latest_review_result.finding_count if task.latest_review_result else 0,
+        }
+
+    def wait_for_completion(self, task_id: str, *, timeout_sec: float = 600, poll_interval: float = 2.0) -> Task:
+        """Block until task reaches a terminal state or timeout."""
+        terminal_states = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.ABORTED, TaskStatus.WAITING_HUMAN}
+        deadline = time.time() + timeout_sec
+
+        while time.time() < deadline:
+            task = self._db.get_task(task_id)
+            if task is None:
+                raise KeyError(f'task not found: {task_id}')
+            task = ReviewResultService.backfill_task(db=self._db, task=task)
+            if task.status in terminal_states:
+                return task
+            time.sleep(poll_interval)
+
+        raise TimeoutError(f'Task {task_id} did not complete within {timeout_sec}s')
+
+    def get_findings(self, task_id: str) -> list[ReviewFinding]:
+        """Get structured findings from latest completed round."""
+        task = self._db.get_task(task_id)
+        if task is None:
+            raise KeyError(f'task not found: {task_id}')
+        task = ReviewResultService.backfill_task(db=self._db, task=task)
+        if task.latest_review_result:
+            return task.latest_review_result.findings
+        return []
+
+    def get_result(self, task_id: str) -> ReviewResult | None:
+        """Get full ReviewResult from latest round."""
+        task = self._db.get_task(task_id)
+        if task is None:
+            raise KeyError(f'task not found: {task_id}')
+        task = ReviewResultService.backfill_task(db=self._db, task=task)
+        return task.latest_review_result
+
+    def stream_events(self, task_id: str, *, since_seq: int = 0) -> Iterator[Event]:
+        """Yield events for a task since a given sequence number."""
+        events = self._db.list_events(task_id)
+        for event in events:
+            if event.seq > since_seq:
+                yield event
+
+    def abort(self, task_id: str) -> bool:
+        """Abort an active review."""
+        return self._execution.abort_task(task_id)
+
+    def validate(self, task_id: str, *, mode: str = 'standard') -> dict:
+        """Run validation checks (build, test, lint)."""
+        self._validation.start_validation(task_id, mode=mode)
+        # Wait for validation to complete
+        task = self.wait_for_completion(task_id, timeout_sec=300)
+        checks = self._db.list_check_runs(task_id)
+        return {
+            'task_id': task_id,
+            'status': task.status,
+            'checks': [
+                {
+                    'name': c.name,
+                    'status': c.status,
+                    'exit_code': c.exit_code,
+                    'duration_sec': c.duration_sec,
+                }
+                for c in checks
+            ],
+            'all_passed': all(c.status == 'passed' for c in checks),
+        }
+
+    def cleanup(self, task_id: str) -> dict:
+        """Clean up worktree and resources for a task."""
+        return self._execution.cleanup_task_worktree(task_id, reason='sdk_cleanup')
+
+    # ------------------------------------------------------------------
+    # Convenience: one-shot review
+    # ------------------------------------------------------------------
+
+    def review(
+        self,
+        repo_path: str,
+        *,
+        pr_url: str | None = None,
+        base: str | None = None,
+        review_focus: str = '',
+        context: dict | None = None,
+        max_rounds: int = 1,
+        timeout_sec: float = 600,
+    ) -> ReviewReport:
+        """One-shot review: create task → execute → return structured result.
+
+        Args:
+            repo_path: Path to local git repository.
+            pr_url: GitHub PR URL (optional). If omitted, reviews local diff.
+            base: Base branch for local-diff mode (default: auto-detect main/master).
+            review_focus: What to focus the review on.
+            context: Optional dict with intent, requirements, constraints.
+            max_rounds: Maximum review rounds (default 1).
+            timeout_sec: Per-round timeout in seconds.
+
+        Returns:
+            ReviewReport with verdict, findings, and metadata.
+        """
+        start_time = time.time()
+
+        try:
+            task = self.create_task(
+                repo_path,
+                pr_url=pr_url,
+                base=base,
+                review_focus=review_focus,
+                context=context,
+            )
+        except Exception as exc:
+            return ReviewReport(
+                task_id='',
+                verdict=ReviewVerdict.FAILED,
+                passed=False,
+                error={'code': 'create_failed', 'message': str(exc), 'recoverable': False},
+            )
+
+        rounds_executed = 0
+        for round_idx in range(max_rounds):
+            try:
+                self.start_review(task.id)
+                task = self.wait_for_completion(task.id, timeout_sec=timeout_sec)
+                rounds_executed += 1
+            except TimeoutError:
+                self.abort(task.id)
+                return ReviewReport(
+                    task_id=task.id,
+                    verdict=ReviewVerdict.FAILED,
+                    passed=False,
+                    rounds_executed=rounds_executed,
+                    duration_sec=time.time() - start_time,
+                    error={'code': 'timeout', 'message': f'Round {round_idx + 1} timed out after {timeout_sec}s', 'recoverable': True},
+                )
+            except Exception as exc:
+                return ReviewReport(
+                    task_id=task.id,
+                    verdict=ReviewVerdict.FAILED,
+                    passed=False,
+                    rounds_executed=rounds_executed,
+                    duration_sec=time.time() - start_time,
+                    error={'code': 'execution_error', 'message': str(exc), 'recoverable': False},
+                )
+
+            # Check result
+            result = self.get_result(task.id)
+            if result and result.verdict == ReviewVerdict.CLEAR:
+                break  # Passed, no more rounds needed
+
+        # Build final report
+        result = self.get_result(task.id)
+        if result is None:
+            return ReviewReport(
+                task_id=task.id,
+                verdict=ReviewVerdict.INCONCLUSIVE,
+                passed=False,
+                rounds_executed=rounds_executed,
+                duration_sec=time.time() - start_time,
+                error={'code': 'no_result', 'message': 'Review completed but no result extracted', 'recoverable': True},
+            )
+
+        passed = result.verdict == ReviewVerdict.CLEAR
+        can_continue = not passed and rounds_executed < max_rounds
+
+        return ReviewReport(
+            task_id=task.id,
+            verdict=result.verdict,
+            passed=passed,
+            findings=result.findings,
+            finding_count=result.finding_count,
+            severity_counts=result.severity_counts,
+            summary=result.summary,
+            rounds_executed=rounds_executed,
+            duration_sec=time.time() - start_time,
+            can_continue=can_continue,
+        )
+
+    # ------------------------------------------------------------------
+    # Local diff helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_default_branch(repo_path: str) -> str:
+        """Detect main/master branch."""
+        for branch in ('main', 'master'):
+            result = subprocess.run(
+                ['git', 'rev-parse', '--verify', branch],
+                capture_output=True, text=True, cwd=repo_path, timeout=10,
+            )
+            if result.returncode == 0:
+                return branch
+        return 'main'
+
+    @staticmethod
+    def _get_local_changed_files(repo_path: str, base: str) -> list[str]:
+        """Get files changed between base branch and HEAD."""
+        result = subprocess.run(
+            ['git', 'diff', '--name-only', f'{base}...HEAD'],
+            capture_output=True, text=True, cwd=repo_path, timeout=30,
+        )
+        if result.returncode != 0:
+            # Fallback: unstaged changes
+            result = subprocess.run(
+                ['git', 'diff', '--name-only'],
+                capture_output=True, text=True, cwd=repo_path, timeout=30,
+            )
+        return [f for f in result.stdout.splitlines() if f.strip()]
+
+    @staticmethod
+    def _get_local_diff(repo_path: str, base: str) -> str:
+        """Get diff text between base and HEAD."""
+        result = subprocess.run(
+            ['git', 'diff', f'{base}...HEAD'],
+            capture_output=True, text=True, cwd=repo_path, timeout=60,
+        )
+        if result.returncode != 0:
+            result = subprocess.run(
+                ['git', 'diff'],
+                capture_output=True, text=True, cwd=repo_path, timeout=60,
+            )
+        return result.stdout
+
+    @staticmethod
+    def _get_commit_messages(repo_path: str, base: str) -> list[str]:
+        """Get commit messages since base branch."""
+        result = subprocess.run(
+            ['git', 'log', '--oneline', f'{base}..HEAD'],
+            capture_output=True, text=True, cwd=repo_path, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]

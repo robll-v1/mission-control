@@ -166,3 +166,92 @@ If the server is killed unexpectedly (power loss, `kill -9`, etc.):
 - Review tasks keep round history and artifacts under `runtime/tasks/<task-id>/`
 - Worktrees are created under `runtime/worktrees/<task-id>/` and auto-cleaned after review
 - Logs are saved to `.run/backend.log` and `.run/frontend.log` during dev mode
+
+## Agent Skill (MCP / CLI / SDK)
+
+Mission Control can be used as an **AI agent skill** — your coding agent calls it to get
+code review feedback without a browser or server.
+
+### Quick Examples
+
+```bash
+# Review local uncommitted changes
+amc review
+
+# Review a specific PR
+amc review https://github.com/org/repo/pull/123
+
+# JSON output for programmatic use
+amc review --format json --exit-code
+
+# Focused review
+amc review --focus "security" --rounds 2
+```
+
+### MCP Server (for AI agents)
+
+Start as an MCP tool server (stdio transport):
+
+```bash
+amc mcp
+```
+
+Configure in your agent's MCP settings (e.g. Claude Desktop, OpenCode):
+
+```json
+{
+  "mcpServers": {
+    "mission-control": {
+      "command": "amc",
+      "args": ["mcp"],
+      "cwd": "/path/to/mission-control"
+    }
+  }
+}
+```
+
+Available MCP tools:
+| Tool | Description |
+|------|-------------|
+| `review_code` | Run full code review (PR or local diff) |
+| `get_review_findings` | Get findings from most recent review |
+| `abort_review` | Cancel a running review |
+
+### SDK (Python)
+
+```python
+from app.sdk import ReviewEngine
+
+engine = ReviewEngine(language='en')
+report = engine.review('/path/to/repo')
+
+if report.passed:
+    print("All clear!")
+else:
+    for f in report.findings:
+        print(f"[{f.severity}] {f.path}:{f.line} — {f.summary}")
+```
+
+### CLI Options
+
+```
+amc review [PR_URL] [OPTIONS]
+
+  PR_URL              GitHub PR URL (omit for local diff mode)
+  --repo, -r PATH     Repository path (default: cwd)
+  --base, -b BRANCH   Base branch for local diff (default: auto-detect)
+  --rounds N          Max review rounds (default: 1)
+  --format FORMAT     Output: markdown (default) or json
+  --focus, -f TEXT    Review focus area
+  --timeout SECONDS   Per-round timeout (default: 600)
+  --exit-code         Exit 1 if review has concerns (useful in CI)
+```
+
+### Modes
+
+| Mode | Trigger | What it reviews |
+|------|---------|-----------------|
+| **PR mode** | Provide PR URL | Full pull request diff from GitHub |
+| **Local diff** | No URL | `git diff` against base branch |
+
+Both modes produce identical output format and use the same AI review engine.
