@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 
 type TaskStatus =
   | 'created'
@@ -446,8 +447,13 @@ export function App() {
   return (
     <div className="layout">
       <header className="topbar">
-        <span className="topbar-brand">PR Review Control</span>
-        <button className="btn-primary" onClick={() => setShowModal(true)}>+ New Review</button>
+        <span className="topbar-brand">⬡ Mission Control</span>
+        <motion.button
+          className="btn-primary"
+          onClick={() => setShowModal(true)}
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+        >+ New Review</motion.button>
       </header>
 
       <div className="body">
@@ -483,7 +489,13 @@ export function App() {
           {!selectedTask && <div className="empty-state">选择一个 PR review 任务查看详情</div>}
 
           {selectedTask && detail && (
-            <>
+            <motion.div
+              key={selectedTask.id}
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.3, ease: [0.25, 0.46, 0.45, 0.94] }}
+              style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}
+            >
               <div className="detail-header">
                 <h2>{selectedTask.title}</h2>
                 <span className={`status-dot tone-${statusTone(selectedTask.status)}`}>{statusLabel(selectedTask.status)}</span>
@@ -564,7 +576,13 @@ export function App() {
                         <div className="section-header"><h3>问题列表</h3><span>{latestResult.finding_count} 条</span></div>
                         <div className="findings-list">
                           {latestResult.findings.map((finding, index) => (
-                            <article className="finding-card" key={`${finding.severity}-${finding.path ?? 'na'}-${index}`}>
+                            <motion.article
+                              className="finding-card"
+                              key={`${finding.severity}-${finding.path ?? 'na'}-${index}`}
+                              initial={{ opacity: 0, x: -8 }}
+                              animate={{ opacity: 1, x: 0 }}
+                              transition={{ delay: index * 0.05, duration: 0.3 }}
+                            >
                               <div className="finding-top">
                                 <span className={`mini-pill tone-${finding.severity === 'critical' || finding.severity === 'high' ? 'danger' : finding.severity === 'medium' ? 'warning' : 'neutral'}`}>
                                   {severityLabel(finding.severity)}
@@ -573,7 +591,7 @@ export function App() {
                               </div>
                               <strong>{finding.summary}</strong>
                               {finding.detail && finding.detail !== finding.summary ? <p>{finding.detail}</p> : null}
-                            </article>
+                            </motion.article>
                           ))}
                           {!latestResult.findings.length && <div className="empty-note">这一轮没有结构化问题</div>}
                         </div>
@@ -644,14 +662,26 @@ export function App() {
                   </>
                 )}
               </div>
-            </>
+            </motion.div>
           )}
         </main>
       </div>
 
       {showModal && (
-        <div className="modal-overlay" onClick={() => setShowModal(false)}>
-          <div className="modal" onClick={(event) => event.stopPropagation()}>
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setShowModal(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+        >
+          <motion.div
+            className="modal"
+            onClick={(event) => event.stopPropagation()}
+            initial={{ opacity: 0, scale: 0.95, y: 20 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            transition={{ type: 'spring', damping: 25, stiffness: 300 }}
+          >
             <h3>创建 PR Review</h3>
             <label>仓库路径<input value={repoPath} onChange={(event) => setRepoPath(event.target.value)} placeholder="/path/to/repo" /></label>
             <label>PR 链接<input value={prUrl} onChange={(event) => setPrUrl(event.target.value)} placeholder="https://github.com/org/repo/pull/123" /></label>
@@ -660,8 +690,8 @@ export function App() {
               <button className="btn-ghost" onClick={() => setShowModal(false)}>取消</button>
               <button className="btn-primary" disabled={!repoPath.trim() || !prUrl.trim()} onClick={createTask}>创建</button>
             </div>
-          </div>
-        </div>
+          </motion.div>
+        </motion.div>
       )}
     </div>
   )
