@@ -617,6 +617,9 @@ validation:
 
 def cmd_review(args: argparse.Namespace) -> None:
     """Run a code review (SDK-based, no server needed)."""
+    # Save user's working directory BEFORE chdir
+    user_cwd = os.getcwd()
+
     # Ensure we're in project dir for relative imports
     root = _root_dir()
     os.chdir(root)
@@ -624,7 +627,7 @@ def cmd_review(args: argparse.Namespace) -> None:
     # Import SDK (heavy imports deferred)
     from app.sdk import ReviewEngine, ReviewReport
 
-    repo_path = args.repo or os.getcwd()
+    repo_path = args.repo or user_cwd
     pr_url = args.pr_url if args.pr_url else None
     base = args.base if hasattr(args, 'base') and args.base else None
     max_rounds = args.rounds
