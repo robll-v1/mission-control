@@ -459,6 +459,160 @@ def cmd_status(_args: argparse.Namespace) -> None:
     print()
 
 
+# ── init command ──────────────────────────────────────────────────────
+
+_BACKEND_INFO = {
+    'opencode': {'cmd': 'opencode', 'desc': 'OpenCode (sst/opencode)'},
+    'claude-code': {'cmd': 'claude', 'desc': 'Claude Code (Anthropic)'},
+    'copilot': {'cmd': 'gh', 'desc': 'GitHub Copilot CLI'},
+    'codex': {'cmd': 'codex', 'desc': 'OpenAI Codex CLI'},
+}
+
+
+def _detect_backends() -> list[str]:
+    """Detect which agent CLIs are available on PATH."""
+    import shutil
+    available = []
+    for name, info in _BACKEND_INFO.items():
+        if shutil.which(info['cmd']):
+            available.append(name)
+    return available
+
+
+def _prompt_choice(question: str, choices: list[str], default: str | None = None) -> str:
+    """Interactive single-choice prompt."""
+    print(f'\n{question}')
+    for i, c in enumerate(choices, 1):
+        marker = ' (default)' if c == default else ''
+        print(f'  {i}. {c}{marker}')
+    while True:
+        hint = f' [{default}]' if default else ''
+        try:
+            answer = input(f'  Choose [1-{len(choices)}]{hint}: ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(1)
+        if not answer and default:
+            return default
+        try:
+            idx = int(answer)
+            if 1 <= idx <= len(choices):
+                return choices[idx - 1]
+        except ValueError:
+            if answer in choices:
+                return answer
+        print(f'  Please enter 1-{len(choices)}')
+
+
+def _prompt_input(question: str, default: str = '') -> str:
+    """Interactive text input prompt."""
+    hint = f' [{default}]' if default else ''
+    try:
+        answer = input(f'{question}{hint}: ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(1)
+    return answer or default
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Interactive setup: generates .amc.yaml in the current directory."""
+    config_path = Path.cwd() / '.amc.yaml'
+
+    print('🚀 Mission Control — Interactive Setup')
+    print('=' * 42)
+
+    if config_path.exists():
+        try:
+            overwrite = input(f'\n⚠️  .amc.yaml already exists. Overwrite? [y/N]: ').strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print('\nAborted.')
+            return
+        if overwrite != 'y':
+            print('Aborted.')
+            return
+
+    # Step 1: Detect available backends
+    available = _detect_backends()
+    print(f'\n📡 Detected agent CLIs: {", ".join(available) if available else "none"}')
+
+    if not available:
+        print('\n⚠️  No supported agent CLI found on PATH.')
+        print('   Install one of: opencode, claude, gh (copilot), codex')
+        print('   Then re-run: amc init')
+        return
+
+    # Step 2: Choose backend
+    backend = _prompt_choice(
+        '🤖 Which agent backend for code review?',
+        available,
+        default=available[0],
+    )
+
+    # Step 3: Model
+    print(f'\n📌 Model configuration:')
+    print(f'   The model name is passed to {backend} via --model flag.')
+    print(f'   Examples: gpt-5.4, claude-sonnet-4, glm-5.1, deepseek-r1')
+    model = _prompt_input('   Model name (leave empty to use agent default)', '')
+
+    # Step 4: Base branch
+    default_branch = 'main'
+    try:
+        result = subprocess.run(
+            ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
+            capture_output=True, text=True, cwd=str(Path.cwd()),
+        )
+        if result.returncode == 0:
+            default_branch = result.stdout.strip().split('/')[-1]
+    except Exception:
+        pass
+    base_branch = _prompt_input(f'\n🌿 Base branch for diff comparison', default_branch)
+
+    # Step 5: Generate .amc.yaml
+    config_content = f"""repo:
+  path: .
+  base_branch: {base_branch}
+
+backend:
+  default: {backend}
+  opencode:
+    model: '{model if backend == "opencode" else ""}'
+    variant: ''
+
+context:
+  include_recent_commits: 8
+  candidate_files_limit: 12
+
+execution:
+  idle_timeout_sec: 180
+
+validation:
+  default_mode: standard
+  checks:
+    build:
+      command: ''
+      required: false
+      modes: ['standard', 'full']
+    test:
+      command: ''
+      required: false
+      modes: ['standard', 'full']
+"""
+    config_path.write_text(config_content)
+    print(f'\n✅ Created {config_path}')
+
+    # Step 6: Show next steps
+    print(f'\n🎉 Setup complete! Next steps:')
+    print(f'   1. Make some code changes')
+    review_cmd = 'amc review'
+    if model:
+        review_cmd += f' --model {model}'
+    print(f'   2. Run: {review_cmd}')
+    print(f'   3. Or configure MCP for your agent:')
+    print(f'      {{"mcpServers": {{"mission-control": {{"command": "amc", "args": ["mcp"]}}}}}}')
+    print()
+
+
 # ── review command ─────────────────────────────────────────────────────
 
 def cmd_review(args: argparse.Namespace) -> None:
@@ -649,6 +803,9 @@ def main() -> None:
     sub.add_parser('stop', help='Stop all services')
     sub.add_parser('status', help='Show service status')
 
+    # init subcommand
+    sub.add_parser('init', help='Interactive setup (generates .amc.yaml)')
+
     # review subcommand
     review_p = sub.add_parser('review', help='Run code review (no server needed)')
     review_p.add_argument('pr_url', nargs='?', default=None, help='GitHub PR URL (optional; omit for local diff)')
@@ -671,6 +828,7 @@ def main() -> None:
         'start': cmd_start,
         'stop': cmd_stop,
         'status': cmd_status,
+        'init': cmd_init,
         'review': cmd_review,
         'mcp': cmd_mcp,
     }
