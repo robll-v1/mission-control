@@ -640,8 +640,74 @@ validation:
 
 def cmd_review(args: argparse.Namespace) -> None:
     """Run a code review (SDK-based, no server needed)."""
+    import shutil
+
     # Save user's working directory BEFORE chdir
     user_cwd = os.getcwd()
+    repo_path = args.repo or user_cwd
+    pr_url = args.pr_url if args.pr_url else None
+    backend_name = args.backend
+
+    # ── Preflight checks ──────────────────────────────────────────────
+    # Check 1: Is this a git repo?
+    if not pr_url:
+        git_check = subprocess.run(
+            ['git', 'rev-parse', '--is-inside-work-tree'],
+            capture_output=True, text=True, cwd=repo_path,
+        )
+        if git_check.returncode != 0:
+            print(f'❌ Not a git repository: {repo_path}')
+            print(f'   amc review needs a git repo to compute diffs.')
+            print(f'   Run from inside a git repo, or use --repo PATH.')
+            sys.exit(1)
+
+    # Check 2: Is the backend CLI available?
+    backend_cmds = {
+        'opencode': 'opencode',
+        'claude-code': 'claude',
+        'copilot': 'gh',
+        'codex': 'codex',
+    }
+    required_cmd = backend_cmds.get(backend_name, backend_name)
+    if not shutil.which(required_cmd):
+        print(f'❌ Backend "{backend_name}" not found: `{required_cmd}` is not on PATH.')
+        print(f'   Install it or choose a different backend with --backend.')
+        available = [name for name, cmd in backend_cmds.items() if shutil.which(cmd)]
+        if available:
+            print(f'   Available backends: {", ".join(available)}')
+        sys.exit(1)
+
+    # Check 3: Any changes to review? (local-diff mode only)
+    if not pr_url:
+        base = args.base if hasattr(args, 'base') and args.base else None
+        # Try to detect base branch
+        if not base:
+            for candidate in ['main', 'master', 'develop']:
+                check = subprocess.run(
+                    ['git', 'rev-parse', '--verify', candidate],
+                    capture_output=True, text=True, cwd=repo_path,
+                )
+                if check.returncode == 0:
+                    base = candidate
+                    break
+        if base:
+            diff_stat = subprocess.run(
+                ['git', 'diff', '--stat', f'{base}..HEAD'],
+                capture_output=True, text=True, cwd=repo_path,
+            )
+            unstaged = subprocess.run(
+                ['git', 'diff', '--stat'],
+                capture_output=True, text=True, cwd=repo_path,
+            )
+            if not diff_stat.stdout.strip() and not unstaged.stdout.strip():
+                print(f'⚠️  No changes detected (base: {base})')
+                print(f'   Nothing to review — your branch is identical to {base}.')
+                print(f'   Make some commits or stage changes, then try again.')
+                sys.exit(0)
+    else:
+        base = args.base if hasattr(args, 'base') and args.base else None
+
+    # ── End preflight ─────────────────────────────────────────────────
 
     # Ensure we're in project dir for relative imports
     root = _root_dir()
@@ -650,9 +716,6 @@ def cmd_review(args: argparse.Namespace) -> None:
     # Import SDK (heavy imports deferred)
     from app.sdk import ReviewEngine, ReviewReport
 
-    repo_path = args.repo or user_cwd
-    pr_url = args.pr_url if args.pr_url else None
-    base = args.base if hasattr(args, 'base') and args.base else None
     max_rounds = args.rounds
     timeout = args.timeout
     output_format = args.format
@@ -664,9 +727,10 @@ def cmd_review(args: argparse.Namespace) -> None:
     else:
         print(f'   Mode: local diff (base: {base or "auto-detect"})')
     print(f'   Repo: {repo_path}')
+    print(f'   Backend: {backend_name}')
     print(f'   Max rounds: {max_rounds}')
 
-    engine = ReviewEngine(language='en', backend=args.backend, model=model)
+    engine = ReviewEngine(language='en', backend=backend_name, model=model)
     if engine.model:
         print(f'   Model: {engine.model}')
     print()
