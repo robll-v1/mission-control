@@ -82,7 +82,21 @@ async def review_code(
     2. Wait ~60-120s, then call get_review_status with the task_id
     3. If status is "completed", findings are included in the response
     """
+    # Resolve API config early to report model to caller
+    from app.adapters.direct_api_adapter import resolve_direct_api_config
+    from app.core.config import load_repo_config
+    amc_cfg = load_repo_config(repo_path)
+    api_config = resolve_direct_api_config(amc_cfg)
+
+    if not api_config.is_valid():
+        return json.dumps({
+            "status": "error",
+            "message": "Direct API config incomplete. Need base_url, api_key, and model. "
+                       "Configure in ~/.codex/config.toml or ~/.config/amc/config.yaml (backend.direct_api section).",
+        }, indent=2)
+
     print(f"[mission-control] Starting inline review: {repo_path}", file=sys.stderr, flush=True)
+    print(f"[mission-control] Using model: {api_config.model} via {api_config.wire_api} API", file=sys.stderr, flush=True)
 
     engine = _get_engine()
 
@@ -125,6 +139,7 @@ async def review_code(
                 ] if report.findings else [],
                 "summary": report.summary or "",
                 "duration_sec": report.duration_sec,
+                "model": api_config.model,
             }
             if report.error:
                 result["error"] = report.error
@@ -143,7 +158,8 @@ async def review_code(
     return json.dumps({
         "status": "started",
         "task_id": task_key,
-        "message": "Review started (direct API mode). Call get_review_status with this task_id in ~60-120 seconds.",
+        "model": api_config.model,
+        "message": f"Review started using {api_config.model} (direct API). Call get_review_status in ~60-120 seconds.",
         "estimated_seconds": 90,
     }, indent=2)
 
