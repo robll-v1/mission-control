@@ -7,6 +7,8 @@
 > **Local-first, AI-powered code review console.**
 > Use it as a **Web UI** or a **CLI tool**.
 
+Project design and history: [`docs/project-design-history.md`](docs/project-design-history.md)
+
 **[English](#english)** | **[中文](#中文)**
 
 ---
@@ -318,7 +320,9 @@ validation:
 # Mission Control（中文文档）
 
 > **本地优先、AI 驱动的代码审查控制台。**
-> 可作为 Web UI、CLI 工具，或 AI Agent 技能（MCP）使用。
+> 可作为 Web UI 或 CLI 工具使用；MCP 代码保留但已归档。
+
+项目设计与开发历程：[`docs/project-design-history.md`](docs/project-design-history.md)
 
 ## 快速开始
 
