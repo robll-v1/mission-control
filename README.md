@@ -8,6 +8,7 @@
 > Use it as a **Web UI** or a **CLI tool**.
 
 Project design and history: [`docs/project-design-history.md`](docs/project-design-history.md)
+Architecture diagrams: [`docs/architecture-and-sequence-diagrams.md`](docs/architecture-and-sequence-diagrams.md)
 
 **[English](#english)** | **[中文](#中文)**
 
@@ -323,6 +324,7 @@ validation:
 > 可作为 Web UI 或 CLI 工具使用；MCP 代码保留但已归档。
 
 项目设计与开发历程：[`docs/project-design-history.md`](docs/project-design-history.md)
+架构图与关键时序图：[`docs/architecture-and-sequence-diagrams.md`](docs/architecture-and-sequence-diagrams.md)
 
 ## 快速开始
 

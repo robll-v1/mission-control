@@ -2,6 +2,8 @@
 
 本文档整理 `mission-control` 的项目定位、核心设计、关键迭代决策与开发历程，作为 README 之外的长期设计记录。它不是面向外部用户的产品文案，而是面向项目维护者的设计总览。
 
+如果想看更正式的图示版说明，请继续阅读 [`architecture-and-sequence-diagrams.md`](architecture-and-sequence-diagrams.md)。
+
 ## 1. 项目定位
 
 `mission-control` 的目标不是做一个 SaaS 审查平台，而是做一个 **local-first、以个人日常使用为中心的 AI code review console**。
