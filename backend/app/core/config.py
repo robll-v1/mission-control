@@ -13,8 +13,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         'opencode': {'model': '', 'variant': ''},
     },
     'context': {
+        'adaptive_budget': True,
+        'hunk_snippets_enabled': True,
         'include_recent_commits': 8,
         'candidate_files_limit': 12,
+        'keywords_limit': 12,
+        'top_level_entries_limit': 12,
+        'include_top_level_entries': False,
+        'hunk_snippet_file_limit': 3,
+        'hunk_snippet_hunks_per_file': 1,
+        'hunk_snippet_context_lines': 8,
     },
     'execution': {
         'idle_timeout_sec': 180,
@@ -80,4 +88,3 @@ def load_repo_config(repo_path: str) -> dict[str, Any]:
             pass
 
     return merged
-

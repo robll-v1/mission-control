@@ -267,8 +267,16 @@ backend:
     variant: ''
 
 context:
+  adaptive_budget: true
+  hunk_snippets_enabled: true
   include_recent_commits: 8
   candidate_files_limit: 12
+  keywords_limit: 12
+  top_level_entries_limit: 12
+  include_top_level_entries: false
+  hunk_snippet_file_limit: 3
+  hunk_snippet_hunks_per_file: 1
+  hunk_snippet_context_lines: 8
 
 execution:
   idle_timeout_sec: 180
@@ -549,8 +557,16 @@ backend:
     variant: ''                  # 变体覆盖
 
 context:
+  adaptive_budget: true         # 根据 patch 大小动态裁剪上下文
+  hunk_snippets_enabled: true   # 注入 hunk 周边代码片段
   include_recent_commits: 8      # 上下文近期 commit 数
   candidate_files_limit: 12      # 最大候选文件数
+  keywords_limit: 12             # 注入 prompt 的关键词上限
+  top_level_entries_limit: 12    # top-level entries 上限
+  include_top_level_entries: false  # 默认不注入仓库根目录列表
+  hunk_snippet_file_limit: 3     # 最多抽取多少个文件的 snippet
+  hunk_snippet_hunks_per_file: 1 # 每个文件最多抽取多少个 hunk snippet
+  hunk_snippet_context_lines: 8  # hunk 前后保留的上下文行数
 
 execution:
   idle_timeout_sec: 180          # Agent 空闲超时（秒）

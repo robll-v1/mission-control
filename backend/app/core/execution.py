@@ -80,7 +80,28 @@ class ExecutionService:
         branch_name, worktree_path, revision = self.worktrees.ensure_worktree(task)
         task.branch_name = branch_name
         task.worktree_path = worktree_path
+        compile_started_at = time.perf_counter()
         compiled = self.contexts.compile_task(task, worktree_path=worktree_path)
+        compile_context_ms = int((time.perf_counter() - compile_started_at) * 1000)
+        prompt_build_ms = 0
+        prompt_text = prompt
+        if prompt_text is None:
+            prompt_started_at = time.perf_counter()
+            prompt_text = self.contexts.build_prompt(task, compiled, review_note=review_note, language=language)
+            prompt_build_ms = int((time.perf_counter() - prompt_started_at) * 1000)
+        prepare_metrics = {
+            'context_compile_ms': compile_context_ms,
+            'prompt_build_ms': prompt_build_ms,
+            'context_markdown_bytes': compiled.markdown_bytes,
+            'context_json_bytes': compiled.json_bytes,
+            'prompt_bytes': len(prompt_text.encode('utf-8')),
+            'changed_file_count': len(task.review_paths),
+            'patch_count': len(compiled.payload.get('review', {}).get('file_patches', []) or []),
+            'candidate_file_count': len(compiled.payload.get('candidate_files', []) or []),
+            'snippet_count': len(compiled.payload.get('related_snippets', []) or []),
+            'top_level_entry_count': len(compiled.payload.get('repo', {}).get('top_level_entries', []) or []),
+            'recent_commit_count': len(compiled.payload.get('repo', {}).get('recent_commits', []) or []),
+        }
         self.mission.append_event(
             task_id=task.id,
             kind='task.review_context_compiled',
@@ -91,6 +112,7 @@ class ExecutionService:
                 'worktree_path': worktree_path,
                 'review_revision': revision,
                 'pr_head_sha': task.pr_head_sha,
+                **prepare_metrics,
             },
         )
 
@@ -102,6 +124,7 @@ class ExecutionService:
             round_index=round_index,
             review_note=(review_note or '').strip(),
             review_revision=revision,
+            metrics=prepare_metrics,
             started_at=time.time(),
             status='running',
         )
@@ -110,13 +133,19 @@ class ExecutionService:
         task.updated_at = time.time()
         self.db.save_task(task)
         self.mission.set_stage(task.id, status=TaskStatus.RUNNING, stage='review_in_progress')
+        self.mission.append_event(
+            task_id=task.id,
+            run_id=run.id,
+            kind='review.metrics_collected',
+            payload={'stage': 'prepare', **prepare_metrics},
+        )
         worker = threading.Thread(
             target=self._run_task,
             args=(
                 task.id,
                 run.id,
                 round_index,
-                prompt or self.contexts.build_prompt(task, compiled, review_note=review_note, language=language),
+                prompt_text,
                 idle_timeout_sec,
             ),
             daemon=True,
@@ -168,6 +197,9 @@ class ExecutionService:
         try:
             adapter = self.adapters[task.backend]
             cmd = adapter.make_command(task=task, prompt=prompt)
+            llm_started_at = time.perf_counter()
+            agent_event_count = 0
+            agent_text_bytes = 0
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
@@ -236,6 +268,10 @@ class ExecutionService:
                 last_activity_at = time.time()
                 events = adapter.parse_stdout_line(line) if stream_name == 'stdout' else adapter.parse_stderr_line(line)
                 for event in events:
+                    agent_event_count += 1
+                    text = event.payload.get('text')
+                    if event.kind == 'agent.text' and isinstance(text, str):
+                        agent_text_bytes += len(text.encode('utf-8'))
                     if 'session_id' in event.payload and not run.backend_session_id:
                         run.backend_session_id = str(event.payload['session_id'])
                         self.db.save_run(run)
@@ -251,7 +287,16 @@ class ExecutionService:
             run.ended_at = time.time()
             run.exit_code = exit_code
             run.status = 'completed' if exit_code == 0 else 'failed'
+            parse_started_at = time.perf_counter()
             run.review_result = ReviewResultService.extract_result(events=self.db.list_events(task_id), run=run)
+            parse_result_ms = int((time.perf_counter() - parse_started_at) * 1000)
+            run.metrics.update({
+                'llm_wall_time_ms': int((time.perf_counter() - llm_started_at) * 1000),
+                'parse_result_ms': parse_result_ms,
+                'agent_event_count': agent_event_count,
+                'agent_text_bytes': agent_text_bytes,
+                'round_duration_ms': int((run.ended_at - run.started_at) * 1000),
+            })
             self.db.save_run(run)
             task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task.id))
             self.db.save_task(task)
@@ -275,6 +320,12 @@ class ExecutionService:
                         'summary': run.review_result.summary,
                     },
                 )
+            self.mission.append_event(
+                task_id=task.id,
+                run_id=run.id,
+                kind='review.metrics_collected',
+                payload={'stage': 'finish', **run.metrics},
+            )
 
             self.mission.append_event(
                 task_id=task.id,
@@ -296,7 +347,17 @@ class ExecutionService:
             run.ended_at = time.time()
             run.exit_code = -2 if isinstance(exc, IdleTimeoutError) else -1
             run.status = 'failed'
+            parse_started_at = time.perf_counter()
             run.review_result = ReviewResultService.extract_result(events=self.db.list_events(task_id), run=run)
+            parse_result_ms = int((time.perf_counter() - parse_started_at) * 1000)
+            llm_elapsed_ms = int((time.perf_counter() - llm_started_at) * 1000) if 'llm_started_at' in locals() else 0
+            run.metrics.update({
+                'llm_wall_time_ms': llm_elapsed_ms,
+                'parse_result_ms': parse_result_ms,
+                'agent_event_count': agent_event_count if 'agent_event_count' in locals() else 0,
+                'agent_text_bytes': agent_text_bytes if 'agent_text_bytes' in locals() else 0,
+                'round_duration_ms': int((run.ended_at - run.started_at) * 1000),
+            })
             self.db.save_run(run)
             task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task.id))
             self.db.save_task(task)
@@ -308,6 +369,12 @@ class ExecutionService:
                 payload={'message': str(exc), 'type': exc.__class__.__name__, 'round_index': round_index},
             )
             self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
+            self.mission.append_event(
+                task_id=task.id,
+                run_id=run.id,
+                kind='review.metrics_collected',
+                payload={'stage': 'finish', **run.metrics},
+            )
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,

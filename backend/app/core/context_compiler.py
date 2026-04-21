@@ -73,6 +73,8 @@ class CompiledContext:
     json_path: str
     markdown: str
     payload: dict[str, Any]
+    markdown_bytes: int = 0
+    json_bytes: int = 0
 
 
 class ContextCompiler:
@@ -84,10 +86,27 @@ class ContextCompiler:
         target_root = Path(worktree_path or task.repo_path)
         repo_cfg = load_repo_config(task.repo_path)
         context_cfg = repo_cfg.get('context', {}) if isinstance(repo_cfg, dict) else {}
-        recent_commit_limit = int(context_cfg.get('include_recent_commits', 8) or 8)
-        candidate_limit = int(context_cfg.get('candidate_files_limit', 12) or 12)
         keywords = self._keywords(task.title, task.description, task.review_paths)
-        pr_context = self._pull_request_context(task.id)
+        review_context = self._review_context(task)
+        budget = self._context_budget(
+            context_cfg=context_cfg,
+            review_paths=task.review_paths,
+            file_patches=review_context.get('file_patches', []),
+        )
+        display_keywords = keywords[:budget['keywords_limit']]
+        snippets: list[dict[str, Any]] = []
+        if context_cfg.get('hunk_snippets_enabled', True):
+            snippets = self._collect_hunk_snippets(
+                repo_root=target_root,
+                file_patches=review_context.get('file_patches', []),
+                file_limit=max(0, int(context_cfg.get('hunk_snippet_file_limit', 3) or 3)),
+                hunks_per_file=max(0, int(context_cfg.get('hunk_snippet_hunks_per_file', 1) or 1)),
+                context_lines=max(0, int(context_cfg.get('hunk_snippet_context_lines', 8) or 8)),
+            )
+        candidate_files = self._candidate_files(target_root, keywords, task.review_paths, budget['candidate_files_limit'])
+        if snippets:
+            snippet_paths = {item.get('path') for item in snippets if item.get('path')}
+            candidate_files = [item for item in candidate_files if item.get('path') not in snippet_paths][:2]
 
         payload: dict[str, Any] = {
             'task': {
@@ -107,27 +126,41 @@ class ContextCompiler:
                 'head_ref': task.pr_head_ref,
                 'head_sha': task.pr_head_sha,
                 'changed_files': task.review_paths,
-                'file_patches': pr_context.get('file_patches', []),
-                'review_count': pr_context.get('review_count', 0),
-                'comment_count': pr_context.get('comment_count', 0),
+                'file_patches': review_context.get('file_patches', []),
+                'review_count': review_context.get('review_count', 0),
+                'comment_count': review_context.get('comment_count', 0),
             },
             'repo': {
                 'path': task.repo_path,
                 'worktree_path': worktree_path,
-                'top_level_entries': self._top_level_entries(repo_root),
+                'top_level_entries': (
+                    self._top_level_entries(repo_root)[:budget['top_level_entries_limit']]
+                    if budget['include_top_level_entries']
+                    else []
+                ),
                 'git_branch': self._git_one_line(task.repo_path, ['rev-parse', '--abbrev-ref', 'HEAD']),
                 'remote_url': self._git_one_line(task.repo_path, ['config', '--get', 'remote.origin.url']),
-                'recent_commits': self._recent_commits(task.repo_path, recent_commit_limit),
+                'recent_commits': self._recent_commits(task.repo_path, budget['recent_commit_limit']),
             },
-            'keywords': keywords,
-            'candidate_files': self._candidate_files(target_root, keywords, task.review_paths, candidate_limit),
+            'keywords': display_keywords,
+            'candidate_files': candidate_files,
+            'related_snippets': snippets,
             'artifacts': self._existing_context_artifacts(task.id),
+            'context_budget': budget,
         }
 
+        payload_json = json.dumps(payload, indent=2, ensure_ascii=False)
         markdown = self._render_markdown(payload)
-        json_path = self.artifacts.write_text(task.id, 'context/context.json', json.dumps(payload, indent=2, ensure_ascii=False))
+        json_path = self.artifacts.write_text(task.id, 'context/context.json', payload_json)
         markdown_path = self.artifacts.write_text(task.id, 'context/context.md', markdown)
-        return CompiledContext(markdown_path=markdown_path, json_path=json_path, markdown=markdown, payload=payload)
+        return CompiledContext(
+            markdown_path=markdown_path,
+            json_path=json_path,
+            markdown=markdown,
+            payload=payload,
+            markdown_bytes=len(markdown.encode('utf-8')),
+            json_bytes=len(payload_json.encode('utf-8')),
+        )
 
     @staticmethod
     def build_prompt(task: Task, compiled: CompiledContext, review_note: str | None = None, language: str = 'zh') -> str:
@@ -232,6 +265,11 @@ class ContextCompiler:
                 files.append(item)
         return files
 
+    def _review_context(self, task: Task) -> dict[str, Any]:
+        if task.source_type == 'local_diff':
+            return self._local_diff_context(task)
+        return self._pull_request_context(task.id)
+
     def _pull_request_context(self, task_id: str) -> dict[str, Any]:
         path = self.artifacts.task_dir(task_id) / 'context' / 'pull_request.json'
         if not path.exists():
@@ -262,6 +300,199 @@ class ContextCompiler:
                 len(payload.get('review_comments', [])) if isinstance(payload.get('review_comments', []), list) else 0
             ),
         }
+
+    def _local_diff_context(self, task: Task) -> dict[str, Any]:
+        path = self.artifacts.task_dir(task.id) / 'context' / 'local_diff.patch'
+        if not path.exists():
+            return {'file_patches': [], 'review_count': 0, 'comment_count': 0}
+        try:
+            diff_text = path.read_text()
+        except Exception:
+            return {'file_patches': [], 'review_count': 0, 'comment_count': 0}
+        return {
+            'file_patches': self._parse_unified_diff(diff_text, task.review_paths),
+            'review_count': 0,
+            'comment_count': 0,
+        }
+
+    @staticmethod
+    def _context_budget(
+        *,
+        context_cfg: dict[str, Any],
+        review_paths: list[str],
+        file_patches: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        adaptive_budget = bool(context_cfg.get('adaptive_budget', True))
+        default_recent_commits = max(0, int(context_cfg.get('include_recent_commits', 8) or 8))
+        default_candidate_limit = max(0, int(context_cfg.get('candidate_files_limit', 12) or 12))
+        default_keywords_limit = max(0, int(context_cfg.get('keywords_limit', 12) or 12))
+        default_top_level_limit = max(0, int(context_cfg.get('top_level_entries_limit', 12) or 12))
+        include_top_level_cfg = context_cfg.get('include_top_level_entries')
+        include_top_level = bool(include_top_level_cfg) if include_top_level_cfg is not None else False
+        changed_file_count = len(review_paths or [])
+        patch_count = len(file_patches or [])
+        patch_chars = sum(len(item.get('patch') or '') for item in file_patches or [])
+
+        budget = {
+            'adaptive_budget': adaptive_budget,
+            'changed_file_count': changed_file_count,
+            'patch_count': patch_count,
+            'patch_chars': patch_chars,
+            'recent_commit_limit': default_recent_commits,
+            'candidate_files_limit': default_candidate_limit,
+            'keywords_limit': default_keywords_limit,
+            'top_level_entries_limit': default_top_level_limit if include_top_level else 0,
+            'include_top_level_entries': include_top_level,
+        }
+        if not adaptive_budget:
+            return budget
+
+        if patch_count == 0 and changed_file_count == 0:
+            budget['include_top_level_entries'] = include_top_level or default_top_level_limit > 0
+            budget['top_level_entries_limit'] = default_top_level_limit if budget['include_top_level_entries'] else 0
+            return budget
+
+        if patch_count == 0:
+            budget['recent_commit_limit'] = min(default_recent_commits, 5)
+            budget['candidate_files_limit'] = min(default_candidate_limit, 8)
+            budget['keywords_limit'] = min(default_keywords_limit, 10)
+            budget['include_top_level_entries'] = include_top_level or default_top_level_limit > 0
+            budget['top_level_entries_limit'] = min(default_top_level_limit, 10) if budget['include_top_level_entries'] else 0
+            return budget
+
+        if changed_file_count <= 3 and patch_chars <= 8000:
+            budget['recent_commit_limit'] = min(default_recent_commits, 3)
+            budget['candidate_files_limit'] = min(default_candidate_limit, 4)
+            budget['keywords_limit'] = min(default_keywords_limit, 8)
+            budget['top_level_entries_limit'] = min(default_top_level_limit, 6) if include_top_level else 0
+            return budget
+
+        if changed_file_count <= 8 and patch_chars <= 24000:
+            budget['recent_commit_limit'] = min(default_recent_commits, 4)
+            budget['candidate_files_limit'] = min(default_candidate_limit, 6)
+            budget['keywords_limit'] = min(default_keywords_limit, 10)
+            budget['top_level_entries_limit'] = min(default_top_level_limit, 8) if include_top_level else 0
+            return budget
+
+        budget['recent_commit_limit'] = min(default_recent_commits, 6)
+        budget['candidate_files_limit'] = min(default_candidate_limit, 8)
+        budget['keywords_limit'] = min(default_keywords_limit, 12)
+        budget['top_level_entries_limit'] = min(default_top_level_limit, 10) if include_top_level else 0
+        return budget
+
+    @staticmethod
+    def _parse_unified_diff(diff_text: str, review_paths: list[str]) -> list[dict[str, Any]]:
+        patches: list[dict[str, Any]] = []
+        allowed_paths = set(review_paths or [])
+        current_lines: list[str] = []
+        current_path: str | None = None
+        additions = 0
+        deletions = 0
+
+        def flush() -> None:
+            nonlocal current_lines, current_path, additions, deletions
+            if current_path and (not allowed_paths or current_path in allowed_paths):
+                patches.append({
+                    'path': current_path,
+                    'status': 'modified',
+                    'additions': additions,
+                    'deletions': deletions,
+                    'patch': ContextCompiler._truncate_patch('\n'.join(current_lines).strip()),
+                })
+            current_lines = []
+            current_path = None
+            additions = 0
+            deletions = 0
+
+        for line in diff_text.splitlines():
+            if line.startswith('diff --git '):
+                flush()
+                continue
+            if line.startswith('+++ b/'):
+                current_path = line[6:]
+            elif line.startswith('+++ /dev/null'):
+                current_path = None
+            if current_path is not None:
+                current_lines.append(line)
+                if line.startswith('+') and not line.startswith('+++'):
+                    additions += 1
+                elif line.startswith('-') and not line.startswith('---'):
+                    deletions += 1
+        flush()
+        return patches
+
+    @staticmethod
+    def _collect_hunk_snippets(
+        *,
+        repo_root: Path,
+        file_patches: list[dict[str, Any]],
+        file_limit: int,
+        hunks_per_file: int,
+        context_lines: int,
+    ) -> list[dict[str, Any]]:
+        if file_limit <= 0 or hunks_per_file <= 0:
+            return []
+        snippets: list[dict[str, Any]] = []
+        files_with_snippets = 0
+        for item in file_patches:
+            if files_with_snippets >= file_limit:
+                break
+            rel_path = str(item.get('path') or '').strip()
+            if not rel_path:
+                continue
+            file_path = repo_root / rel_path
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            if file_path.suffix.lower() not in TEXT_FILE_SUFFIXES and file_path.name not in {'Makefile', 'Dockerfile'}:
+                continue
+            try:
+                if file_path.stat().st_size > 256 * 1024:
+                    continue
+                content_lines = file_path.read_text(errors='ignore').splitlines()
+            except Exception:
+                continue
+            hunks = ContextCompiler._parse_patch_hunks(str(item.get('patch') or ''))
+            if not hunks:
+                continue
+            file_snippet_count = 0
+            for hunk in hunks:
+                if file_snippet_count >= hunks_per_file:
+                    break
+                anchor_line = hunk['new_start']
+                span = max(hunk['new_count'], 1)
+                start_line = max(1, anchor_line - context_lines)
+                end_line = min(len(content_lines), anchor_line + span + context_lines - 1)
+                if end_line < start_line:
+                    continue
+                snippet_text = '\n'.join(
+                    f'{line_no:>4}: {content_lines[line_no - 1]}'
+                    for line_no in range(start_line, end_line + 1)
+                )
+                snippets.append({
+                    'path': rel_path,
+                    'anchor_line': anchor_line,
+                    'start_line': start_line,
+                    'end_line': end_line,
+                    'reason': 'changed_hunk',
+                    'text': snippet_text,
+                })
+                file_snippet_count += 1
+            if file_snippet_count:
+                files_with_snippets += 1
+        return snippets
+
+    @staticmethod
+    def _parse_patch_hunks(patch: str) -> list[dict[str, int]]:
+        hunks: list[dict[str, int]] = []
+        for line in patch.splitlines():
+            match = re.match(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', line)
+            if not match:
+                continue
+            hunks.append({
+                'new_start': int(match.group(1)),
+                'new_count': int(match.group(2) or 1),
+            })
+        return hunks
 
     @staticmethod
     def _truncate_patch(patch: str, limit: int = 1800) -> str:
@@ -530,6 +761,7 @@ class ContextCompiler:
         review = payload['review']
         repo = payload['repo']
         candidates = payload['candidate_files']
+        snippets = payload.get('related_snippets', [])
         artifacts = payload.get('artifacts', [])
         keywords = payload.get('keywords', [])
         lines = [
@@ -585,32 +817,32 @@ class ContextCompiler:
             f'- Worktree Path: {repo.get("worktree_path") or "(not created yet)"}',
             f'- Current Branch: {repo.get("git_branch") or "(unknown)"}',
             f'- Remote URL: {repo.get("remote_url") or "(unknown)"}',
-            '',
-            '### Top-Level Entries',
         ])
         entries = repo.get('top_level_entries', []) or []
         if entries:
+            lines.extend(['', '### Top-Level Entries'])
             lines.extend(f'- {entry}' for entry in entries)
-        else:
-            lines.append('- (none)')
-        lines.extend(['', '### Search Keywords'])
         if keywords:
+            lines.extend(['', '### Search Keywords'])
             lines.append('- ' + ', '.join(keywords))
-        else:
-            lines.append('- (none)')
-        lines.extend(['', '### Suggested Candidate Files'])
+        if snippets:
+            lines.extend(['', '### Hunk-Local Snippets'])
+            for item in snippets:
+                lines.append(
+                    f"- {item['path']}:{item['start_line']}-{item['end_line']} (anchor={item['anchor_line']})"
+                )
+                lines.append('```text')
+                lines.append(item['text'])
+                lines.append('```')
         if candidates:
+            lines.extend(['', '### Suggested Candidate Files'])
             for item in candidates:
                 breakdown = f"score={item['score']} path={item.get('path_score', 0)} structure={item.get('structure_score', 0)} content={item.get('content_score', 0)}"
                 lines.append(f"- {item['path']} ({breakdown})")
-        else:
-            lines.append('- (none)')
-        lines.extend(['', '### Recent Commits'])
         commits = repo.get('recent_commits', []) or []
         if commits:
+            lines.extend(['', '### Recent Commits'])
             lines.extend(f'- {commit}' for commit in commits)
-        else:
-            lines.append('- (none)')
         if artifacts:
             lines.extend(['', '## Existing Context Artifacts'])
             lines.extend(f'- {item["relative_path"]}' for item in artifacts)

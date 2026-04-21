@@ -64,6 +64,7 @@ class ReviewReport:
     is_incremental: bool = False
     previous_sha: str | None = None
     inferred_focus: str = ''
+    metrics: dict[str, object] = field(default_factory=dict)
 
 
 class ReviewEngine:
@@ -500,6 +501,9 @@ class ReviewEngine:
 
         passed = result.verdict == ReviewVerdict.CLEAR
         can_continue = not passed and rounds_executed < max_rounds
+        latest_runs = self._db.list_runs(task.id)
+        latest_run = latest_runs[-1] if latest_runs else None
+        metrics: dict[str, object] = dict(latest_run.metrics) if latest_run and latest_run.metrics else {}
 
         # --- Finding dedup against history ---
         finding_statuses: list[FindingStatus] = []
@@ -544,6 +548,7 @@ class ReviewEngine:
             duration_sec=time.time() - start_time,
             changed_files=list(task.review_paths) if task.review_paths else [],
             commit_range=f'{previous_sha[:7]}..{current_sha[:7]}' if previous_sha and current_sha else '',
+            metadata={'metrics': metrics} if metrics else {},
         )
         history.save_review(record)
 
@@ -563,6 +568,7 @@ class ReviewEngine:
             is_incremental=is_incremental,
             previous_sha=previous_sha,
             inferred_focus=inferred_focus,
+            metrics=metrics,
         )
 
     # ------------------------------------------------------------------
@@ -637,8 +643,12 @@ class ReviewEngine:
 
         # Compile context and build prompt
         try:
+            compile_started_at = time.perf_counter()
             compiled = self._contexts.compile_task(task, worktree_path=task.repo_path)
+            compile_context_ms = int((time.perf_counter() - compile_started_at) * 1000)
+            prompt_started_at = time.perf_counter()
             prompt = self._contexts.build_prompt(task, compiled, language=self.language)
+            prompt_build_ms = int((time.perf_counter() - prompt_started_at) * 1000)
         except Exception as exc:
             return ReviewReport(
                 task_id=task.id,
@@ -646,12 +656,33 @@ class ReviewEngine:
                 passed=False,
                 error={'code': 'compile_failed', 'message': str(exc), 'recoverable': False},
             )
+        metrics: dict[str, object] = {
+            'context_compile_ms': compile_context_ms,
+            'prompt_build_ms': prompt_build_ms,
+            'context_markdown_bytes': compiled.markdown_bytes,
+            'context_json_bytes': compiled.json_bytes,
+            'prompt_bytes': len(prompt.encode('utf-8')),
+            'changed_file_count': len(task.review_paths),
+            'patch_count': len(compiled.payload.get('review', {}).get('file_patches', []) or []),
+            'candidate_file_count': len(compiled.payload.get('candidate_files', []) or []),
+            'snippet_count': len(compiled.payload.get('related_snippets', []) or []),
+            'top_level_entry_count': len(compiled.payload.get('repo', {}).get('top_level_entries', []) or []),
+            'recent_commit_count': len(compiled.payload.get('repo', {}).get('recent_commits', []) or []),
+        }
+        self._engine.append_event(
+            task_id=task.id,
+            kind='review.metrics_collected',
+            payload={'stage': 'prepare', **metrics},
+        )
 
         # Call LLM API directly
         try:
             api_config.timeout = timeout_sec
             adapter = DirectAPIAdapter(api_config)
+            llm_started_at = time.perf_counter()
             response_text = adapter.call_llm(prompt)
+            metrics['llm_wall_time_ms'] = int((time.perf_counter() - llm_started_at) * 1000)
+            metrics['response_text_bytes'] = len(response_text.encode('utf-8'))
         except Exception as exc:
             return ReviewReport(
                 task_id=task.id,
@@ -659,6 +690,7 @@ class ReviewEngine:
                 passed=False,
                 duration_sec=time.time() - start_time,
                 error={'code': 'api_error', 'message': str(exc), 'recoverable': True},
+                metrics=metrics,
             )
 
         if not response_text.strip():
@@ -668,10 +700,14 @@ class ReviewEngine:
                 passed=False,
                 duration_sec=time.time() - start_time,
                 error={'code': 'empty_response', 'message': 'LLM returned empty response', 'recoverable': True},
+                metrics=metrics,
             )
 
         # Parse findings from raw text
+        parse_started_at = time.perf_counter()
         result = ReviewResultService.parse_raw_text(response_text)
+        metrics['parse_result_ms'] = int((time.perf_counter() - parse_started_at) * 1000)
+        metrics['round_duration_ms'] = int((time.time() - start_time) * 1000)
 
         # Store events for audit trail
         self._engine.append_event(
@@ -687,6 +723,11 @@ class ReviewEngine:
                 'finding_count': result.finding_count,
                 'mode': 'direct_api',
             },
+        )
+        self._engine.append_event(
+            task_id=task.id,
+            kind='review.metrics_collected',
+            payload={'stage': 'finish', **metrics},
         )
 
         # Update task status
@@ -705,6 +746,7 @@ class ReviewEngine:
             duration_sec=time.time() - start_time,
             can_continue=False,
             inferred_focus=inferred_focus,
+            metrics=metrics,
         )
 
     # ------------------------------------------------------------------

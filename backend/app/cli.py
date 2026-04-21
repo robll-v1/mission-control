@@ -603,8 +603,16 @@ backend:
     model: '{model}'
 
 context:
+  adaptive_budget: true
+  hunk_snippets_enabled: true
   include_recent_commits: 8
   candidate_files_limit: 12
+  keywords_limit: 12
+  top_level_entries_limit: 12
+  include_top_level_entries: false
+  hunk_snippet_file_limit: 3
+  hunk_snippet_hunks_per_file: 1
+  hunk_snippet_context_lines: 8
 
 execution:
   idle_timeout_sec: 180
@@ -781,6 +789,8 @@ def _report_to_json(report) -> dict:
         'duration_sec': report.duration_sec,
         'can_continue': report.can_continue,
     }
+    if getattr(report, 'metrics', None):
+        output['metrics'] = report.metrics
 
     # Incremental info
     if report.is_incremental:

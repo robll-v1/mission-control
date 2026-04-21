@@ -22,12 +22,12 @@ SEVERITY_PATTERN = re.compile(
     r'^\s*[-*]\s*\*{0,2}(critical|high|medium|low|严重|高|中|低)\*{0,2}\s*[:：\-]\s*(.+)$',
     re.IGNORECASE,
 )
-# Match `path/to/file.go:123` — backtick-wrapped path with line number
-PATH_LINE_PATTERN = re.compile(r'`([^`:\s]+):(\d+)`')
+# Match `path/to/file.go:123` or `path/to/file.go:123-145`
+PATH_LINE_PATTERN = re.compile(r'`([^`:\s]+):(\d+)(?:-\d+)?`')
 # Match `path/to/file.go` — backtick-wrapped path without line number
 PATH_PATTERN = re.compile(r'`([^`/\s]+/[^`:\s]+)`')
-# Match bare path:line without backticks (e.g. cmd/main.go:42)
-BARE_PATH_LINE_PATTERN = re.compile(r'(\S+/\S+?):(\d+)')
+# Match bare path:line, with optional backticks and optional line range
+BARE_PATH_LINE_PATTERN = re.compile(r'`?([^`\s:]+/[^`\s:]+):(\d+)(?:-\d+)?`?')
 NOISE_TEXT_PREFIXES = ('[mnemo]',)
 NOISY_EVENT_KINDS = {'agent.step_start', 'agent.step_finish'}
 

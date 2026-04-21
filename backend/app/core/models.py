@@ -86,6 +86,7 @@ class Run(BaseModel):
     backend_session_id: str | None = None
     status: str = 'created'
     review_result: ReviewResult | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
     started_at: float
     ended_at: float | None = None
     exit_code: int | None = None

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
@@ -281,61 +283,72 @@ class ReviewHistoryStore:
         Returns list of (finding, was_modified) tuples.
         Layer 1 of fix verification: determines if code was even touched.
         """
-        import subprocess
-
+        modified_files, ranges_by_file, ranges_complete = self._diff_state_since(since_sha)
         results = []
         for finding in findings:
             if not finding.path:
                 results.append((finding, False))
                 continue
-
-            modified = self._is_file_region_modified(
-                finding.path, finding.line, since_sha
+            if finding.path not in modified_files:
+                results.append((finding, False))
+                continue
+            if finding.line is None:
+                results.append((finding, True))
+                continue
+            if not ranges_complete:
+                results.append((finding, True))
+                continue
+            modified = self._line_in_modified_ranges(
+                finding.line,
+                ranges_by_file.get(finding.path, []),
             )
             results.append((finding, modified))
 
         return results
 
-    def _is_file_region_modified(
-        self, file_path: str, line: int | None, since_sha: str
-    ) -> bool:
-        """Check if a specific file region was modified since a commit."""
-        import subprocess
-
-        # Check if the file itself was modified
-        result = subprocess.run(
-            ['git', 'diff', '--name-only', f'{since_sha}..HEAD', '--', file_path],
+    def _diff_state_since(self, since_sha: str) -> tuple[set[str], dict[str, list[tuple[int, int]]], bool]:
+        modified_files_result = subprocess.run(
+            ['git', 'diff', '--name-only', f'{since_sha}..HEAD'],
             capture_output=True, text=True, cwd=str(self.repo_path), timeout=10,
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            return False  # file not modified
+        modified_files = {
+            line.strip()
+            for line in modified_files_result.stdout.splitlines()
+            if line.strip()
+        } if modified_files_result.returncode == 0 else set()
 
-        if line is None:
-            return True  # file modified, no specific line to check
-
-        # Check if the specific line region was modified (±5 lines)
-        result = subprocess.run(
-            ['git', 'diff', f'{since_sha}..HEAD', '-U0', '--', file_path],
+        patch_result = subprocess.run(
+            ['git', 'diff', f'{since_sha}..HEAD', '-U0'],
             capture_output=True, text=True, cwd=str(self.repo_path), timeout=10,
         )
-        if result.returncode != 0:
-            return True  # can't determine, assume modified
+        if patch_result.returncode != 0:
+            return modified_files, {}, False
 
-        # Parse diff hunks to check if our line is in a modified region
-        for diff_line in result.stdout.splitlines():
-            if diff_line.startswith('@@'):
-                # Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
-                try:
-                    parts = diff_line.split()
-                    old_range = parts[1]  # e.g. "-42,5"
-                    old_start = int(old_range.split(',')[0].lstrip('-'))
-                    old_count = int(old_range.split(',')[1]) if ',' in old_range else 1
-                    # Check if finding line falls within ±5 of modified region
-                    if old_start - 5 <= line <= old_start + old_count + 5:
-                        return True
-                except (ValueError, IndexError):
-                    continue
+        ranges_by_file: dict[str, list[tuple[int, int]]] = {}
+        current_path: str | None = None
+        for diff_line in patch_result.stdout.splitlines():
+            if diff_line.startswith('diff --git '):
+                current_path = None
+                continue
+            if diff_line.startswith('+++ b/'):
+                current_path = diff_line[6:].strip()
+                continue
+            if not current_path or not diff_line.startswith('@@'):
+                continue
+            match = re.match(r'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@', diff_line)
+            if not match:
+                continue
+            old_start = int(match.group(1))
+            old_count = int(match.group(2) or 1)
+            ranges_by_file.setdefault(current_path, []).append((old_start, old_count))
 
+        return modified_files, ranges_by_file, True
+
+    @staticmethod
+    def _line_in_modified_ranges(line: int, ranges: list[tuple[int, int]]) -> bool:
+        for start, count in ranges:
+            if start - 5 <= line <= start + count + 5:
+                return True
         return False
 
     # ------------------------------------------------------------------
