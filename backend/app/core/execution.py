@@ -220,6 +220,8 @@ class ExecutionService:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 bufsize=1,
                 start_new_session=(sys.platform != 'win32'),
                 **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {}),
@@ -456,7 +458,7 @@ class ExecutionService:
         try:
             result = subprocess.run(
                 [executable, 'run', '--format', 'json', 'Reply with exactly one word: OK'],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
                 cwd=task.repo_path,
             )
             if result.returncode != 0:

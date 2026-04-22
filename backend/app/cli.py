@@ -26,6 +26,66 @@ HEALTH_TIMEOUT = 30
 IS_WINDOWS = sys.platform == 'win32'
 
 
+def _enable_windows_vt_mode() -> bool:
+    """Try to enable ANSI escape support in the current Windows console.
+
+    Returns True if VT processing is active (or not needed). On older Windows
+    builds where this fails, callers should strip ANSI / use ASCII fallbacks.
+    """
+    if not IS_WINDOWS:
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(kernel32.SetConsoleMode(handle, new_mode))
+    except Exception:
+        return False
+
+
+def _try_set_utf8_codepage() -> None:
+    """Best-effort: switch the active Windows console codepage to UTF-8 (65001)."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
+
+
+_USE_COLOR = (not IS_WINDOWS) or _enable_windows_vt_mode()
+if IS_WINDOWS:
+    _try_set_utf8_codepage()
+# Honor explicit overrides for environments without TTY support.
+if os.environ.get('NO_COLOR'):
+    _USE_COLOR = False
+if os.environ.get('AMC_FORCE_COLOR'):
+    _USE_COLOR = True
+
+if IS_WINDOWS:
+    _SYM_OK = '[OK]'
+    _SYM_WARN = '[!]'
+    _SYM_FAIL = '[x]'
+else:
+    _SYM_OK = '✅'
+    _SYM_WARN = '⚠️ '
+    _SYM_FAIL = '❌'
+
+
+def _color(code: str, msg: str) -> str:
+    if not _USE_COLOR:
+        return msg
+    return f'\033[{code}m{msg}\033[0m'
+
+
 def _root_dir() -> Path:
     """Resolve project root (directory containing pyproject.toml)."""
     here = Path(__file__).resolve().parent
@@ -56,19 +116,19 @@ def _venv_bin(name: str) -> Path:
 # ── helpers ───────────────────────────────────────────────────────────
 
 def _info(msg: str) -> None:
-    print(f'\033[0;36m{msg}\033[0m')
+    print(_color('0;36', msg))
 
 
 def _ok(msg: str) -> None:
-    print(f'\033[0;32m✅ {msg}\033[0m')
+    print(_color('0;32', f'{_SYM_OK} {msg}'))
 
 
 def _warn(msg: str) -> None:
-    print(f'\033[0;33m⚠️  {msg}\033[0m')
+    print(_color('0;33', f'{_SYM_WARN} {msg}'))
 
 
 def _fail(msg: str) -> None:
-    print(f'\033[0;31m❌ {msg}\033[0m')
+    print(_color('0;31', f'{_SYM_FAIL} {msg}'))
     sys.exit(1)
 
 
@@ -176,16 +236,34 @@ def _ensure_frontend_deps() -> None:
     node_modules = root / 'frontend' / 'node_modules'
     if node_modules.exists():
         return
-    if not _which('node'):
+    npm_bin = _resolve_npm()
+    if not npm_bin:
         return
     _info('Installing frontend dependencies...')
     subprocess.run(
-        ['npm', 'install', '--silent'],
+        [npm_bin, 'install', '--silent'],
         cwd=str(root / 'frontend'),
         check=True,
-        shell=IS_WINDOWS,
     )
     _ok('Frontend dependencies ready')
+
+
+def _resolve_npm() -> str | None:
+    """Locate the npm launcher cross-platform.
+
+    Windows installs npm as ``npm.cmd``; ``shutil.which('npm')`` resolves it
+    correctly when available. Falling back to a bare name keeps macOS/Linux
+    behavior unchanged when PATH lookup is denied (sandboxed runs, etc.).
+    """
+    import shutil
+    resolved = shutil.which('npm')
+    if resolved:
+        return resolved
+    if IS_WINDOWS:
+        resolved = shutil.which('npm.cmd')
+        if resolved:
+            return resolved
+    return None
 
 
 # ── commands ──────────────────────────────────────────────────────────
@@ -245,9 +323,12 @@ def cmd_start(args: argparse.Namespace) -> None:
         '--app-dir', str(root / 'backend'),
         '--host', '127.0.0.1',
         '--port', str(backend_port),
-        '--reload',
     ]
-    with open(backend_log, 'w') as log:
+    # --reload spawns a separate reloader+worker pair, which makes process
+    # cleanup unreliable (especially on Windows). Allow opt-in for dev only.
+    if os.environ.get('AMC_DEV_RELOAD'):
+        backend_cmd.append('--reload')
+    with open(backend_log, 'w', encoding='utf-8', errors='replace', newline='') as log:
         backend_proc = subprocess.Popen(
             backend_cmd,
             stdout=log, stderr=log,
@@ -263,13 +344,15 @@ def cmd_start(args: argparse.Namespace) -> None:
         frontend_log = _run_dir() / 'frontend.log'
         env = os.environ.copy()
         env['VITE_API_TARGET'] = f'http://127.0.0.1:{backend_port}'
-        npm_cmd = 'npm.cmd' if IS_WINDOWS else 'npm'
+        npm_bin = _resolve_npm()
+        if not npm_bin:
+            _fail('npm not found in PATH')
         frontend_cmd = [
-            npm_cmd, 'run', 'dev', '--',
+            npm_bin, 'run', 'dev', '--',
             '--host', '127.0.0.1',
             '--port', str(frontend_port),
         ]
-        with open(frontend_log, 'w') as log:
+        with open(frontend_log, 'w', encoding='utf-8', errors='replace', newline='') as log:
             frontend_proc = subprocess.Popen(
                 frontend_cmd,
                 cwd=str(root / 'frontend'),
@@ -277,7 +360,6 @@ def cmd_start(args: argparse.Namespace) -> None:
                 env=env,
                 start_new_session=not IS_WINDOWS,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0,
-                shell=IS_WINDOWS,
             )
         _save_pid('frontend', frontend_proc.pid)
 

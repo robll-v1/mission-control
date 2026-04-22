@@ -1,6 +1,7 @@
 import logging
 import os
 import signal
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -143,21 +144,35 @@ def admin_shutdown():
             aborted.append(task_id)
         except Exception:
             pass
-    # Kill the parent process (reloader in --reload mode) for clean exit
-    parent_pid = os.getppid()
+
     my_pid = os.getpid()
-    # Schedule both SIGTERM signals after response is sent
+    # If launched via uvicorn --reload, the worker's parent is the reloader and
+    # must be terminated too; otherwise getppid() is the shell/CLI and we
+    # should not touch it.
+    parent_pid = os.getppid() if os.environ.get('AMC_DEV_RELOAD') else None
+    is_windows = sys.platform == 'win32'
+
+    def _terminate(pid: int) -> None:
+        try:
+            if is_windows:
+                # On Windows os.kill maps to TerminateProcess; use taskkill /T
+                # to also reap any child processes uvicorn may have spawned.
+                import subprocess as _sp
+                _sp.run(
+                    ['taskkill', '/F', '/T', '/PID', str(pid)],
+                    capture_output=True,
+                )
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
     def _deferred_kill():
         import time as _time
         _time.sleep(0.5)
-        try:
-            os.kill(parent_pid, signal.SIGTERM)
-        except OSError:
-            pass
-        try:
-            os.kill(my_pid, signal.SIGTERM)
-        except OSError:
-            pass
+        if parent_pid:
+            _terminate(parent_pid)
+        _terminate(my_pid)
 
     import threading
     threading.Thread(target=_deferred_kill, daemon=True).start()
