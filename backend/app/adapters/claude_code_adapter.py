@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from app.adapters.base import AdapterEvent, RunnerAdapter
+from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable
 from app.core.models import Task
 
 
@@ -18,7 +18,7 @@ class ClaudeCodeAdapter(RunnerAdapter):
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         work_dir = task.worktree_path or task.repo_path
         cmd = [
-            'claude', '-p', prompt,
+            resolve_executable('claude'), '-p', prompt,
             '--output-format', 'stream-json',
             '--verbose',
             '--permission-mode', 'bypassPermissions',

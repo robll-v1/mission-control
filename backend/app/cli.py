@@ -1008,7 +1008,7 @@ def main() -> None:
     # init subcommand
     init_p = sub.add_parser('init', help='Interactive setup (generates .amc.yaml)')
     init_p.add_argument('--global', dest='global_config', action='store_true',
-                        help='Write to ~/.config/amc/config.yaml (user-wide defaults)')
+                        help='Write to the user-wide config (~/.config/amc/config.yaml or %%APPDATA%%\\amc\\config.yaml on Windows)')
 
     # review subcommand
     review_p = sub.add_parser('review', help='Run code review (no server needed)')

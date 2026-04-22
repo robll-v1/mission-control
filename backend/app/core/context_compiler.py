@@ -383,7 +383,9 @@ class ContextCompiler:
     @staticmethod
     def _parse_unified_diff(diff_text: str, review_paths: list[str]) -> list[dict[str, Any]]:
         patches: list[dict[str, Any]] = []
-        allowed_paths = set(review_paths or [])
+        # Git diffs always emit POSIX-style paths even on Windows; normalize the
+        # caller-supplied filter so backslash paths still match.
+        allowed_paths = {p.replace('\\', '/') for p in (review_paths or [])}
         current_lines: list[str] = []
         current_path: str | None = None
         additions = 0
@@ -409,7 +411,7 @@ class ContextCompiler:
                 flush()
                 continue
             if line.startswith('+++ b/'):
-                current_path = line[6:]
+                current_path = line[6:].replace('\\', '/')
             elif line.startswith('+++ /dev/null'):
                 current_path = None
             if current_path is not None:

@@ -1,12 +1,33 @@
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.review_policy import BLOCKED_MARKER, forbidden_command_reason
 from app.core.models import Task
+
+
+def resolve_executable(name: str) -> str:
+    """Return a launchable path for ``name``, falling back to the bare name.
+
+    On Windows ``shutil.which`` honours PATHEXT, so npm/codex/gh installed as
+    ``.cmd`` or ``.bat`` shims resolve correctly. Falling back to the bare name
+    preserves macOS/Linux behaviour and keeps preflight error messages familiar
+    when the binary is genuinely missing.
+    """
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    if sys.platform == 'win32':
+        for ext in ('.cmd', '.exe', '.bat'):
+            resolved = shutil.which(name + ext)
+            if resolved:
+                return resolved
+    return name
 
 
 @dataclass

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.adapters.base import RunnerAdapter
+from app.adapters.base import RunnerAdapter, resolve_executable
 from app.core.models import Task
 
 
@@ -13,7 +13,7 @@ class OpenCodeAdapter(RunnerAdapter):
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         work_dir = task.worktree_path or task.repo_path
-        cmd = ['opencode', 'run', '--dir', work_dir, '--format', 'json']
+        cmd = [resolve_executable('opencode'), 'run', '--dir', work_dir, '--format', 'json']
         if self.model:
             cmd.extend(['--model', self.model])
         if self.variant:

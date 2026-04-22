@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -39,10 +40,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def _global_config_path() -> Path:
-    """~/.config/amc/config.yaml (XDG-compatible)."""
+    """Locate the user-level config file in a platform-appropriate place.
+
+    * ``XDG_CONFIG_HOME`` / ``~/.config/amc/config.yaml`` on macOS & Linux.
+    * ``%APPDATA%\\amc\\config.yaml`` on Windows (with a fall-back to the
+      Linux-style location so legacy installs keep working).
+    """
     xdg = os.environ.get('XDG_CONFIG_HOME', '')
     if xdg:
         return Path(xdg) / 'amc' / 'config.yaml'
+    if sys.platform == 'win32':
+        appdata = os.environ.get('APPDATA')
+        if appdata:
+            primary = Path(appdata) / 'amc' / 'config.yaml'
+            legacy = Path.home() / '.config' / 'amc' / 'config.yaml'
+            if primary.exists() or not legacy.exists():
+                return primary
+            return legacy
     return Path.home() / '.config' / 'amc' / 'config.yaml'
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from app.adapters.base import AdapterEvent, RunnerAdapter
+from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable
 from app.core.models import Task
 
 
@@ -17,7 +17,7 @@ class CodexAdapter(RunnerAdapter):
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         work_dir = task.worktree_path or task.repo_path
-        cmd = ['codex', 'exec', '--json', '--full-auto']
+        cmd = [resolve_executable('codex'), 'exec', '--json', '--full-auto']
         if self.model:
             cmd.extend(['-c', f'model="{self.model}"'])
         cmd.extend(['--cwd', work_dir, prompt])
