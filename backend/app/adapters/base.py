@@ -38,11 +38,31 @@ class AdapterEvent:
 
 
 class RunnerAdapter(ABC):
+    #: Backend key used in config and on ``Task.backend`` (e.g. ``claude-code``).
     name: str
+    #: Name of the program to launch. Often differs from :attr:`name` —
+    #: ``claude-code`` runs ``claude``, ``copilot`` runs ``gh``. Preflight must
+    #: probe *this*, not :attr:`name`.
+    executable: str = ''
 
     @abstractmethod
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         raise NotImplementedError
+
+    @classmethod
+    def executable_name(cls) -> str:
+        """Program this adapter launches; falls back to the backend key."""
+        return cls.executable or cls.name
+
+    def probe_command(self) -> list[str] | None:
+        """A cheap invocation proving the CLI is usable, or ``None`` to skip.
+
+        Returning ``None`` means "existence on PATH is the only check we can
+        make". That is preferable to running an invocation the CLI does not
+        understand, which produces a confusing failure that looks like a
+        credentials problem.
+        """
+        return None
 
     def parse_stdout_line(self, line: str) -> list[AdapterEvent]:
         stripped = line.strip()

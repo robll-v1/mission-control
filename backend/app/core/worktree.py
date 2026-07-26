@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 from app.core.models import Task
+from app.core.proc import run_git
 
 
 GITHUB_REMOTE_RE = re.compile(r'github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$')
@@ -140,12 +141,7 @@ class WorktreeManager:
 
     @staticmethod
     def _run_git(repo_path: str, args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ['git', '-C', repo_path, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        return run_git(repo_path, args, timeout=timeout)
 
     def _resolve_revision(self, task: Task) -> str:
         if task.pr_head_sha:

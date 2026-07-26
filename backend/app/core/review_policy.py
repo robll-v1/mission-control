@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 
 
@@ -35,6 +36,15 @@ BLOCKED_PATTERN = re.compile(
 
 
 def prepare_static_review_env(runtime_root: str, base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Prepend a directory of no-op shims so build/run commands fail fast.
+
+    This is a guard-rail, not a sandbox: anything invoking an absolute path
+    (``/usr/bin/python``, ``C:\\Python\\python.exe``) bypasses PATH entirely.
+
+    On Windows a bare extensionless file is never executable — command lookup
+    only considers the suffixes in ``PATHEXT`` — so a ``.cmd`` shim is written
+    alongside the POSIX one. Without it the policy silently does nothing there.
+    """
     env = dict(base_env or os.environ)
     bin_dir = Path(runtime_root)
     if not bin_dir.is_absolute():
@@ -47,9 +57,18 @@ def prepare_static_review_env(runtime_root: str, base_env: dict[str, str] | None
             '#!/usr/bin/env bash\n'
             f'echo "{BLOCKED_MARKER}" >&2\n'
             'echo "Command: $0 $*" >&2\n'
-            'exit 97\n'
+            'exit 97\n',
+            encoding='utf-8',
         )
         path.chmod(0o755)
+        if sys.platform == 'win32':
+            (bin_dir / f'{command}.cmd').write_text(
+                '@echo off\r\n'
+                f'echo {BLOCKED_MARKER} 1>&2\r\n'
+                f'echo Command: {command} %* 1>&2\r\n'
+                'exit /b 97\r\n',
+                encoding='utf-8',
+            )
     legacy_node = bin_dir / 'node'
     if legacy_node.exists():
         legacy_node.unlink()

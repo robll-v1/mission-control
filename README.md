@@ -88,7 +88,7 @@ Mission Control automates code review by:
 | Category | Highlights |
 |----------|-----------|
 | **Review** | Multi-round review, context-aware prompts, structured findings |
-| **Safety** | Static review policy (blocks shell/docker/npm), preflight checks |
+| **Safety** | Static review policy (guard-rail against shell/docker/npm), preflight checks |
 | **Reliability** | Graceful shutdown, crash recovery, idle timeout |
 | **Output** | Verdict (clear/concerns/failed), severity ratings, exportable summaries |
 | **Streaming** | Real-time SSE events for live progress |
@@ -298,6 +298,21 @@ validation:
 - **Crash recovery**: on restart, stale `running` tasks are marked `FAILED` with audit event
 - **Idle timeout**: kills unresponsive agent processes after 180s
 
+## Review policy — scope
+
+The static review policy prepends a directory of no-op shims to `PATH` so that
+`npm`, `docker`, `go`, `pytest` and friends fail fast during a review. Treat it
+as a **guard-rail against accidents, not a sandbox**: anything invoking an
+absolute path (`/usr/bin/python`, `C:\Python\python.exe`) bypasses `PATH`
+entirely. Violations are additionally flagged in the event stream.
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest -q
+```
+
 ## Cross-Platform
 
 | Feature | macOS/Linux | Windows |
@@ -398,7 +413,7 @@ Mission Control 自动化代码审查流程：
 | 类别 | 亮点 |
 |------|------|
 | **审查** | 多轮审查、上下文感知、结构化发现 |
-| **安全** | 静态审查策略（阻止 shell/docker/npm）、预检查 |
+| **安全** | 静态审查策略（拦截 shell/docker/npm 的护栏）、预检查 |
 | **可靠性** | 优雅停机、崩溃恢复、空闲超时 |
 | **输出** | 判定（通过/关注/阻止）、严重程度分级、可导出摘要 |
 | **实时** | SSE 事件流，实时查看审查进度 |
@@ -590,6 +605,20 @@ validation:
 - **优雅停机**：`amc stop` → 中止活跃任务 → SIGTERM → 兜底强杀
 - **崩溃恢复**：重启时自动将滞留的 `running` 任务标记为 `FAILED`
 - **空闲超时**：180 秒无响应自动终止 Agent 进程
+
+## 审查策略的边界
+
+静态审查策略通过在 `PATH` 前插入一批空操作 shim，让 `npm`、`docker`、`go`、
+`pytest` 等命令在审查期间快速失败。请把它当作**防误操作的护栏，而不是沙箱**：
+任何使用绝对路径的调用（`/usr/bin/python`、`C:\Python\python.exe`）都能绕过
+`PATH`。违规调用会额外记录在事件流中。
+
+## 测试
+
+```bash
+pip install -e ".[dev]"
+pytest -q
+```
 
 ## 跨平台支持
 

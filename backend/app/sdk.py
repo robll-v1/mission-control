@@ -10,7 +10,6 @@ Usage:
 """
 from __future__ import annotations
 
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -32,6 +31,7 @@ from app.core.models import (
     Task,
     TaskStatus,
 )
+from app.core.proc import run_text
 from app.core.validation import ValidationService
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
@@ -116,40 +116,41 @@ class ReviewEngine:
             artifacts=self._artifacts,
         )
 
-    @staticmethod
-    def _resolve_model() -> str | None:
-        """Resolve model from env var or .amc.yaml config.
+    def _resolve_model(self, repo_path: str = '.') -> str | None:
+        """Resolve the model from env var or merged config.
 
-        Priority: $AMC_MODEL > .amc.yaml backend.opencode.model > None
+        Priority: ``$AMC_MODEL`` > ``backend.<backend>.model`` >
+        ``backend.<default>.model`` > ``None`` (let the backend decide).
+
+        This used to be declared ``@staticmethod`` while its body dereferenced
+        ``self``; the resulting ``NameError`` was swallowed by a bare
+        ``except Exception``, so configured models were silently ignored and
+        only ``--model`` / ``$AMC_MODEL`` ever took effect.
         """
         import os
 
-        # Check environment variable
         env_model = os.environ.get('AMC_MODEL', '').strip()
         if env_model:
             return env_model
 
-        # Check merged config (global + project .amc.yaml)
         from app.core.config import load_repo_config
-        try:
-            config = load_repo_config(self.repo_path if hasattr(self, 'repo_path') else '.')
-            backend_config = config.get('backend', {})
-            # Try backend-specific model first, then fall back to default backend's model
-            agent_config = backend_config.get(self.backend_name, {})
-            yaml_model = ''
-            if isinstance(agent_config, dict):
-                yaml_model = agent_config.get('model', '').strip()
-            if not yaml_model:
-                default_backend = backend_config.get('default', 'opencode')
-                default_config = backend_config.get(default_backend, {})
-                if isinstance(default_config, dict):
-                    yaml_model = default_config.get('model', '').strip()
-            if yaml_model:
-                return yaml_model
-        except Exception:
-            pass
+        config = load_repo_config(repo_path)
+        backend_config = config.get('backend', {})
+        if not isinstance(backend_config, dict):
+            return None
 
-        return None  # Use backend's own default
+        def _model_of(key: str) -> str:
+            section = backend_config.get(key)
+            if not isinstance(section, dict):
+                return ''
+            return str(section.get('model') or '').strip()
+
+        # Backend-specific first, then whatever the configured default backend uses.
+        return (
+            _model_of(self.backend_name)
+            or _model_of(str(backend_config.get('default', 'opencode')))
+            or None
+        )
 
     # ------------------------------------------------------------------
     # Task creation
@@ -524,33 +525,17 @@ class ReviewEngine:
             resolved_findings = [fs.finding for fs in comparison['resolved']]
 
         # --- Save review to history ---
-        current_sha = self._get_head_sha(str(repo)) or ''
-        base_ref = base or self._detect_default_branch(str(repo))
-        record = ReviewRecord(
-            review_id=str(uuid.uuid4())[:8],
-            timestamp=time.time(),
-            head_sha=current_sha,
-            base_ref=base_ref,
-            mode='pr' if pr_url else 'local_diff',
+        self._save_review_history(
+            repo=repo,
+            task=task,
+            result=result,
+            base=base,
             pr_url=pr_url,
             focus=inferred_focus,
-            verdict=result.verdict.value if hasattr(result.verdict, 'value') else str(result.verdict),
-            findings=[
-                StoredFinding(
-                    severity=f.severity,
-                    path=f.path or '',
-                    line=f.line,
-                    summary=f.summary,
-                )
-                for f in result.findings
-            ],
-            finding_count=result.finding_count,
+            previous_sha=previous_sha,
             duration_sec=time.time() - start_time,
-            changed_files=list(task.review_paths) if task.review_paths else [],
-            commit_range=f'{previous_sha[:7]}..{current_sha[:7]}' if previous_sha and current_sha else '',
-            metadata={'metrics': metrics} if metrics else {},
+            metrics=metrics,
         )
-        history.save_review(record)
 
         return ReviewReport(
             task_id=task.id,
@@ -705,18 +690,42 @@ class ReviewEngine:
 
         # Parse findings from raw text
         parse_started_at = time.perf_counter()
-        result = ReviewResultService.parse_raw_text(response_text)
+        result = ReviewResultService.parse_raw_text(response_text, language=self.language)
         metrics['parse_result_ms'] = int((time.perf_counter() - parse_started_at) * 1000)
         metrics['round_duration_ms'] = int((time.time() - start_time) * 1000)
+
+        # Persist a Run and the latest result exactly like the subprocess path.
+        # Without this the review completes but the Web UI, get_result() and
+        # get_findings() all report zero findings.
+        run = Run(
+            task_id=task.id,
+            backend=self.backend_name,
+            round_index=len(self._db.list_runs(task.id)) + 1,
+            status='completed',
+            review_result=result,
+            metrics=metrics,
+            started_at=start_time,
+            ended_at=time.time(),
+            exit_code=0,
+        )
+        self._db.save_run(run)
+        # Re-read: append_event() touches the row, so the local object may be stale.
+        task = self._db.get_task(task.id) or task
+        task.last_run_id = run.id
+        task.latest_review_result = ReviewResultService.latest_result(self._db.list_runs(task.id))
+        task.updated_at = time.time()
+        self._db.save_task(task)
 
         # Store events for audit trail
         self._engine.append_event(
             task_id=task.id,
+            run_id=run.id,
             kind='agent.text',
             payload={'text': response_text[:5000]},
         )
         self._engine.append_event(
             task_id=task.id,
+            run_id=run.id,
             kind='review.result_extracted',
             payload={
                 'verdict': result.verdict.value if hasattr(result.verdict, 'value') else str(result.verdict),
@@ -726,12 +735,26 @@ class ReviewEngine:
         )
         self._engine.append_event(
             task_id=task.id,
+            run_id=run.id,
             kind='review.metrics_collected',
             payload={'stage': 'finish', **metrics},
         )
 
         # Update task status
         self._engine.set_stage(task.id, status=TaskStatus.COMPLETED, stage='review_done')
+
+        # Record the review so incremental mode works on this path too.
+        self._save_review_history(
+            repo=repo,
+            task=task,
+            result=result,
+            base=base,
+            pr_url=pr_url,
+            focus=inferred_focus,
+            previous_sha=None,
+            duration_sec=time.time() - start_time,
+            metrics=metrics,
+        )
 
         passed = result.verdict == ReviewVerdict.CLEAR
         return ReviewReport(
@@ -749,6 +772,49 @@ class ReviewEngine:
             metrics=metrics,
         )
 
+    def _save_review_history(
+        self,
+        *,
+        repo: Path,
+        task: Task,
+        result: ReviewResult,
+        base: str | None,
+        pr_url: str | None,
+        focus: str,
+        previous_sha: str | None,
+        duration_sec: float,
+        metrics: dict[str, object],
+    ) -> None:
+        """Append a review to the repo-local history store."""
+        current_sha = self._get_head_sha(str(repo)) or ''
+        record = ReviewRecord(
+            review_id=str(uuid.uuid4())[:8],
+            timestamp=time.time(),
+            head_sha=current_sha,
+            base_ref=base or self._detect_default_branch(str(repo)),
+            mode='pr' if pr_url else 'local_diff',
+            pr_url=pr_url,
+            focus=focus,
+            verdict=result.verdict.value if hasattr(result.verdict, 'value') else str(result.verdict),
+            findings=[
+                StoredFinding(
+                    severity=f.severity,
+                    path=f.path or '',
+                    line=f.line,
+                    summary=f.summary,
+                )
+                for f in result.findings
+            ],
+            finding_count=result.finding_count,
+            duration_sec=duration_sec,
+            changed_files=list(task.review_paths) if task.review_paths else [],
+            commit_range=(
+                f'{previous_sha[:7]}..{current_sha[:7]}' if previous_sha and current_sha else ''
+            ),
+            metadata={'metrics': metrics} if metrics else {},
+        )
+        ReviewHistoryStore(str(repo)).save_review(record)
+
     # ------------------------------------------------------------------
     # Local diff helpers
     # ------------------------------------------------------------------
@@ -757,9 +823,9 @@ class ReviewEngine:
     def _detect_default_branch(repo_path: str) -> str:
         """Detect main/master branch."""
         for branch in ('main', 'master'):
-            result = subprocess.run(
+            result = run_text(
                 ['git', 'rev-parse', '--verify', branch],
-                capture_output=True, text=True, cwd=repo_path, timeout=10,
+                cwd=repo_path, timeout=10,
             )
             if result.returncode == 0:
                 return branch
@@ -770,24 +836,24 @@ class ReviewEngine:
         """Get files changed between base branch and HEAD, plus staged changes."""
         files = set()
         # Committed changes vs base
-        result = subprocess.run(
+        result = run_text(
             ['git', 'diff', '--name-only', f'{base}...HEAD'],
-            capture_output=True, text=True, cwd=repo_path, timeout=30,
+            cwd=repo_path, timeout=30,
         )
         if result.returncode == 0:
             files.update(f for f in result.stdout.splitlines() if f.strip())
         # Staged but uncommitted changes
-        result = subprocess.run(
+        result = run_text(
             ['git', 'diff', '--cached', '--name-only'],
-            capture_output=True, text=True, cwd=repo_path, timeout=30,
+            cwd=repo_path, timeout=30,
         )
         if result.returncode == 0:
             files.update(f for f in result.stdout.splitlines() if f.strip())
         # Unstaged changes (working tree)
         if not files:
-            result = subprocess.run(
+            result = run_text(
                 ['git', 'diff', '--name-only'],
-                capture_output=True, text=True, cwd=repo_path, timeout=30,
+                cwd=repo_path, timeout=30,
             )
             if result.returncode == 0:
                 files.update(f for f in result.stdout.splitlines() if f.strip())
@@ -798,24 +864,24 @@ class ReviewEngine:
         """Get diff text: committed vs base + staged + unstaged."""
         parts = []
         # Committed changes vs base
-        result = subprocess.run(
+        result = run_text(
             ['git', 'diff', f'{base}...HEAD'],
-            capture_output=True, text=True, cwd=repo_path, timeout=60,
+            cwd=repo_path, timeout=60,
         )
         if result.returncode == 0 and result.stdout.strip():
             parts.append(result.stdout)
         # Staged but uncommitted
-        result = subprocess.run(
+        result = run_text(
             ['git', 'diff', '--cached'],
-            capture_output=True, text=True, cwd=repo_path, timeout=60,
+            cwd=repo_path, timeout=60,
         )
         if result.returncode == 0 and result.stdout.strip():
             parts.append(result.stdout)
         # Unstaged (only if nothing else found)
         if not parts:
-            result = subprocess.run(
+            result = run_text(
                 ['git', 'diff'],
-                capture_output=True, text=True, cwd=repo_path, timeout=60,
+                cwd=repo_path, timeout=60,
             )
             if result.returncode == 0:
                 parts.append(result.stdout)
@@ -824,9 +890,9 @@ class ReviewEngine:
     @staticmethod
     def _get_commit_messages(repo_path: str, base: str) -> list[str]:
         """Get commit messages since base branch."""
-        result = subprocess.run(
+        result = run_text(
             ['git', 'log', '--oneline', f'{base}..HEAD'],
-            capture_output=True, text=True, cwd=repo_path, timeout=10,
+            cwd=repo_path, timeout=10,
         )
         if result.returncode != 0:
             return []
@@ -835,9 +901,9 @@ class ReviewEngine:
     @staticmethod
     def _get_head_sha(repo_path: str) -> str | None:
         """Get current HEAD commit SHA."""
-        result = subprocess.run(
+        result = run_text(
             ['git', 'rev-parse', 'HEAD'],
-            capture_output=True, text=True, cwd=repo_path, timeout=10,
+            cwd=repo_path, timeout=10,
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -854,9 +920,9 @@ class ReviewEngine:
         - "perf" in messages → focus on performance
         """
         # Get recent commit messages
-        result = subprocess.run(
+        result = run_text(
             ['git', 'log', '--oneline', '-10', f'{base}..HEAD'],
-            capture_output=True, text=True, cwd=repo_path, timeout=10,
+            cwd=repo_path, timeout=10,
         )
         if result.returncode != 0:
             return ''
@@ -878,9 +944,9 @@ class ReviewEngine:
             focus_parts.append('test coverage')
 
         # Also check what types of files changed
-        file_result = subprocess.run(
+        file_result = run_text(
             ['git', 'diff', '--name-only', f'{base}..HEAD'],
-            capture_output=True, text=True, cwd=repo_path, timeout=10,
+            cwd=repo_path, timeout=10,
         )
         if file_result.returncode == 0:
             files = file_result.stdout.lower()

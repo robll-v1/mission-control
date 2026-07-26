@@ -18,6 +18,8 @@ import time
 import webbrowser
 from pathlib import Path
 
+from app.core.proc import run_text
+
 RUN_DIR_NAME = '.run'
 BACKEND_DEFAULT_PORT = 8000
 FRONTEND_DEFAULT_PORT = 5173
@@ -171,11 +173,8 @@ def _read_pid(name: str) -> int | None:
 def _pid_alive(pid: int) -> bool:
     try:
         if IS_WINDOWS:
-            result = subprocess.run(
-                ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
-                capture_output=True, text=True,
-            )
-            return str(pid) in result.stdout
+            result = run_text(['tasklist', '/FI', f'PID eq {pid}', '/NH'])
+            return str(pid) in (result.stdout or '')
         else:
             os.kill(pid, 0)
             return True
@@ -281,7 +280,7 @@ def cmd_start(args: argparse.Namespace) -> None:
 
     has_node = bool(_which('node'))
     if has_node:
-        node_ver = subprocess.run(['node', '--version'], capture_output=True, text=True).stdout.strip()
+        node_ver = (run_text(['node', '--version']).stdout or '').strip()
         _ok(f'Node.js: {node_ver}')
     else:
         _warn('Node.js not found. Frontend will not be started.')
@@ -543,22 +542,30 @@ def cmd_status(_args: argparse.Namespace) -> None:
 
 # ── init command ──────────────────────────────────────────────────────
 
-_BACKEND_INFO = {
-    'opencode': {'cmd': 'opencode', 'desc': 'OpenCode (sst/opencode)'},
-    'claude-code': {'cmd': 'claude', 'desc': 'Claude Code (Anthropic)'},
-    'copilot': {'cmd': 'gh', 'desc': 'GitHub Copilot CLI'},
-    'codex': {'cmd': 'codex', 'desc': 'OpenAI Codex CLI'},
+_BACKEND_DESC = {
+    'opencode': 'OpenCode (sst/opencode)',
+    'claude-code': 'Claude Code (Anthropic)',
+    'copilot': 'GitHub Copilot CLI',
+    'codex': 'OpenAI Codex CLI',
 }
+
+
+def _backend_executables() -> dict[str, str]:
+    """Map backend key -> program name, straight from the adapter registry."""
+    from app.adapters import AVAILABLE_BACKENDS, get_adapter
+    mapping: dict[str, str] = {}
+    for name in AVAILABLE_BACKENDS:
+        try:
+            mapping[name] = get_adapter(name).executable_name()
+        except Exception:  # pragma: no cover - a broken adapter must not kill the CLI
+            mapping[name] = name
+    return mapping
 
 
 def _detect_backends() -> list[str]:
     """Detect which agent CLIs are available on PATH."""
     import shutil
-    available = []
-    for name, info in _BACKEND_INFO.items():
-        if shutil.which(info['cmd']):
-            available.append(name)
-    return available
+    return [name for name, cmd in _backend_executables().items() if shutil.which(cmd)]
 
 
 def _prompt_choice(question: str, choices: list[str], default: str | None = None) -> str:
@@ -656,7 +663,7 @@ backend:
   {backend}:
     model: '{model}'
 """
-        config_path.write_text(config_content)
+        config_path.write_text(config_content, encoding='utf-8')
         print(f'\n✅ Created {config_path}')
         print(f'\n💡 This sets your default backend and model globally.')
         print(f'   Per-project .amc.yaml can override these.')
@@ -665,11 +672,11 @@ backend:
         # Project config: full settings
         default_branch = 'main'
         try:
-            result = subprocess.run(
+            result = run_text(
                 ['git', 'symbolic-ref', 'refs/remotes/origin/HEAD'],
-                capture_output=True, text=True, cwd=str(Path.cwd()),
+                cwd=str(Path.cwd()),
             )
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout:
                 default_branch = result.stdout.strip().split('/')[-1]
         except Exception:
             pass
@@ -711,7 +718,7 @@ validation:
       required: false
       modes: ['standard', 'full']
 """
-        config_path.write_text(config_content)
+        config_path.write_text(config_content, encoding='utf-8')
         print(f'\n✅ Created {config_path}')
 
         # Show next steps
@@ -741,10 +748,7 @@ def cmd_review(args: argparse.Namespace) -> None:
     # ── Preflight checks ──────────────────────────────────────────────
     # Check 1: Is this a git repo?
     if not pr_url:
-        git_check = subprocess.run(
-            ['git', 'rev-parse', '--is-inside-work-tree'],
-            capture_output=True, text=True, cwd=repo_path,
-        )
+        git_check = run_text(['git', 'rev-parse', '--is-inside-work-tree'], cwd=repo_path)
         if git_check.returncode != 0:
             print(f'❌ Not a git repository: {repo_path}')
             print(f'   amc review needs a git repo to compute diffs.')
@@ -752,12 +756,9 @@ def cmd_review(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     # Check 2: Is the backend CLI available?
-    backend_cmds = {
-        'opencode': 'opencode',
-        'claude-code': 'claude',
-        'copilot': 'gh',
-        'codex': 'codex',
-    }
+    # Source the backend -> executable mapping from the adapter registry so this
+    # preflight and ExecutionService._preflight_check cannot drift apart.
+    backend_cmds = _backend_executables()
     required_cmd = backend_cmds.get(backend_name, backend_name)
     if not shutil.which(required_cmd):
         print(f'❌ Backend "{backend_name}" not found: `{required_cmd}` is not on PATH.')
@@ -773,27 +774,16 @@ def cmd_review(args: argparse.Namespace) -> None:
         # Try to detect base branch
         if not base:
             for candidate in ['main', 'master', 'develop']:
-                check = subprocess.run(
-                    ['git', 'rev-parse', '--verify', candidate],
-                    capture_output=True, text=True, cwd=repo_path,
-                )
+                check = run_text(['git', 'rev-parse', '--verify', candidate], cwd=repo_path)
                 if check.returncode == 0:
                     base = candidate
                     break
         if base:
-            diff_stat = subprocess.run(
-                ['git', 'diff', '--stat', f'{base}..HEAD'],
-                capture_output=True, text=True, cwd=repo_path,
-            )
-            staged = subprocess.run(
-                ['git', 'diff', '--cached', '--stat'],
-                capture_output=True, text=True, cwd=repo_path,
-            )
-            unstaged = subprocess.run(
-                ['git', 'diff', '--stat'],
-                capture_output=True, text=True, cwd=repo_path,
-            )
-            if not diff_stat.stdout.strip() and not staged.stdout.strip() and not unstaged.stdout.strip():
+            diff_stat = run_text(['git', 'diff', '--stat', f'{base}..HEAD'], cwd=repo_path)
+            staged = run_text(['git', 'diff', '--cached', '--stat'], cwd=repo_path)
+            unstaged = run_text(['git', 'diff', '--stat'], cwd=repo_path)
+            if not (diff_stat.stdout or '').strip() and not (staged.stdout or '').strip() \
+                    and not (unstaged.stdout or '').strip():
                 print(f'⚠️  No changes detected (base: {base})')
                 print(f'   Nothing to review — your branch is identical to {base}.')
                 print(f'   Make some commits or stage changes, then try again.')

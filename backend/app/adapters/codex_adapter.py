@@ -10,10 +10,14 @@ from app.core.models import Task
 
 class CodexAdapter(RunnerAdapter):
     name = 'codex'
+    executable = 'codex'
 
     def __init__(self, model: str | None = None, variant: str | None = None):
         self.model = model
         self.variant = variant
+
+    def probe_command(self) -> list[str] | None:
+        return [resolve_executable('codex'), '--version']
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         work_dir = task.worktree_path or task.repo_path

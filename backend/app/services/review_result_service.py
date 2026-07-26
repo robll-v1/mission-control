@@ -31,6 +31,32 @@ BARE_PATH_LINE_PATTERN = re.compile(r'`?([^`\s:]+/[^`\s:]+):(\d+)(?:-\d+)?`?')
 NOISE_TEXT_PREFIXES = ('[mnemo]',)
 NOISY_EVENT_KINDS = {'agent.step_start', 'agent.step_finish'}
 
+DEFAULT_LANGUAGE = 'en'
+# Fallback text used when the model produced nothing we could parse. These used
+# to be hardcoded Chinese, so `amc review` (which runs language='en') emitted
+# Chinese on exactly the failure paths where a readable message matters most.
+MESSAGES: dict[str, dict[str, str]] = {
+    'en': {
+        'no_result_failed': 'Review failed; no structured conclusion was produced.',
+        'no_result': 'No structured review conclusion was produced.',
+        'clear': 'No material correctness or regression issues found.',
+        'failed': 'Review failed and produced no conclusion.',
+        'no_summary': 'Review finished, but produced no structured summary.',
+    },
+    'zh': {
+        'no_result_failed': 'Review 运行失败，未能产出结构化结论。',
+        'no_result': '没有产出结构化评审结论。',
+        'clear': '未发现明显正确性或回归问题。',
+        'failed': 'Review 运行失败，未能给出结论。',
+        'no_summary': 'Review 已结束，但没有结构化摘要。',
+    },
+}
+
+
+def _message(key: str, language: str) -> str:
+    table = MESSAGES.get((language or DEFAULT_LANGUAGE).lower(), MESSAGES[DEFAULT_LANGUAGE])
+    return table.get(key, MESSAGES[DEFAULT_LANGUAGE][key])
+
 
 class ReviewResultService:
     @staticmethod
@@ -63,7 +89,7 @@ class ReviewResultService:
         return task
 
     @staticmethod
-    def extract_result(*, events: list[Event], run: Run) -> ReviewResult:
+    def extract_result(*, events: list[Event], run: Run, language: str = DEFAULT_LANGUAGE) -> ReviewResult:
         text_events = [
             event for event in events
             if event.run_id == run.id and event.kind == 'agent.text'
@@ -71,7 +97,9 @@ class ReviewResultService:
         text_event = ReviewResultService._pick_result_event(text_events)
         if text_event is None:
             verdict = ReviewVerdict.FAILED if run.status == 'failed' else ReviewVerdict.INCONCLUSIVE
-            summary = 'Review 运行失败，未能产出结构化结论。' if verdict == ReviewVerdict.FAILED else '没有产出结构化评审结论。'
+            summary = _message(
+                'no_result_failed' if verdict == ReviewVerdict.FAILED else 'no_result', language
+            )
             return ReviewResult(
                 verdict=verdict,
                 summary=summary,
@@ -85,7 +113,9 @@ class ReviewResultService:
         findings = ReviewResultService._parse_findings(text)
         counts = Counter(finding.severity for finding in findings)
         verdict = ReviewResultService._derive_verdict(run=run, findings=findings, text=text)
-        summary = ReviewResultService._derive_summary(text=text, findings=findings, verdict=verdict)
+        summary = ReviewResultService._derive_summary(
+            text=text, findings=findings, verdict=verdict, language=language
+        )
         return ReviewResult(
             verdict=verdict,
             summary=summary,
@@ -206,17 +236,23 @@ class ReviewResultService:
         return ReviewVerdict.INCONCLUSIVE
 
     @staticmethod
-    def _derive_summary(*, text: str, findings: list[ReviewFinding], verdict: ReviewVerdict) -> str:
+    def _derive_summary(
+        *,
+        text: str,
+        findings: list[ReviewFinding],
+        verdict: ReviewVerdict,
+        language: str = DEFAULT_LANGUAGE,
+    ) -> str:
         for paragraph in [segment.strip() for segment in text.split('\n\n') if segment.strip()]:
             if not paragraph.startswith(('- ', '* ', '#')):
                 return paragraph
         if findings:
             return findings[0].summary
         if verdict == ReviewVerdict.CLEAR:
-            return '未发现明显正确性或回归问题。'
+            return _message('clear', language)
         if verdict == ReviewVerdict.FAILED:
-            return 'Review 运行失败，未能给出结论。'
-        return 'Review 已结束，但没有结构化摘要。'
+            return _message('failed', language)
+        return _message('no_summary', language)
 
     @staticmethod
     def update_task_result(*, task: Task, rounds: list[Run]) -> Task:
@@ -224,7 +260,7 @@ class ReviewResultService:
         return task
 
     @staticmethod
-    def parse_raw_text(text: str) -> ReviewResult:
+    def parse_raw_text(text: str, language: str = DEFAULT_LANGUAGE) -> ReviewResult:
         """Parse raw LLM response text into a ReviewResult (no Run needed).
 
         Used by the direct API / inline review path.
@@ -251,7 +287,9 @@ class ReviewResultService:
             else:
                 verdict = ReviewVerdict.INCONCLUSIVE
 
-        summary = ReviewResultService._derive_summary(text=text, findings=findings, verdict=verdict)
+        summary = ReviewResultService._derive_summary(
+            text=text, findings=findings, verdict=verdict, language=language
+        )
         return ReviewResult(
             verdict=verdict,
             summary=summary,
