@@ -6,7 +6,7 @@ ambient locale.
 """
 from __future__ import annotations
 
-import subprocess
+import sys
 
 import pytest
 
@@ -61,11 +61,20 @@ def test_load_repo_config_does_not_mutate_defaults(tmp_path, isolated_config):
 
 
 def test_run_text_decodes_non_ascii_child_output():
-    """run_text must decode as UTF-8 regardless of the host locale codepage."""
-    code = 'import sys; sys.stdout.write("caf\\u00e9 — 中文")'
-    result = run_text([subprocess.sys.executable, '-c', code])
+    """run_text must decode UTF-8 bytes regardless of the host locale codepage.
+
+    The child writes to ``stdout.buffer`` so it emits UTF-8 bytes no matter what
+    its own locale is — otherwise the child would die with UnicodeEncodeError on
+    a cp1252/cp936 host and we would be testing the child, not run_text.
+    """
+    code = (
+        'import sys; '
+        'sys.stdout.buffer.write("caf\\u00e9 \\u2014 \\u4e2d\\u6587".encode("utf-8"))'
+    )
+    result = run_text([sys.executable, '-c', code])
+    assert result.returncode == 0, result.stderr
     assert result.stdout is not None
-    assert 'café' in result.stdout
+    assert result.stdout == 'café — 中文'
 
 
 def test_run_git_returns_text_for_non_ascii_commit(git_repo):
