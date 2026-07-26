@@ -67,8 +67,20 @@ class Database:
         self.conn.commit()
 
     def list_runs(self, task_id: str) -> list[Run]:
-        rows = self.conn.execute('SELECT data FROM runs WHERE task_id = ?', (task_id,)).fetchall()
-        return [Run.model_validate_json(row['data']) for row in rows]
+        """Return this task's runs oldest-first.
+
+        Callers treat ``runs[-1]`` as the latest round, so the order must be
+        explicit — a bare SELECT returns rows in unspecified order and only
+        happens to come back in insert order today. Sort by ``round_index`` so
+        the ordering is semantic, with insertion order as the tiebreak.
+        """
+        rows = self.conn.execute(
+            'SELECT data FROM runs WHERE task_id = ? ORDER BY rowid ASC', (task_id,)
+        ).fetchall()
+        runs = [Run.model_validate_json(row['data']) for row in rows]
+        # Stable sort: equal round_index keeps insertion order.
+        runs.sort(key=lambda run: run.round_index)
+        return runs
 
     def append_event(self, event: Event) -> None:
         self.conn.execute(

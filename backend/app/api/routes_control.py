@@ -1,7 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.core.execution import ExecutionService, PullRequestRefreshError
+from app.core.execution import (
+    BackendUnavailableError,
+    ExecutionService,
+    PullRequestRefreshError,
+)
 
 
 def get_execution() -> ExecutionService:
@@ -23,6 +27,10 @@ def start_task(task_id: str, request: StartTaskRequest, execution: ExecutionServ
         run = execution.start_task(task_id, prompt=request.prompt, review_note=request.review_note)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except BackendUnavailableError as exc:
+        # The task exists; the server just has no adapter for its backend.
+        # Answering 404 here sends the user looking for a missing task.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except PullRequestRefreshError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except RuntimeError as exc:

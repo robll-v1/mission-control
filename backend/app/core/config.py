@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import sys
 from pathlib import Path
@@ -71,21 +72,44 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _load_yaml_file(path: Path) -> dict[str, Any]:
+    """Read a YAML config file as UTF-8.
+
+    Config files are written as UTF-8 (``amc init`` emits UTF-8, and users paste
+    non-ASCII comments into them), but ``Path.read_text()`` without an explicit
+    encoding decodes using the locale codepage. On a zh-CN/ja-JP Windows install
+    that raises ``UnicodeDecodeError`` and the config is silently ignored, so the
+    user gets default behaviour with no clue why. Decode explicitly, and warn
+    rather than swallow so a broken config is visible.
+    """
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        print(f'[amc] warning: ignoring unreadable config {path}: {exc}', file=sys.stderr)
+        return {}
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        print(
+            f'[amc] warning: ignoring config {path}: expected a mapping, got {type(loaded).__name__}',
+            file=sys.stderr,
+        )
+        return {}
+    return loaded
+
+
 def load_global_config() -> dict[str, Any]:
-    """Load global user config from ~/.config/amc/config.yaml."""
+    """Load global user config from the platform config path."""
     path = _global_config_path()
     if not path.exists():
         return {}
-    try:
-        return yaml.safe_load(path.read_text()) or {}
-    except Exception:
-        return {}
+    return _load_yaml_file(path)
 
 
 def load_repo_config(repo_path: str) -> dict[str, Any]:
     """Load merged config: DEFAULT < global < project .amc.yaml."""
     # Layer 1: defaults
-    merged = dict(DEFAULT_CONFIG)
+    merged = copy.deepcopy(DEFAULT_CONFIG)
 
     # Layer 2: global user config
     global_cfg = load_global_config()
@@ -95,10 +119,8 @@ def load_repo_config(repo_path: str) -> dict[str, Any]:
     # Layer 3: project-level .amc.yaml
     config_path = Path(repo_path) / '.amc.yaml'
     if config_path.exists():
-        try:
-            project_cfg = yaml.safe_load(config_path.read_text()) or {}
+        project_cfg = _load_yaml_file(config_path)
+        if project_cfg:
             merged = _deep_merge(merged, project_cfg)
-        except Exception:
-            pass
 
     return merged

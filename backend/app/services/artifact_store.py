@@ -14,10 +14,21 @@ class ArtifactStore:
         return root
 
     def write_text(self, task_id: str, relative_path: str, content: str) -> str:
+        """Persist an artifact as UTF-8.
+
+        Artifacts routinely carry non-ASCII text — PR bodies, commit subjects,
+        diffs of source files. Without an explicit encoding this uses the locale
+        codepage, which on a non-English Windows install raises
+        ``UnicodeEncodeError`` and aborts the whole review.
+        """
         path = self.task_dir(task_id) / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        path.write_text(content, encoding='utf-8')
         return str(path)
+
+    def read_text(self, task_id: str, relative_path: str) -> str:
+        """Read back an artifact written by :meth:`write_text`."""
+        return (self.task_dir(task_id) / relative_path).read_text(encoding='utf-8')
 
     def list_files(self, task_id: str) -> list[dict[str, str]]:
         root = self.task_dir(task_id)

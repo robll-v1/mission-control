@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from app.adapters.base import RunnerAdapter
+from app.adapters.base import RunnerAdapter, resolve_executable
 from app.core.config import load_repo_config
 from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
@@ -29,6 +29,14 @@ class IdleTimeoutError(RuntimeError):
 
 class PreflightError(RuntimeError):
     pass
+
+
+class BackendUnavailableError(RuntimeError):
+    """The requested backend has no adapter registered on this server.
+
+    Distinct from "task not found" so the API can answer 409 instead of 404 and
+    the user is not sent looking for a task that exists.
+    """
 
 
 class PullRequestRefreshError(RuntimeError):
@@ -68,7 +76,10 @@ class ExecutionService:
         if task is None:
             raise KeyError(f'task not found: {task_id}')
         if task.backend not in self.adapters:
-            raise KeyError(f'backend adapter not found: {task.backend}')
+            raise BackendUnavailableError(
+                f'backend adapter not found: {task.backend}. '
+                f'Available: {", ".join(sorted(self.adapters)) or "(none)"}'
+            )
         with self._lock:
             if task_id in self._active:
                 raise RuntimeError('a review round is already in progress for this PR')
@@ -147,6 +158,7 @@ class ExecutionService:
                 round_index,
                 prompt_text,
                 idle_timeout_sec,
+                language,
             ),
             daemon=True,
         )
@@ -187,7 +199,15 @@ class ExecutionService:
             reason=reason,
         )
 
-    def _run_task(self, task_id: str, run_id: str, round_index: int, prompt: str, idle_timeout_sec: int) -> None:
+    def _run_task(
+        self,
+        task_id: str,
+        run_id: str,
+        round_index: int,
+        prompt: str,
+        idle_timeout_sec: int,
+        language: str = 'en',
+    ) -> None:
         task = self.db.get_task(task_id)
         run = next((item for item in self.db.list_runs(task_id) if item.id == run_id), None)
         if task is None or run is None:
@@ -290,7 +310,9 @@ class ExecutionService:
             run.exit_code = exit_code
             run.status = 'completed' if exit_code == 0 else 'failed'
             parse_started_at = time.perf_counter()
-            run.review_result = ReviewResultService.extract_result(events=self.db.list_events(task_id), run=run)
+            run.review_result = ReviewResultService.extract_result(
+                events=self.db.list_events(task_id), run=run, language=language
+            )
             parse_result_ms = int((time.perf_counter() - parse_started_at) * 1000)
             run.metrics.update({
                 'llm_wall_time_ms': int((time.perf_counter() - llm_started_at) * 1000),
@@ -350,7 +372,9 @@ class ExecutionService:
             run.exit_code = -2 if isinstance(exc, IdleTimeoutError) else -1
             run.status = 'failed'
             parse_started_at = time.perf_counter()
-            run.review_result = ReviewResultService.extract_result(events=self.db.list_events(task_id), run=run)
+            run.review_result = ReviewResultService.extract_result(
+                events=self.db.list_events(task_id), run=run, language=language
+            )
             parse_result_ms = int((time.perf_counter() - parse_started_at) * 1000)
             llm_elapsed_ms = int((time.perf_counter() - llm_started_at) * 1000) if 'llm_started_at' in locals() else 0
             run.metrics.update({
@@ -445,40 +469,51 @@ class ExecutionService:
     def _preflight_check(self, task: Task) -> None:
         adapter = self.adapters.get(task.backend)
         if adapter is None:
-            raise PreflightError(f'backend adapter not configured: {task.backend}')
+            raise BackendUnavailableError(
+                f'backend adapter not configured: {task.backend}. '
+                f'Available: {", ".join(sorted(self.adapters)) or "(none)"}'
+            )
 
         backend_name = adapter.name
-        executable = backend_name
-        if not shutil.which(executable):
+        # The backend key and the program name differ for most adapters
+        # (claude-code -> claude, copilot -> gh); probing the key would reject
+        # a CLI that is installed and working.
+        executable = adapter.executable_name()
+        # resolve_executable() is what make_command() uses to launch, and it
+        # honours PATHEXT so npm/gh/codex .cmd shims resolve on Windows. It
+        # returns the bare name unchanged when nothing was found.
+        if resolve_executable(executable) == executable and shutil.which(executable) is None:
             raise PreflightError(
-                f'{executable} is not installed or not in PATH. '
+                f'{executable} (backend "{backend_name}") is not installed or not in PATH. '
                 f'Install it before starting a review.'
             )
 
-        try:
-            result = subprocess.run(
-                [executable, 'run', '--format', 'json', 'Reply with exactly one word: OK'],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
-                cwd=task.repo_path,
-            )
-            if result.returncode != 0:
-                stderr_preview = (result.stderr or '').strip()[:300]
-                raise PreflightError(
-                    f'{executable} preflight test failed (exit {result.returncode}). '
-                    f'Check your API key and configuration. stderr: {stderr_preview}'
+        probe = adapter.probe_command()
+        if probe is not None:
+            try:
+                result = subprocess.run(
+                    probe,
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
+                    cwd=task.repo_path,
                 )
-        except subprocess.TimeoutExpired:
-            raise PreflightError(
-                f'{executable} preflight test timed out after 60s. '
-                f'The LLM backend may be unreachable.'
-            )
-        except FileNotFoundError:
-            raise PreflightError(f'{executable} executable not found.')
+                if result.returncode != 0:
+                    stderr_preview = (result.stderr or '').strip()[:300]
+                    raise PreflightError(
+                        f'{executable} preflight test failed (exit {result.returncode}). '
+                        f'Check your API key and configuration. stderr: {stderr_preview}'
+                    )
+            except subprocess.TimeoutExpired:
+                raise PreflightError(
+                    f'{executable} preflight test timed out after 60s. '
+                    f'The LLM backend may be unreachable.'
+                )
+            except FileNotFoundError:
+                raise PreflightError(f'{executable} executable not found.')
 
         self.mission.append_event(
             task_id=task.id,
             kind='task.preflight_passed',
-            payload={'backend': backend_name},
+            payload={'backend': backend_name, 'executable': executable},
         )
 
     @staticmethod

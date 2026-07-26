@@ -222,20 +222,26 @@ async def get_review_findings(
                 "findings": findings,
             }, indent=2, ensure_ascii=False)
 
-    # Fall back to DB
-    from app.services.database import Database
+    # Fall back to the on-disk task database.
+    # NB: `tasks` rows are a single JSON `data` blob with no repo_path column,
+    # so the filtering has to happen in Python rather than in SQL.
+    import os
+
+    from app.core.db import Database
     from app.services.review_result_service import ReviewResultService
-    db = Database()
-    tasks = db.query(
-        "SELECT id FROM tasks WHERE repo_path = ? ORDER BY created_at DESC LIMIT 1",
-        (repo_path,),
-    )
-    if not tasks:
+
+    db = Database('data/amc.db')
+    target = os.path.normcase(os.path.abspath(repo_path))
+    matching = [
+        task for task in db.list_tasks()
+        if os.path.normcase(os.path.abspath(task.repo_path)) == target
+    ]
+    if not matching:
         return json.dumps({"error": "No review found for this repository"})
 
-    task_id = tasks[0]["id"]
-    result_svc = ReviewResultService(db)
-    result = result_svc.get_result(task_id)
+    task = max(matching, key=lambda t: t.updated_at)
+    task = ReviewResultService.backfill_task(db=db, task=task)
+    result = task.latest_review_result
     if not result:
         return json.dumps({"error": "Review has no results yet"})
 

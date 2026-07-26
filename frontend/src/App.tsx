@@ -328,7 +328,10 @@ export function App() {
 
   useEffect(() => {
     void refreshTasks()
-    const timer = window.setInterval(() => void refreshTasks(), 4000)
+    // Pass clearErr=false: this tick is background polling, not a user action.
+    // With the default (true) it wiped the error banner within 4s, so a failed
+    // "start review" looked like the button did nothing at all.
+    const timer = window.setInterval(() => void refreshTasks(false), 4000)
     return () => window.clearInterval(timer)
   }, [])
 
@@ -345,7 +348,8 @@ export function App() {
     const source = new EventSource(`/api/tasks/${selectedTaskId}/stream`)
     eventSourceRef.current = source
     source.onmessage = () => {
-      void loadTask(selectedTaskId)
+      // Background stream updates must not clear a banner the user has not read.
+      void loadTask(selectedTaskId, false)
       void refreshTasks(false)
     }
     source.onerror = () => {
@@ -367,11 +371,11 @@ export function App() {
     }
   }
 
-  const loadTask = async (taskId: string) => {
+  const loadTask = async (taskId: string, clearErr = true) => {
     try {
       const data = normalizeTaskDetail(await api<TaskDetailResponse>(`/api/tasks/${taskId}`))
       setDetail(data)
-      setError(null)
+      if (clearErr) setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load task detail')
     }

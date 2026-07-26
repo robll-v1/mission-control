@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from app.core.config import load_repo_config
 from app.core.models import Task
+from app.core.proc import run_git
 from app.services.artifact_store import ArtifactStore
 
 
@@ -275,7 +275,7 @@ class ContextCompiler:
         if not path.exists():
             return {'file_patches': [], 'review_count': 0, 'comment_count': 0}
         try:
-            payload = json.loads(path.read_text())
+            payload = json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             return {'file_patches': [], 'review_count': 0, 'comment_count': 0}
 
@@ -306,7 +306,7 @@ class ContextCompiler:
         if not path.exists():
             return {'file_patches': [], 'review_count': 0, 'comment_count': 0}
         try:
-            diff_text = path.read_text()
+            diff_text = path.read_text(encoding='utf-8')
         except Exception:
             return {'file_patches': [], 'review_count': 0, 'comment_count': 0}
         return {
@@ -450,7 +450,7 @@ class ContextCompiler:
             try:
                 if file_path.stat().st_size > 256 * 1024:
                     continue
-                content_lines = file_path.read_text(errors='ignore').splitlines()
+                content_lines = file_path.read_text(encoding='utf-8', errors='replace').splitlines()
             except Exception:
                 continue
             hunks = ContextCompiler._parse_patch_hunks(str(item.get('patch') or ''))
@@ -520,24 +520,14 @@ class ContextCompiler:
     def _recent_commits(repo_path: str, limit: int) -> list[str]:
         if limit <= 0:
             return []
-        result = subprocess.run(
-            ['git', '-C', repo_path, 'log', f'-{limit}', '--oneline'],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
+        result = run_git(repo_path, ['log', f'-{limit}', '--oneline'], timeout=20)
         if result.returncode != 0:
             return []
         return [line for line in result.stdout.splitlines() if line.strip()]
 
     @staticmethod
     def _git_one_line(repo_path: str, args: list[str]) -> str:
-        result = subprocess.run(
-            ['git', '-C', repo_path, *args],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        result = run_git(repo_path, args, timeout=15)
         if result.returncode != 0:
             return ''
         return result.stdout.strip()
@@ -545,12 +535,7 @@ class ContextCompiler:
     @staticmethod
     def _iter_repo_files(root: Path) -> list[Path]:
         try:
-            result = subprocess.run(
-                ['git', '-C', str(root), 'ls-files'],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            result = run_git(root, ['ls-files'], timeout=30)
             if result.returncode == 0:
                 files = []
                 for line in result.stdout.splitlines():
@@ -729,7 +714,7 @@ class ContextCompiler:
         try:
             if path.stat().st_size > 256 * 1024:
                 return 0
-            content = path.read_text(errors='ignore')[:65536].lower()
+            content = path.read_text(encoding='utf-8', errors='replace')[:65536].lower()
         except Exception:
             return 0
         score = 0
