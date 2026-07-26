@@ -34,14 +34,31 @@ properties, so re-theming means editing one block.
 | Text | `--text`, `--text-secondary`, `--text-muted` |
 | Brand | `--accent`, `--accent-hover`, `--accent-soft`, `--accent-ring` |
 | Semantic | `--ok`, `--warn`, `--danger`, `--neutral` (+ `-soft` fills) |
+| Severity | `--sev-critical`, `--sev-high`, `--sev-medium`, `--sev-low` (+ `-soft`) |
 | Type | `--font-sans`, `--font-serif`, `--font-mono` |
+
+### Two moods
+
+The themes are not the same design with the lights turned off.
+
+- **Light — warm paper.** Surfaces carry a slight yellow cast. Hue does the
+  semantic work: red / amber / slate / grey for the severity ramp.
+- **Dark — matte monochrome.** No hue anywhere. Flat neutral surfaces, hairline
+  borders, `--shadow` disabled so nothing reads as glossy. Meaning is carried by
+  a **luminance ramp — brighter means more urgent** — so `--danger` is the
+  brightest value in the theme and `--ok` one of the dimmest.
+
+Because the dark ramp has no hue, severity must never depend on it alone. Every
+state also carries a text label (`严重/高/中/低`, `审查失败/需要关注/未发现明显问题`),
+and links carry a persistent underline rather than a colour shift.
 
 Conventions worth keeping:
 
-- **Warm neutrals, not grey.** Surfaces carry a slight yellow cast; dark mode is
-  a warm near-black rather than pure black.
-- **Colour means something.** Hue is reserved for status, verdict, and severity.
-  Chrome is neutral.
+- **Colour means something.** Hue (light) or luminance (dark) is reserved for
+  status, verdict, and severity. Chrome stays neutral in both.
+- **Severity has its own ramp**, not aliases of the semantic colours — it needs
+  four distinguishable steps, and every step is used as *text*, so all four must
+  clear 4.5:1 on `--surface`.
 - **Serif for voice, sans for UI.** The brand, page title, verdict word, and
   round number use `--font-serif`; controls and data use `--font-sans`.
 - **Monospace for identifiers.** Paths, SHAs, and event kinds use `--font-mono`

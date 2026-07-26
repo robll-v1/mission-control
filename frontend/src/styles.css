@@ -37,6 +37,18 @@
   --neutral: #5c5a52;
   --neutral-soft: #efede5;
 
+  /* Severity scale. Its own ramp rather than aliases of the semantic colours,
+     because severity needs four distinguishable steps and every step is used
+     as *text* (.sev-tag), so all four must clear 4.5:1 on --surface. */
+  --sev-critical: #a93f2c;
+  --sev-high: #8f6220;
+  --sev-medium: #55677a;
+  --sev-low: #6e6a60;
+  --sev-critical-soft: #f9e9e5;
+  --sev-high-soft: #f8efe1;
+  --sev-medium-soft: #e9eef3;
+  --sev-low-soft: #efede5;
+
   --radius-sm: 6px;
   --radius: 10px;
   --radius-lg: 14px;
@@ -63,35 +75,54 @@
   text-rendering: optimizeLegibility;
 }
 
+/* Dark theme — matte monochrome.
+   Light mode is warm paper; dark mode is deliberately a different mood: no hue
+   at all, flat neutral surfaces, hairline borders, and almost no shadow, so
+   nothing reads as glossy. Meaning is carried by a luminance ramp instead of
+   colour — brighter = more urgent — which is why --danger is the brightest
+   value here and --ok the dimmest. Every state also carries a text label
+   (严重/高/中/低, 审查失败/需要关注/未发现明显问题), so severity never depends
+   on the ramp alone. */
 :root[data-theme='dark'] {
-  --bg: #201f1d;
-  --surface: #292826;
-  --surface-sunken: #1a1917;
-  --surface-hover: #323130;
-  --border: #3b3a36;
-  --border-strong: #4c4a45;
+  --bg: #0e0e0e;
+  --surface: #171717;
+  --surface-sunken: #0a0a0a;
+  --surface-hover: #1f1f1f;
+  --border: #262626;
+  --border-strong: #3a3a3a;
 
-  --text: #f0eee6;
-  --text-secondary: #a8a59b;
-  --text-muted: #939087;
+  --text: #f2f2f2;
+  --text-secondary: #a8a8a8;
+  --text-muted: #8c8c8c;
 
-  --accent: #d97757;
-  --accent-hover: #e18a6d;
-  --accent-soft: #3a2a23;
-  --accent-ring: rgba(217, 119, 87, 0.4);
+  --accent: #f2f2f2;
+  --accent-hover: #ffffff;
+  --accent-soft: #212121;
+  --accent-ring: rgba(242, 242, 242, 0.26);
 
-  --ok: #7faa84;
-  --ok-soft: #253028;
-  --warn: #d3a05a;
-  --warn-soft: #362c1e;
-  --danger: #d97a66;
-  --danger-soft: #382522;
-  --neutral: #a8a59b;
-  --neutral-soft: #302f2c;
+  /* urgency ramp: dim = calm, bright = demands attention */
+  --ok: #8f8f8f;
+  --ok-soft: #191919;
+  --warn: #c2c2c2;
+  --warn-soft: #1f1f1f;
+  --danger: #f5f5f5;
+  --danger-soft: #262626;
+  --neutral: #a8a8a8;
+  --neutral-soft: #1c1c1c;
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow: 0 2px 8px rgba(0, 0, 0, 0.32), 0 1px 2px rgba(0, 0, 0, 0.24);
-  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.48);
+  --sev-critical: #f5f5f5;
+  --sev-high: #c2c2c2;
+  --sev-medium: #969696;
+  --sev-low: #838383;
+  --sev-critical-soft: #272727;
+  --sev-high-soft: #212121;
+  --sev-medium-soft: #1c1c1c;
+  --sev-low-soft: #191919;
+
+  /* matte: separation comes from borders, not from lift */
+  --shadow-sm: none;
+  --shadow: none;
+  --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.7);
 }
 
 * { box-sizing: border-box; }
@@ -389,8 +420,15 @@ code, .mono { font-family: var(--font-mono); }
   color: var(--text-secondary);
   flex-wrap: wrap;
 }
-.detail-eyebrow a { color: var(--accent); text-decoration: none; }
-.detail-eyebrow a:hover { text-decoration: underline; }
+/* Underline rather than colour alone: in the dark theme --accent is white, so
+   a hue-only link would be indistinguishable from body text. */
+.detail-eyebrow a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 3px;
+}
+.detail-eyebrow a:hover { text-decoration-color: currentColor; }
 
 .detail-title {
   margin: 0;
@@ -489,10 +527,10 @@ code, .mono { font-family: var(--font-mono); }
   border: 1px solid var(--border);
 }
 .sev-chip .n { font-variant-numeric: tabular-nums; font-weight: 600; }
-.sev-chip.on-critical { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
-.sev-chip.on-high     { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
-.sev-chip.on-medium   { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
-.sev-chip.on-low      { background: var(--neutral-soft); color: var(--text-secondary); border-color: transparent; }
+.sev-chip.on-critical { background: var(--sev-critical-soft); color: var(--sev-critical); border-color: transparent; }
+.sev-chip.on-high     { background: var(--sev-high-soft); color: var(--sev-high); border-color: transparent; }
+.sev-chip.on-medium   { background: var(--sev-medium-soft); color: var(--sev-medium); border-color: transparent; }
+.sev-chip.on-low      { background: var(--sev-low-soft); color: var(--sev-low); border-color: transparent; }
 
 /* ── Pills ──────────────────────────────────────────────── */
 
@@ -589,10 +627,10 @@ code, .mono { font-family: var(--font-mono); }
   gap: 9px;
   box-shadow: var(--shadow-sm);
 }
-.finding.sev-critical { --sev: var(--danger); }
-.finding.sev-high     { --sev: var(--warn); }
-.finding.sev-medium   { --sev: var(--accent); }
-.finding.sev-low      { --sev: var(--border-strong); }
+.finding.sev-critical { --sev: var(--sev-critical); }
+.finding.sev-high     { --sev: var(--sev-high); }
+.finding.sev-medium   { --sev: var(--sev-medium); }
+.finding.sev-low      { --sev: var(--sev-low); }
 
 .finding-top {
   display: flex;
@@ -690,7 +728,11 @@ code, .mono { font-family: var(--font-mono); }
   font-size: 12.5px;
   color: var(--accent);
   width: fit-content;
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 3px;
 }
+.event summary:hover { text-decoration-color: currentColor; }
 .event details pre {
   margin-top: 8px;
   padding: 11px 13px;
