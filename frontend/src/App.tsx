@@ -12,6 +12,7 @@ type TaskStatus =
   | 'aborted'
 
 type ReviewVerdict = 'clear' | 'concerns' | 'failed' | 'inconclusive'
+type ReviewSource = 'pull_request' | 'local_diff'
 
 type ReviewFinding = {
   severity: string
@@ -37,6 +38,7 @@ type Task = {
   description: string
   repo_path: string
   backend: string
+  source_type: ReviewSource
   status: TaskStatus
   current_stage: string
   source_url?: string | null
@@ -45,6 +47,7 @@ type Task = {
   pr_owner?: string | null
   pr_repo?: string | null
   pr_head_sha?: string | null
+  pr_base_ref?: string | null
   latest_review_result?: ReviewResult | null
   updated_at: number
   last_run_id?: string | null
@@ -120,7 +123,14 @@ const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   })
   if (!response.ok) {
     const text = await response.text()
-    throw new Error(text || `Request failed: ${response.status}`)
+    let message = text
+    try {
+      const payload = JSON.parse(text) as { detail?: unknown }
+      if (typeof payload.detail === 'string') message = payload.detail
+    } catch {
+      // Keep a non-JSON response as-is.
+    }
+    throw new Error(message || `Request failed: ${response.status}`)
   }
   return response.json() as Promise<T>
 }
@@ -302,6 +312,9 @@ const tabLabel = (tab: DetailTab) => {
 }
 
 const prShortLabel = (task: Task) => {
+  if (task.source_type === 'local_diff') {
+    return `本地变更 · ${task.pr_base_ref || '自动基准'}`
+  }
   if (task.pr_owner && task.pr_repo && task.pr_number) {
     return `${task.pr_owner}/${task.pr_repo} #${task.pr_number}`
   }
@@ -364,8 +377,11 @@ export function App() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [detail, setDetail] = useState<TaskDetail | null>(null)
   const [repoPath, setRepoPath] = useState('')
+  const [reviewSource, setReviewSource] = useState<ReviewSource>('pull_request')
   const [prUrl, setPrUrl] = useState('')
+  const [baseBranch, setBaseBranch] = useState('')
   const [reviewFocus, setReviewFocus] = useState('')
+  const [isCreating, setIsCreating] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
   const [detailTab, setDetailTab] = useState<DetailTab>('results')
   const [showAllEvents, setShowAllEvents] = useState(false)
@@ -463,21 +479,29 @@ export function App() {
   }, [showModal])
 
   const createTask = async () => {
-    if (!repoPath.trim() || !prUrl.trim()) {
-      setNotice({ tone: 'error', text: '请填写仓库路径和 GitHub PR 链接。' })
+    if (!repoPath.trim() || (reviewSource === 'pull_request' && !prUrl.trim())) {
+      setNotice({
+        tone: 'error',
+        text: reviewSource === 'pull_request' ? '请填写仓库路径和 GitHub PR 链接。' : '请填写仓库路径。',
+      })
       return
     }
+    if (isCreating) return
+    setIsCreating(true)
     try {
       const task = await api<Task>('/api/tasks', {
         method: 'POST',
         body: JSON.stringify({
           repo_path: repoPath.trim(),
-          pr_url: prUrl.trim(),
+          source_type: reviewSource,
+          pr_url: reviewSource === 'pull_request' ? prUrl.trim() : null,
+          base: reviewSource === 'local_diff' ? baseBranch.trim() || null : null,
           review_focus: reviewFocus.trim(),
         }),
       })
       setRepoPath(repoPath.trim())
       setPrUrl('')
+      setBaseBranch('')
       setReviewFocus('')
       setShowModal(false)
       setNotice(null)
@@ -485,6 +509,8 @@ export function App() {
       setSelectedTaskId(task.id)
     } catch (err) {
       setNotice({ tone: 'error', text: err instanceof Error ? err.message : '创建审查任务失败' })
+    } finally {
+      setIsCreating(false)
     }
   }
 
@@ -890,29 +916,60 @@ export function App() {
             onClick={(event) => event.stopPropagation()}
             role="dialog"
             aria-modal="true"
-            aria-label="新建 PR 审查"
+            aria-label="新建代码审查"
           >
-            <h2>新建 PR 审查</h2>
+            <h2>新建代码审查</h2>
             <p className="modal-hint">
-              Mission Control 会拉取该 PR 的 diff 与讨论，编译上下文后交给 AI 后端做静态审查。
+              {reviewSource === 'pull_request'
+                ? '拉取 GitHub PR 的 diff 与讨论，编译上下文后交给 AI 后端审查。'
+                : '审查本地仓库相对基准分支的提交、暂存区和工作区变更。'}
             </p>
+            <div className="mode-switch" role="group" aria-label="审查来源">
+              <button
+                type="button"
+                className={reviewSource === 'pull_request' ? 'active' : ''}
+                aria-pressed={reviewSource === 'pull_request'}
+                onClick={() => setReviewSource('pull_request')}
+              >
+                GitHub PR
+              </button>
+              <button
+                type="button"
+                className={reviewSource === 'local_diff' ? 'active' : ''}
+                aria-pressed={reviewSource === 'local_diff'}
+                onClick={() => setReviewSource('local_diff')}
+              >
+                本地变更
+              </button>
+            </div>
             <label className="field">
               <span className="field-label">本地仓库路径</span>
               <input
                 value={repoPath}
                 onChange={(event) => setRepoPath(event.target.value)}
-                placeholder="/path/to/repo"
+                placeholder="C:\\path\\to\\repo"
                 autoFocus
               />
             </label>
-            <label className="field">
-              <span className="field-label">GitHub PR 链接</span>
-              <input
-                value={prUrl}
-                onChange={(event) => setPrUrl(event.target.value)}
-                placeholder="https://github.com/org/repo/pull/123"
-              />
-            </label>
+            {reviewSource === 'pull_request' ? (
+              <label className="field">
+                <span className="field-label">GitHub PR 链接</span>
+                <input
+                  value={prUrl}
+                  onChange={(event) => setPrUrl(event.target.value)}
+                  placeholder="https://github.com/org/repo/pull/123"
+                />
+              </label>
+            ) : (
+              <label className="field">
+                <span className="field-label">基准分支（可选）</span>
+                <input
+                  value={baseBranch}
+                  onChange={(event) => setBaseBranch(event.target.value)}
+                  placeholder="自动检测 main 或 master"
+                />
+              </label>
+            )}
             <label className="field">
               <span className="field-label">审查重点（可选）</span>
               <textarea
@@ -923,13 +980,13 @@ export function App() {
               />
             </label>
             <div className="modal-actions">
-              <button className="btn btn-ghost" onClick={() => setShowModal(false)}>取消</button>
+              <button className="btn btn-ghost" disabled={isCreating} onClick={() => setShowModal(false)}>取消</button>
               <button
                 className="btn btn-primary"
-                disabled={!repoPath.trim() || !prUrl.trim()}
+                disabled={isCreating || !repoPath.trim() || (reviewSource === 'pull_request' && !prUrl.trim())}
                 onClick={createTask}
               >
-                创建审查
+                {isCreating ? '正在创建…' : '创建审查'}
               </button>
             </div>
           </div>
