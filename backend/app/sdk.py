@@ -35,6 +35,13 @@ from app.core.proc import run_text
 from app.core.validation import ValidationService
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
+from app.services.local_review_service import (
+    build_local_review_source,
+    get_commit_messages,
+    get_local_changed_files,
+    get_local_diff,
+    resolve_base_branch,
+)
 from app.services.review_history import (
     FindingStatus,
     ReviewHistoryStore,
@@ -227,57 +234,34 @@ class ReviewEngine:
         context: dict | None,
     ) -> Task:
         """Create task from local git diff (no PR URL needed)."""
-        base_branch = base or self._detect_default_branch(repo_path)
-        changed_files = self._get_local_changed_files(repo_path, base_branch)
-
-        # Build title and description from local context
-        commits = self._get_commit_messages(repo_path, base_branch)
-        intent = ''
-        if context and context.get('intent'):
-            intent = context['intent']
-        elif commits:
-            intent = commits[0]
-
-        title = f'[Local Review] {intent[:80]}' if intent else '[Local Review]'
-
-        desc_parts = [f'Local diff review against {base_branch}']
-        if intent:
-            desc_parts.append(f'Intent: {intent}')
-        if context and context.get('requirements'):
-            desc_parts.append('Requirements:')
-            for req in context['requirements']:
-                desc_parts.append(f'  - {req}')
-        if commits:
-            desc_parts.append(f'Recent commits ({len(commits)}):')
-            for msg in commits[:5]:
-                desc_parts.append(f'  - {msg}')
-        if review_focus:
-            desc_parts.append(f'Review focus: {review_focus}')
-
-        description = '\n'.join(desc_parts)
+        local = build_local_review_source(
+            repo_path,
+            base=base,
+            review_focus=review_focus,
+            context=context,
+        )
 
         task = self._engine.create_task(
-            title=title,
+            title=local.title,
             repo_path=repo_path,
-            description=description,
+            description=local.description,
             source_type='local_diff',
             source_url=None,
             backend=self.backend_name,
             review_focus=review_focus,
-            pr_base_ref=base_branch,
-            review_paths=changed_files,
+            pr_base_ref=local.base_branch,
+            review_paths=local.changed_files,
         )
 
         # Save local diff as artifact
-        diff_text = self._get_local_diff(repo_path, base_branch)
-        self._artifacts.write_text(task.id, 'context/local_diff.patch', diff_text)
+        self._artifacts.write_text(task.id, 'context/local_diff.patch', local.diff_text)
         self._engine.append_event(
             task_id=task.id,
             kind='task.local_diff_ingested',
             payload={
-                'base_branch': base_branch,
-                'changed_files': len(changed_files),
-                'diff_size_bytes': len(diff_text),
+                'base_branch': local.base_branch,
+                'changed_files': len(local.changed_files),
+                'diff_size_bytes': len(local.diff_text.encode('utf-8')),
             },
         )
         return task
@@ -822,81 +806,22 @@ class ReviewEngine:
     @staticmethod
     def _detect_default_branch(repo_path: str) -> str:
         """Detect main/master branch."""
-        for branch in ('main', 'master'):
-            result = run_text(
-                ['git', 'rev-parse', '--verify', branch],
-                cwd=repo_path, timeout=10,
-            )
-            if result.returncode == 0:
-                return branch
-        return 'main'
+        return resolve_base_branch(repo_path)
 
     @staticmethod
     def _get_local_changed_files(repo_path: str, base: str) -> list[str]:
         """Get files changed between base branch and HEAD, plus staged changes."""
-        files = set()
-        # Committed changes vs base
-        result = run_text(
-            ['git', 'diff', '--name-only', f'{base}...HEAD'],
-            cwd=repo_path, timeout=30,
-        )
-        if result.returncode == 0:
-            files.update(f for f in result.stdout.splitlines() if f.strip())
-        # Staged but uncommitted changes
-        result = run_text(
-            ['git', 'diff', '--cached', '--name-only'],
-            cwd=repo_path, timeout=30,
-        )
-        if result.returncode == 0:
-            files.update(f for f in result.stdout.splitlines() if f.strip())
-        # Unstaged changes (working tree)
-        if not files:
-            result = run_text(
-                ['git', 'diff', '--name-only'],
-                cwd=repo_path, timeout=30,
-            )
-            if result.returncode == 0:
-                files.update(f for f in result.stdout.splitlines() if f.strip())
-        return sorted(files)
+        return get_local_changed_files(repo_path, base)
 
     @staticmethod
     def _get_local_diff(repo_path: str, base: str) -> str:
         """Get diff text: committed vs base + staged + unstaged."""
-        parts = []
-        # Committed changes vs base
-        result = run_text(
-            ['git', 'diff', f'{base}...HEAD'],
-            cwd=repo_path, timeout=60,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            parts.append(result.stdout)
-        # Staged but uncommitted
-        result = run_text(
-            ['git', 'diff', '--cached'],
-            cwd=repo_path, timeout=60,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            parts.append(result.stdout)
-        # Unstaged (only if nothing else found)
-        if not parts:
-            result = run_text(
-                ['git', 'diff'],
-                cwd=repo_path, timeout=60,
-            )
-            if result.returncode == 0:
-                parts.append(result.stdout)
-        return '\n'.join(parts)
+        return get_local_diff(repo_path, base)
 
     @staticmethod
     def _get_commit_messages(repo_path: str, base: str) -> list[str]:
         """Get commit messages since base branch."""
-        result = run_text(
-            ['git', 'log', '--oneline', f'{base}..HEAD'],
-            cwd=repo_path, timeout=10,
-        )
-        if result.returncode != 0:
-            return []
-        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return get_commit_messages(repo_path, base)
 
     @staticmethod
     def _get_head_sha(repo_path: str) -> str | None:
