@@ -339,6 +339,13 @@ const MoonIcon = () => (
   </svg>
 )
 
+const SlidersIcon = () => (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+    strokeLinecap="round" aria-hidden="true">
+    <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6" />
+  </svg>
+)
+
 const MenuIcon = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
     strokeLinecap="round" aria-hidden="true">
@@ -562,13 +569,11 @@ export function App() {
   const isRunning = selectedTask?.status === 'running'
   const startLabel = latestRound ? '发起下一轮审查' : '开始首轮审查'
 
-  if (showSettings) return <Settings onBack={() => setShowSettings(false)} />
-
   return (
     <div className="layout">
       <header className="topbar">
         <button
-          className="icon-btn sidebar-toggle"
+          className={`icon-btn sidebar-toggle ${showSettings ? 'is-hidden' : ''}`}
           onClick={() => setNavOpen((v) => !v)}
           aria-label="切换任务列表"
           aria-expanded={navOpen}
@@ -580,7 +585,15 @@ export function App() {
           <span className="brand-sub">AI 代码审查控制台</span>
         </div>
         <div className="topbar-actions">
-          <button className="btn btn-ghost" onClick={() => setShowSettings(true)}>设置</button>
+          <button
+            className={`icon-btn ${showSettings ? 'is-active' : ''}`}
+            onClick={() => setShowSettings((v) => !v)}
+            aria-label="模型选择"
+            aria-pressed={showSettings}
+            title="模型选择"
+          >
+            <SlidersIcon />
+          </button>
           <button
             className="icon-btn"
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
@@ -589,12 +602,23 @@ export function App() {
           >
             {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
           </button>
-          <button className="btn btn-primary" onClick={() => setShowModal(true)}>
+          <button
+            className="btn btn-primary"
+            onClick={() => {
+              setShowSettings(false)
+              setShowModal(true)
+            }}
+          >
             新建审查
           </button>
         </div>
       </header>
 
+      {showSettings ? (
+        <div className="body settings-body">
+          <Settings onBack={() => setShowSettings(false)} />
+        </div>
+      ) : (
       <div className="body">
         {navOpen && <div className="scrim" onClick={() => setNavOpen(false)} />}
 
@@ -913,6 +937,7 @@ export function App() {
           </div>
         </main>
       </div>
+      )}
 
       {showModal && (
         <div className="modal-overlay" onClick={() => setShowModal(false)} role="presentation">
