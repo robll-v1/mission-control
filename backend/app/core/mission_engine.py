@@ -68,6 +68,11 @@ class MissionEngine:
         task = self.db.get_task(task_id)
         if task is None:
             raise KeyError(f'task not found: {task_id}')
+        if task.status == TaskStatus.ABORTED and status != TaskStatus.INGESTING:
+            # An accepted abort is final for the round. Worker finalisation
+            # racing the abort (exit handling, result extraction) must not
+            # repaint the task as failed; only starting a new round may.
+            return task
         task.status = status
         task.current_stage = stage
         task.updated_at = time.time()

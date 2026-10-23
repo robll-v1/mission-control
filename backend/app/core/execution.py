@@ -360,9 +360,16 @@ class ExecutionService:
                     )
 
             exit_code = proc.wait(timeout=5)
+            # An accepted abort (task already ABORTED) is final for this round;
+            # repainting it as failed below would hide that the user cancelled.
+            fresh_task = self.db.get_task(task.id)
+            was_aborted = fresh_task is not None and fresh_task.status == TaskStatus.ABORTED
             run.ended_at = time.time()
             run.exit_code = exit_code
-            run.status = 'completed' if exit_code == 0 else 'failed'
+            if was_aborted:
+                run.status = 'aborted'
+            else:
+                run.status = 'completed' if exit_code == 0 else 'failed'
             parse_started_at = time.perf_counter()
             run.review_result = ReviewResultService.extract_result(
                 events=self.db.list_events(task_id), run=run, language=language
@@ -376,10 +383,16 @@ class ExecutionService:
                 'round_duration_ms': int((run.ended_at - run.started_at) * 1000),
             })
             self.db.save_run(run)
-            task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task.id))
-            self.db.save_task(task)
+            # Save through a freshly-read task: the worker's `task` snapshot is
+            # stale by now, and writing it back would repaint an aborted task.
+            latest = ReviewResultService.latest_result(self.db.list_runs(task.id))
+            if fresh_task is not None:
+                fresh_task.latest_review_result = latest
+                self.db.save_task(fresh_task)
 
-            if exit_code == 0:
+            if was_aborted:
+                pass  # keep ABORTED; late worker finalisation must not repaint it
+            elif exit_code == 0:
                 self.mission.set_stage(task.id, status=TaskStatus.WAITING_HUMAN, stage='awaiting_next_round')
             else:
                 self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
@@ -414,6 +427,7 @@ class ExecutionService:
                     'exit_code': exit_code,
                     'session_id': run.backend_session_id,
                     'round_index': round_index,
+                    **({'reason': 'aborted'} if was_aborted else {}),
                     'verdict': run.review_result.verdict if run.review_result is not None else None,
                     'finding_count': run.review_result.finding_count if run.review_result is not None else 0,
                     'severity_counts': run.review_result.severity_counts if run.review_result is not None else {},
@@ -422,9 +436,11 @@ class ExecutionService:
         except Exception as exc:
             if proc is not None and proc.poll() is None:
                 self._terminate_process(proc)
+            fresh_task = self.db.get_task(task.id)
+            was_aborted = fresh_task is not None and fresh_task.status == TaskStatus.ABORTED
             run.ended_at = time.time()
             run.exit_code = -2 if isinstance(exc, IdleTimeoutError) else -1
-            run.status = 'failed'
+            run.status = 'aborted' if was_aborted else 'failed'
             parse_started_at = time.perf_counter()
             run.review_result = ReviewResultService.extract_result(
                 events=self.db.list_events(task_id), run=run, language=language
@@ -439,8 +455,12 @@ class ExecutionService:
                 'round_duration_ms': int((run.ended_at - run.started_at) * 1000),
             })
             self.db.save_run(run)
-            task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task.id))
-            self.db.save_task(task)
+            # Same as the success path: persist through the fresh task, not the
+            # worker's stale snapshot.
+            latest = ReviewResultService.latest_result(self.db.list_runs(task.id))
+            if fresh_task is not None:
+                fresh_task.latest_review_result = latest
+                self.db.save_task(fresh_task)
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
@@ -448,7 +468,8 @@ class ExecutionService:
                 level=EventLevel.ERROR,
                 payload={'message': str(exc), 'type': exc.__class__.__name__, 'round_index': round_index},
             )
-            self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
+            if not was_aborted:
+                self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
@@ -463,7 +484,7 @@ class ExecutionService:
                 payload={
                     'exit_code': run.exit_code,
                     'session_id': run.backend_session_id,
-                    'reason': 'idle_timeout' if isinstance(exc, IdleTimeoutError) else 'exception',
+                    'reason': 'aborted' if was_aborted else ('idle_timeout' if isinstance(exc, IdleTimeoutError) else 'exception'),
                     'round_index': round_index,
                     'verdict': run.review_result.verdict if run.review_result is not None else 'failed',
                     'finding_count': run.review_result.finding_count if run.review_result is not None else 0,
