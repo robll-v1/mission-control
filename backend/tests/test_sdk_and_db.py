@@ -327,3 +327,18 @@ def test_review_inline_persists_run_and_latest_result(tmp_path, git_repo, isolat
 
     # And review history is written, so incremental mode works on this path.
     assert (git_repo / '.amc' / 'reviews' / 'latest.json').exists()
+
+
+def test_mode_lookup_searches_all_retained_history(tmp_path):
+    from app.services.review_history import ReviewHistoryStore, ReviewRecord, StoredFinding
+
+    store = ReviewHistoryStore(str(tmp_path))
+    finding = StoredFinding(severity='high', path='a.py', summary='retain this issue')
+    store.save_review(ReviewRecord(review_id='local', timestamp=1, head_sha='local-sha',
+                                  base_ref='main', mode='local_diff', findings=[finding]))
+    for i in range(20):
+        store.save_review(ReviewRecord(review_id=f'pr-{i}', timestamp=i + 2, head_sha=f'pr-{i}',
+                                      base_ref='main', mode='pr'))
+    assert len(store.get_history(limit=50)) == 21
+    assert store.get_last_reviewed_sha(mode='local_diff') == 'local-sha'
+    assert store.get_previous_findings(mode='local_diff')[0].summary == finding.summary

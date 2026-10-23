@@ -224,17 +224,49 @@ class ExecutionService:
     def abort_task(self, task_id: str) -> bool:
         with self._lock:
             active = self._active.get(task_id)
-        if active is None or active.process is None:
-            return False
+            if active is None or active.process is None:
+                return False
+            with self.db.locked():
+                run = next((r for r in self.db.list_runs(task_id) if r.id == active.run_id), None)
+                task = self.db.get_task(task_id)
+                if run is None or run.status != 'running' or task is None or task.status == TaskStatus.ABORTED:
+                    return False
+                # Publish cancellation before termination can wake the worker.
+                # Finalisation uses the same lock, so a completed round cannot
+                # accept a late abort while its worktree is being cleaned up.
+                self.mission.set_stage(task_id, status=TaskStatus.ABORTED, stage='aborted')
+                self.mission.append_event(
+                    task_id=task_id,
+                    run_id=active.run_id,
+                    kind='control.accepted',
+                    payload={'action': 'abort'},
+                )
         self._terminate_process(active.process)
-        self.mission.set_stage(task_id, status=TaskStatus.ABORTED, stage='aborted')
-        self.mission.append_event(
-            task_id=task_id,
-            run_id=active.run_id,
-            kind='control.accepted',
-            payload={'action': 'abort'},
-        )
         return True
+
+    def _persist_round_result(self, task_id: str, run: Run, language: str) -> bool:
+        """Commit the result and task state together with respect to abort."""
+        with self.db.locked():
+            task = self.db.get_task(task_id)
+            was_aborted = task is not None and task.status == TaskStatus.ABORTED
+            if was_aborted:
+                run.status = 'aborted'
+                # Partial agent output must never certify a cancelled review.
+                run.review_result = ReviewResultService.extract_result(
+                    events=self.db.list_events(task_id), run=run, language=language
+                )
+            self.db.save_run(run)
+            if task is not None:
+                task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task_id))
+                self.db.save_task(task)
+                if not was_aborted:
+                    completed = run.status == 'completed'
+                    self.mission.set_stage(
+                        task_id,
+                        status=TaskStatus.WAITING_HUMAN if completed else TaskStatus.FAILED,
+                        stage='awaiting_next_round' if completed else 'review_failed',
+                    )
+            return was_aborted
 
     def cleanup_task_worktree(self, task_id: str, *, reason: str = 'manual') -> dict[str, object]:
         task = self.db.get_task(task_id)
@@ -360,16 +392,9 @@ class ExecutionService:
                     )
 
             exit_code = proc.wait(timeout=5)
-            # An accepted abort (task already ABORTED) is final for this round;
-            # repainting it as failed below would hide that the user cancelled.
-            fresh_task = self.db.get_task(task.id)
-            was_aborted = fresh_task is not None and fresh_task.status == TaskStatus.ABORTED
             run.ended_at = time.time()
             run.exit_code = exit_code
-            if was_aborted:
-                run.status = 'aborted'
-            else:
-                run.status = 'completed' if exit_code == 0 else 'failed'
+            run.status = 'completed' if exit_code == 0 else 'failed'
             parse_started_at = time.perf_counter()
             run.review_result = ReviewResultService.extract_result(
                 events=self.db.list_events(task_id), run=run, language=language
@@ -382,20 +407,7 @@ class ExecutionService:
                 'agent_text_bytes': agent_text_bytes,
                 'round_duration_ms': int((run.ended_at - run.started_at) * 1000),
             })
-            self.db.save_run(run)
-            # Save through a freshly-read task: the worker's `task` snapshot is
-            # stale by now, and writing it back would repaint an aborted task.
-            latest = ReviewResultService.latest_result(self.db.list_runs(task.id))
-            if fresh_task is not None:
-                fresh_task.latest_review_result = latest
-                self.db.save_task(fresh_task)
-
-            if was_aborted:
-                pass  # keep ABORTED; late worker finalisation must not repaint it
-            elif exit_code == 0:
-                self.mission.set_stage(task.id, status=TaskStatus.WAITING_HUMAN, stage='awaiting_next_round')
-            else:
-                self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
+            was_aborted = self._persist_round_result(task.id, run, language)
 
             if run.review_result is not None:
                 self.mission.append_event(
@@ -436,11 +448,9 @@ class ExecutionService:
         except Exception as exc:
             if proc is not None and proc.poll() is None:
                 self._terminate_process(proc)
-            fresh_task = self.db.get_task(task.id)
-            was_aborted = fresh_task is not None and fresh_task.status == TaskStatus.ABORTED
             run.ended_at = time.time()
             run.exit_code = -2 if isinstance(exc, IdleTimeoutError) else -1
-            run.status = 'aborted' if was_aborted else 'failed'
+            run.status = 'failed'
             parse_started_at = time.perf_counter()
             run.review_result = ReviewResultService.extract_result(
                 events=self.db.list_events(task_id), run=run, language=language
@@ -454,13 +464,7 @@ class ExecutionService:
                 'agent_text_bytes': agent_text_bytes if 'agent_text_bytes' in locals() else 0,
                 'round_duration_ms': int((run.ended_at - run.started_at) * 1000),
             })
-            self.db.save_run(run)
-            # Same as the success path: persist through the fresh task, not the
-            # worker's stale snapshot.
-            latest = ReviewResultService.latest_result(self.db.list_runs(task.id))
-            if fresh_task is not None:
-                fresh_task.latest_review_result = latest
-                self.db.save_task(fresh_task)
+            was_aborted = self._persist_round_result(task.id, run, language)
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
@@ -468,8 +472,6 @@ class ExecutionService:
                 level=EventLevel.ERROR,
                 payload={'message': str(exc), 'type': exc.__class__.__name__, 'round_index': round_index},
             )
-            if not was_aborted:
-                self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,

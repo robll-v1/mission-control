@@ -90,3 +90,45 @@ def test_allowed_paths_filter_still_applies():
     # No filter means every section is kept, including deletions.
     unfiltered = _parse([DELETED_FILE_SECTION], [])
     assert [item['path'] for item in unfiltered] == ['deleted.txt']
+
+
+def test_git_quoted_paths_are_decoded():
+    cases = [
+        ('"b/tab\\tname.txt"', 'tab\tname.txt'),
+        ('"b/new\\nline.txt"', 'new\nline.txt'),
+        ('"b/quote\\"name.txt"', 'quote"name.txt'),
+        ('"b/back\\\\slash.txt"', 'back\\slash.txt'),
+        ('"b/\\344\\270\\255.txt"', '中.txt'),
+    ]
+    for header, path in cases:
+        diff = f'diff --git a/x b/x\n--- a/x\n+++ {header}\n@@ -1 +1 @@\n-before\n+after\n'
+        patches = _parse([diff], [])
+        assert [p['path'] for p in patches] == [path]
+        assert '+after' in patches[0]['patch']
+        # Git's name-only output uses literal backslashes on POSIX.
+        import os
+        if os.name != 'nt' or '\\' not in path:
+            assert len(_parse([diff], [path])) == 1
+
+
+def test_hunk_content_cannot_be_mistaken_for_a_file_header():
+    diff = 'diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n--- a/old\n+++ b/other\n'
+    patches = _parse([diff], ['file'])
+    assert [p['path'] for p in patches] == ['file']
+    assert '+++ b/other' in patches[0]['patch']
+    assert patches[0]['additions'] == 1
+    assert patches[0]['deletions'] == 1
+
+
+def test_real_git_quoted_path_patch_is_kept(git_repo):
+    import subprocess
+    # Tab names are valid on POSIX. C-quoted non-ASCII names work on Windows too.
+    name = '中文.txt'
+    (git_repo / name).write_text('before\n', encoding='utf-8')
+    subprocess.run(['git', '-C', str(git_repo), 'add', name], check=True, capture_output=True)
+    (git_repo / name).write_text('after\n', encoding='utf-8')
+    diff = subprocess.run(['git', '-C', str(git_repo), '-c', 'core.quotePath=true', 'diff'],
+                          check=True, capture_output=True, text=True, encoding='utf-8').stdout
+    patches = _parse([diff], [name])
+    assert [p['path'] for p in patches] == [name]
+    assert '+after' in patches[0]['patch']

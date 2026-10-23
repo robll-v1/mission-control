@@ -77,6 +77,7 @@ class ReviewHistoryStore:
     - latest.json: most recent review (quick access)
     """
 
+    MAX_RECORDS = 50
     STORE_DIR = '.amc/reviews'
     HISTORY_FILE = 'history.json'
     LATEST_FILE = 'latest.json'
@@ -123,7 +124,7 @@ class ReviewHistoryStore:
         """
         if mode is None:
             return self.get_latest()
-        for record in self.get_history():
+        for record in self.get_history(limit=self.MAX_RECORDS):
             if record.mode == mode:
                 return record
         return None
@@ -169,8 +170,8 @@ class ReviewHistoryStore:
         history.append(record_dict)
 
         # Keep max 50 records
-        if len(history) > 50:
-            history = history[-50:]
+        if len(history) > self.MAX_RECORDS:
+            history = history[-self.MAX_RECORDS:]
 
         history_file.write_text(
             json.dumps(history, indent=2, ensure_ascii=False),

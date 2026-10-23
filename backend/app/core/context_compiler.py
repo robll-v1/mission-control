@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
@@ -385,7 +386,7 @@ class ContextCompiler:
         patches: list[dict[str, Any]] = []
         # Git diffs always emit POSIX-style paths even on Windows; normalize the
         # caller-supplied filter so backslash paths still match.
-        allowed_paths = {p.replace('\\', '/') for p in (review_paths or [])}
+        allowed_paths = {p.replace(os.sep, '/') for p in (review_paths or [])}
         current_lines: list[str] = []
         current_path: str | None = None
         current_status = 'modified'
@@ -410,26 +411,39 @@ class ContextCompiler:
             additions = 0
             deletions = 0
 
-        for line in diff_text.splitlines():
+        def header_path(value: str, prefix: str) -> str | None:
+            # Git uses C-quoted paths for tabs, quotes and backslashes, and
+            # octal UTF-8 bytes when core.quotePath is enabled. Decode bytes
+            # before interpreting UTF-8; JSON escapes do not support octal.
+            value = value.split('\t', 1)[0]
+            if value.startswith('"') and value.endswith('"'):
+                value = codecs.escape_decode(value[1:-1].encode('utf-8'))[0].decode('utf-8', errors='replace')
+            return value[len(prefix):] if value.startswith(prefix) else None
+
+        in_hunk = False
+        for line in diff_text.split('\n'):
             if line.startswith('diff --git '):
                 flush()
+                in_hunk = False
                 continue
-            # Git terminates ---/+++ header paths that contain spaces with a
-            # tab; review_paths (from `git diff --name-only -z`) has no tab,
-            # so drop it or the allowed-paths filter never matches.
-            if line.startswith('--- a/'):
-                old_path = line[6:].rstrip('\t').replace('\\', '/')
-            elif line.startswith('+++ b/'):
-                current_path = line[6:].rstrip('\t').replace('\\', '/')
-            elif line.startswith('+++ /dev/null'):
-                # Deleted file: the only usable path is on the --- side.
-                current_path = old_path
-                current_status = 'deleted'
+            if line.startswith('@@ '):
+                in_hunk = True
+            # Only file headers carry paths. An added line whose content
+            # starts with "++ b/" is still hunk content, not a new header.
+            if not in_hunk:
+                if line.startswith('--- '):
+                    old_path = header_path(line[4:], 'a/')
+                elif line.startswith('+++ '):
+                    if line[4:] == '/dev/null':
+                        current_path = old_path
+                        current_status = 'deleted'
+                    else:
+                        current_path = header_path(line[4:], 'b/')
             if current_path is not None:
                 current_lines.append(line)
-                if line.startswith('+') and not line.startswith('+++'):
+                if in_hunk and line.startswith('+'):
                     additions += 1
-                elif line.startswith('-') and not line.startswith('---'):
+                elif in_hunk and line.startswith('-'):
                     deletions += 1
         flush()
         return patches

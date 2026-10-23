@@ -4,6 +4,8 @@ from __future__ import annotations
 import sys
 import time
 
+import pytest
+
 from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
 from app.core.execution import ExecutionService
@@ -35,7 +37,8 @@ class SleepAdapter:
         return []
 
 
-def test_abort_survives_worker_finalisation(git_repo, tmp_path, isolated_config):
+@pytest.mark.parametrize('finish_during_termination', [False, True])
+def test_abort_survives_worker_finalisation(git_repo, tmp_path, isolated_config, monkeypatch, finish_during_termination):
     (git_repo / 'a.txt').write_text('abort me\n', encoding='utf-8')
     local = build_local_review_source(str(git_repo), base='main')
     db = Database(str(tmp_path / 'db.sqlite'))
@@ -73,6 +76,18 @@ def test_abort_survives_worker_finalisation(git_repo, tmp_path, isolated_config)
     else:
         raise AssertionError('round never launched its process')
 
+    if finish_during_termination:
+        original_terminate = execution._terminate_process
+
+        def terminate_and_wait(proc):
+            original_terminate(proc)
+            deadline = time.monotonic() + 10
+            while execution.is_active(task.id) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not execution.is_active(task.id)
+
+        monkeypatch.setattr(execution, '_terminate_process', terminate_and_wait)
+
     assert execution.abort_task(task.id) is True
     assert db.get_task(task.id).status == TaskStatus.ABORTED
 
@@ -105,3 +120,51 @@ def test_set_stage_cannot_leave_aborted_except_new_round(tmp_path):
     mission.set_stage(task.id, status=TaskStatus.INGESTING, stage='prepare_review')
     assert db.get_task(task.id).status == TaskStatus.INGESTING
     db.close()
+
+
+def test_abort_during_result_parsing_is_not_lost(git_repo, tmp_path, isolated_config, monkeypatch):
+    """Cancellation after the worker reads its state must survive result parsing."""
+    import threading
+    from app.services.review_result_service import ReviewResultService
+    from test_execution_concurrency import _build, _make_local_task
+
+    (git_repo / 'a.txt').write_text('changed\n', encoding='utf-8')
+    db, mission, artifacts, worktrees, contexts, execution = _build(tmp_path, git_repo)
+    task = _make_local_task(git_repo, mission, artifacts)
+    parsing = threading.Event()
+    release = threading.Event()
+    original = ReviewResultService.extract_result
+
+    def gated_extract(**kwargs):
+        if not parsing.is_set():
+            parsing.set()
+            assert release.wait(10), 'test never released parsing'
+        return original(**kwargs)
+
+    monkeypatch.setattr(ReviewResultService, 'extract_result', staticmethod(gated_extract))
+    execution.start_task(task.id)
+    try:
+        assert parsing.wait(10), 'worker never reached result parsing'
+        assert execution.abort_task(task.id)
+    finally:
+        release.set()
+        deadline = time.monotonic() + 10
+        while execution.is_active(task.id) and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert not execution.is_active(task.id)
+    assert db.get_task(task.id).status == TaskStatus.ABORTED
+    assert db.list_runs(task.id)[0].status == 'aborted'
+    finished = [e for e in db.list_events(task.id) if e.kind == 'review.round_finished']
+    assert finished[-1].payload['reason'] == 'aborted'
+    db.close()
+
+
+def test_cancelled_output_cannot_certify_clear():
+    from app.core.models import Event, Run
+    from app.services.review_result_service import ReviewResultService
+
+    run = Run(task_id='task', backend='opencode', status='aborted', started_at=1)
+    event = Event(task_id='task', run_id=run.id, kind='agent.text', seq=1, ts=1,
+                  payload={'text': 'Found no material issues'})
+    result = ReviewResultService.extract_result(events=[event], run=run)
+    assert result.verdict == 'inconclusive'
