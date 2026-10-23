@@ -388,21 +388,25 @@ class ContextCompiler:
         allowed_paths = {p.replace('\\', '/') for p in (review_paths or [])}
         current_lines: list[str] = []
         current_path: str | None = None
+        current_status = 'modified'
+        old_path: str | None = None
         additions = 0
         deletions = 0
 
         def flush() -> None:
-            nonlocal current_lines, current_path, additions, deletions
+            nonlocal current_lines, current_path, current_status, old_path, additions, deletions
             if current_path and (not allowed_paths or current_path in allowed_paths):
                 patches.append({
                     'path': current_path,
-                    'status': 'modified',
+                    'status': current_status,
                     'additions': additions,
                     'deletions': deletions,
                     'patch': ContextCompiler._truncate_patch('\n'.join(current_lines).strip()),
                 })
             current_lines = []
             current_path = None
+            current_status = 'modified'
+            old_path = None
             additions = 0
             deletions = 0
 
@@ -410,10 +414,17 @@ class ContextCompiler:
             if line.startswith('diff --git '):
                 flush()
                 continue
-            if line.startswith('+++ b/'):
-                current_path = line[6:].replace('\\', '/')
+            # Git terminates ---/+++ header paths that contain spaces with a
+            # tab; review_paths (from `git diff --name-only -z`) has no tab,
+            # so drop it or the allowed-paths filter never matches.
+            if line.startswith('--- a/'):
+                old_path = line[6:].rstrip('\t').replace('\\', '/')
+            elif line.startswith('+++ b/'):
+                current_path = line[6:].rstrip('\t').replace('\\', '/')
             elif line.startswith('+++ /dev/null'):
-                current_path = None
+                # Deleted file: the only usable path is on the --- side.
+                current_path = old_path
+                current_status = 'deleted'
             if current_path is not None:
                 current_lines.append(line)
                 if line.startswith('+') and not line.startswith('+++'):
