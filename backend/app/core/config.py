@@ -4,10 +4,15 @@ import copy
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+class ConfigError(RuntimeError):
+    """A config file exists but cannot be parsed."""
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -73,7 +78,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def _load_yaml_file(path: Path) -> dict[str, Any]:
+def _load_yaml_file(path: Path, *, strict: bool = False) -> dict[str, Any]:
     """Read a YAML config file as UTF-8.
 
     Config files are written as UTF-8 (``amc init`` emits UTF-8, and users paste
@@ -82,15 +87,23 @@ def _load_yaml_file(path: Path) -> dict[str, Any]:
     that raises ``UnicodeDecodeError`` and the config is silently ignored, so the
     user gets default behaviour with no clue why. Decode explicitly, and warn
     rather than swallow so a broken config is visible.
+
+    ``strict=True`` raises :class:`ConfigError` instead of warning, for callers
+    about to rewrite the file — silently treating a parseable-but-recoverable
+    file as empty and saving over it destroys the user's content.
     """
     try:
         loaded = yaml.safe_load(path.read_text(encoding='utf-8'))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        if strict:
+            raise ConfigError(f'{path}: {exc}') from exc
         print(f'[amc] warning: ignoring unreadable config {path}: {exc}', file=sys.stderr)
         return {}
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
+        if strict:
+            raise ConfigError(f'{path}: expected a mapping, got {type(loaded).__name__}')
         print(
             f'[amc] warning: ignoring config {path}: expected a mapping, got {type(loaded).__name__}',
             file=sys.stderr,
@@ -99,12 +112,12 @@ def _load_yaml_file(path: Path) -> dict[str, Any]:
     return loaded
 
 
-def load_global_config() -> dict[str, Any]:
+def load_global_config(*, strict: bool = False) -> dict[str, Any]:
     """Load global user config from the platform config path."""
     path = _global_config_path()
     if not path.exists():
         return {}
-    return _load_yaml_file(path)
+    return _load_yaml_file(path, strict=strict)
 
 
 def load_repo_config(repo_path: str) -> dict[str, Any]:
@@ -162,3 +175,10 @@ def save_global_config(config: dict[str, Any]) -> None:
         temp_path.replace(path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+# Serialises read-modify-write cycles on the global config within this process:
+# the backend serves /api/config/save from concurrent request threads, and the
+# atomic replace inside save_global_config only prevents torn files, not the
+# lost update where two savers both load the same base and the last write wins.
+global_config_lock = threading.Lock()
