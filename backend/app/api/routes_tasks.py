@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.core.context_compiler import ContextCompiler
+from app.core.config import resolve_backend_config
 from app.core.github_ingest import fetch_pull_request, is_github_pr_url
 from app.core.mission_engine import MissionEngine
 from app.core.models import TaskStatus
@@ -25,6 +26,22 @@ def get_artifacts() -> ArtifactStore:
 def get_contexts() -> ContextCompiler:
     from app.api.app import contexts
     return contexts
+
+
+def _generated_paths(repo_path: str, mission: MissionEngine, artifacts: ArtifactStore) -> list[str]:
+    repo = Path(repo_path).resolve()
+    worktrees_root = artifacts.runtime_root / 'worktrees'
+    if not worktrees_root.is_absolute():
+        worktrees_root = repo / worktrees_root
+    paths = [(artifacts.runtime_root / 'tasks').resolve(), mission.db.path.resolve(), worktrees_root.resolve()]
+    paths.extend(Path(f'{mission.db.path}{suffix}').resolve() for suffix in ('-journal', '-wal', '-shm'))
+    excluded = []
+    for path in paths:
+        try:
+            excluded.append(path.relative_to(repo).as_posix())
+        except ValueError:
+            pass
+    return excluded
 
 
 router = APIRouter(prefix='/api/tasks', tags=['tasks'])
@@ -50,6 +67,7 @@ def create_task(
         raise HTTPException(status_code=400, detail=f'repo_path does not exist: {repo_path}')
 
     review_focus = request.review_focus.strip()
+    backend = resolve_backend_config(repo_path, backend=request.backend)['backend']
     if request.source_type == 'pull_request':
         pr_url = (request.pr_url or '').strip()
         if not pr_url:
@@ -71,7 +89,7 @@ def create_task(
             description=description,
             source_type='pull_request',
             source_url=pr_url,
-            backend=request.backend,
+            backend=backend,
             review_focus=review_focus,
             pr_owner=pull_request.owner,
             pr_repo=pull_request.repo,
@@ -100,6 +118,7 @@ def create_task(
                 repo_path,
                 base=request.base,
                 review_focus=review_focus,
+                generated_paths=_generated_paths(repo_path, mission, artifact_store),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -109,10 +128,12 @@ def create_task(
             description=local.description,
             source_type='local_diff',
             source_url=None,
-            backend=request.backend,
+            backend=backend,
             review_focus=review_focus,
             pr_base_ref=local.base_branch,
             review_paths=local.changed_files,
+            local_head_sha=local.head_sha,
+            local_snapshot_sha=local.snapshot_sha,
         )
         diff_path = artifact_store.write_text(task.id, 'context/local_diff.patch', local.diff_text)
         mission.append_event(

@@ -243,6 +243,8 @@ data/              SQLite 数据库
 - 修复验证；
 - 明确模型选择优先级链。
 
+本地增量审查对比当前轮 finding 与历史结果。无法在当前 diff 中重新验证的旧 finding 会标为 `unverified` 并保留，不能当作已修复；CLI 可用 `--no-incremental` 执行完整重审。SDK 的 `Run` / `get_result()` 表示本轮原始结果，`ReviewReport` 则表示跨轮聚合结果。
+
 这标志着项目从“能 review 一次”迈向“能连续陪你做多轮开发”。
 
 ### 阶段 4：多后端适配与个人工具化（2026-04-20）

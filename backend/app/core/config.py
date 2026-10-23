@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -124,3 +125,40 @@ def load_repo_config(repo_path: str) -> dict[str, Any]:
             merged = _deep_merge(merged, project_cfg)
 
     return merged
+
+
+def resolve_backend_config(
+    repo_path: str,
+    *,
+    backend: str | None = None,
+    model: str | None = None,
+) -> dict[str, str | None]:
+    """Resolve the selected backend and its model from merged configuration."""
+    config = load_repo_config(repo_path)
+    section = config.get('backend', {})
+    if not isinstance(section, dict):
+        section = {}
+    selected_backend = backend or str(section.get('default') or DEFAULT_CONFIG['backend']['default'])
+    selected = section.get(selected_backend, {})
+    if not isinstance(selected, dict):
+        selected = {}
+    env_model = os.environ.get('AMC_MODEL', '').strip()
+    return {
+        'backend': selected_backend,
+        'model': model or env_model or str(selected.get('model') or '').strip() or None,
+        'variant': str(selected.get('variant') or '').strip() or None,
+    }
+
+
+def save_global_config(config: dict[str, Any]) -> None:
+    """Atomically save the full global config mapping."""
+    path = _global_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=path.parent, delete=False) as handle:
+        temp_path = Path(handle.name)
+    try:
+        with temp_path.open('w', encoding='utf-8') as handle:
+            yaml.safe_dump(config, handle, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)

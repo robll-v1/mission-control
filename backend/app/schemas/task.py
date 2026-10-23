@@ -9,4 +9,4 @@ class CreateTaskRequest(BaseModel):
     pr_url: str | None = None
     base: str | None = None
     review_focus: str = ''
-    backend: str = 'opencode'
+    backend: str | None = None

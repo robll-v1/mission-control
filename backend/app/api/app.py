@@ -11,9 +11,10 @@ from fastapi.responses import FileResponse
 from app.adapters import get_adapter, AVAILABLE_BACKENDS
 from app.api.routes_artifacts import router as artifact_router
 from app.api.routes_control import router as control_router
+from app.api.routes_config import router as config_router
 from app.api.routes_stream import router as stream_router
 from app.api.routes_tasks import router as task_router
-from app.core.config import load_repo_config
+from app.core.config import load_repo_config, resolve_backend_config
 from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
 from app.core.execution import ExecutionService
@@ -35,7 +36,10 @@ adapters = {name: get_adapter(name) for name in AVAILABLE_BACKENDS}
 worktrees = WorktreeManager(RUNTIME_ROOT)
 artifacts = ArtifactStore(RUNTIME_ROOT)
 contexts = ContextCompiler(artifacts)
-execution = ExecutionService(db=db, mission=engine, adapters=adapters, worktrees=worktrees, artifacts=artifacts, contexts=contexts)
+execution = ExecutionService(
+    db=db, mission=engine, adapters=adapters, worktrees=worktrees, artifacts=artifacts, contexts=contexts,
+    adapter_factory=lambda name, *, model=None, variant=None: get_adapter(name, model=model, variant=variant),
+)
 validation = ValidationService(db=db, mission=engine, artifacts=artifacts)
 diffs = DiffService(artifacts)
 summaries = SummaryService(db, artifacts)
@@ -123,6 +127,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title='PR Review Control', lifespan=lifespan)
 app.include_router(task_router)
+app.include_router(config_router)
 app.include_router(stream_router)
 app.include_router(control_router)
 app.include_router(artifact_router)

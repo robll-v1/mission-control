@@ -65,6 +65,8 @@ class Task(BaseModel):
     pr_head_ref: str | None = None
     pr_head_sha: str | None = None
     pr_base_ref: str | None = None
+    local_head_sha: str | None = None
+    local_snapshot_sha: str | None = None
     review_paths: list[str] = Field(default_factory=list)
     status: TaskStatus = TaskStatus.CREATED
     current_stage: str = 'created'

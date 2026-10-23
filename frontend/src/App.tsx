@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Settings } from './Settings'
 
 type TaskStatus =
   | 'created'
@@ -387,6 +388,7 @@ export function App() {
   const [showAllEvents, setShowAllEvents] = useState(false)
   const [showModal, setShowModal] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'light'
     const stored = window.localStorage.getItem(THEME_KEY)
@@ -560,6 +562,8 @@ export function App() {
   const isRunning = selectedTask?.status === 'running'
   const startLabel = latestRound ? '发起下一轮审查' : '开始首轮审查'
 
+  if (showSettings) return <Settings onBack={() => setShowSettings(false)} />
+
   return (
     <div className="layout">
       <header className="topbar">
@@ -576,6 +580,7 @@ export function App() {
           <span className="brand-sub">AI 代码审查控制台</span>
         </div>
         <div className="topbar-actions">
+          <button className="btn btn-ghost" onClick={() => setShowSettings(true)}>设置</button>
           <button
             className="icon-btn"
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}

@@ -741,9 +741,10 @@ def cmd_review(args: argparse.Namespace) -> None:
 
     # Save user's working directory BEFORE chdir
     user_cwd = os.getcwd()
-    repo_path = args.repo or user_cwd
+    repo_path = str(Path(args.repo or user_cwd).expanduser().resolve())
     pr_url = args.pr_url if args.pr_url else None
-    backend_name = args.backend
+    from app.core.config import resolve_backend_config
+    backend_name = resolve_backend_config(repo_path, backend=args.backend)['backend']
 
     # ── Preflight checks ──────────────────────────────────────────────
     # Check 1: Is this a git repo?
@@ -779,11 +780,12 @@ def cmd_review(args: argparse.Namespace) -> None:
                     base = candidate
                     break
         if base:
-            diff_stat = run_text(['git', 'diff', '--stat', f'{base}..HEAD'], cwd=repo_path)
-            staged = run_text(['git', 'diff', '--cached', '--stat'], cwd=repo_path)
-            unstaged = run_text(['git', 'diff', '--stat'], cwd=repo_path)
-            if not (diff_stat.stdout or '').strip() and not (staged.stdout or '').strip() \
-                    and not (unstaged.stdout or '').strip():
+            committed = run_text(['git', 'diff', '--quiet', f'{base}...HEAD'], cwd=repo_path)
+            staged = run_text(['git', 'diff', '--cached', '--quiet'], cwd=repo_path)
+            unstaged = run_text(['git', 'diff', '--quiet'], cwd=repo_path)
+            untracked = run_text(['git', 'ls-files', '--others', '--exclude-standard'], cwd=repo_path)
+            if committed.returncode == 0 and staged.returncode == 0 and unstaged.returncode == 0 \
+                    and not (untracked.stdout or '').strip():
                 print(f'⚠️  No changes detected (base: {base})')
                 print(f'   Nothing to review — your branch is identical to {base}.')
                 print(f'   Make some commits or stage changes, then try again.')
@@ -826,6 +828,7 @@ def cmd_review(args: argparse.Namespace) -> None:
         review_focus=args.focus or '',
         max_rounds=max_rounds,
         timeout_sec=timeout,
+        incremental=not getattr(args, 'no_incremental', False),
     )
 
     # Output result
@@ -847,6 +850,7 @@ def _report_to_json(report) -> dict:
         'verdict': str(report.verdict.value) if hasattr(report.verdict, 'value') else str(report.verdict),
         'passed': report.passed,
         'finding_count': report.finding_count,
+        'current_round_finding_count': len(report.findings),
         'findings': [
             {
                 'severity': f.severity,
@@ -882,6 +886,10 @@ def _report_to_json(report) -> dict:
                 {'severity': f.severity, 'path': f.path, 'line': f.line, 'summary': f.summary}
                 for f in report.resolved_findings
             ],
+            'unverified_findings': [
+                {'severity': f.severity, 'path': f.path, 'line': f.line, 'summary': f.summary}
+                for f in report.unverified_findings
+            ],
         }
 
     if report.error:
@@ -911,14 +919,15 @@ def _print_review_markdown(report) -> None:
         print()
 
     # Show findings with status if incremental
-    if report.findings:
+    if report.findings or (report.is_incremental and report.finding_statuses):
         if report.is_incremental and report.finding_statuses:
             new_count = sum(1 for fs in report.finding_statuses if fs.status == 'new')
             persistent_count = sum(1 for fs in report.finding_statuses if fs.status == 'persistent')
-            print(f'🔎 Findings ({report.finding_count}): {new_count} new, {persistent_count} persistent')
+            unverified_count = sum(1 for fs in report.finding_statuses if fs.status == 'unverified')
+            print(f'🔎 Findings ({report.finding_count}): {new_count} new, {persistent_count} persistent, {unverified_count} unverified')
             for fs in report.finding_statuses:
                 f = fs.finding
-                status_icon = '🆕' if fs.status == 'new' else '🔄'
+                status_icon = {'new': '🆕', 'persistent': '🔄', 'unverified': '❔'}.get(fs.status, '•')
                 loc = ''
                 if f.path:
                     loc = f' ({f.path}'
@@ -1005,13 +1014,14 @@ def main() -> None:
     review_p.add_argument('pr_url', nargs='?', default=None, help='GitHub PR URL (optional; omit for local diff)')
     review_p.add_argument('--repo', '-r', default=None, help='Repository path (default: cwd)')
     review_p.add_argument('--base', '-b', default=None, help='Base branch for local diff (default: auto-detect)')
-    review_p.add_argument('--backend', default='opencode', help='Backend agent (opencode, claude-code, copilot, codex)')
+    review_p.add_argument('--backend', default=None, help='Backend agent (opencode, claude-code, copilot, codex)')
     review_p.add_argument('--model', '-m', default=None, help='Model override (priority: --model > $AMC_MODEL > .amc.yaml)')
     review_p.add_argument('--rounds', type=int, default=1, help='Max review rounds (default: 1)')
     review_p.add_argument('--format', choices=['markdown', 'json'], default='markdown', help='Output format')
     review_p.add_argument('--focus', '-f', default=None, help='Review focus (e.g. "security", "performance")')
     review_p.add_argument('--timeout', type=int, default=600, help='Per-round timeout in seconds (default: 600)')
     review_p.add_argument('--exit-code', action='store_true', help='Exit with code 1 if review has concerns')
+    review_p.add_argument('--no-incremental', action='store_true', help='Review all current changes and replace prior findings')
 
     # mcp subcommand
     sub.add_parser('mcp', help='Start MCP tool server (stdio)')
