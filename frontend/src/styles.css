@@ -1069,6 +1069,8 @@ code, .mono { font-family: var(--font-mono); }
 /* ── Settings: 模型选择 ─────────────────────────────────── */
 
 .settings-body { grid-template-columns: minmax(0, 1fr); }
+/* Keep focused options clear of the sticky save bar when they scroll into view. */
+.settings-main { scroll-padding-bottom: 104px; }
 .sidebar-toggle.is-hidden { display: none; }
 .icon-btn.is-active { background: var(--surface-hover); color: var(--text); }
 
