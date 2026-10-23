@@ -9,7 +9,8 @@ dependencies = [
   'uvicorn>=0.35.0',
   'pydantic>=2.11.0',
   'pyyaml>=6.0.2',
-  'mcp>=1.0.0',
+  # The MCP server uses the v1 FastMCP API; MCP 2 renamed it and changed APIs.
+  'mcp>=1.0.0,<2',
   'httpx[socks]>=0.27.0',
 ]
 
