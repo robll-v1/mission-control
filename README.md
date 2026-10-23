@@ -4,17 +4,45 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> **Local-first, AI-powered code review console.**
-> Use it as a **Web UI** or a **CLI tool**.
-
-Project design and history: [`docs/project-design-history.md`](docs/project-design-history.md)
-Architecture diagrams: [`docs/architecture-and-sequence-diagrams.md`](docs/architecture-and-sequence-diagrams.md)
+> **Review your changes with the AI agent you already use — on your machine, before you push.**
 
 **[English](#english)** | **[中文](#中文)**
 
----
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/review-dark.png">
+  <img alt="Mission Control review console showing a verdict, severity counts and findings with file:line" src="docs/screenshots/review-light.png">
+</picture>
 
 <a id="english"></a>
+
+## Why Mission Control
+
+**1. Bring your own agent.** Mission Control drives the coding-agent CLI you already have — OpenCode, Claude Code, Codex or Copilot CLI. It detects which ones are installed and which models each can use, and you pick one in the UI. No extra seat, and no API key handed to another service.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/settings-dark.png">
+  <img alt="Model selection page listing the detected agent CLIs and their models" src="docs/screenshots/settings-light.png" width="680">
+</picture>
+
+**2. Reviews exactly what is on disk.** Staged, unstaged and untracked changes are captured into a snapshot commit through a temporary git index, and the agent reviews that snapshot in an isolated worktree. Your index, your `HEAD` and your working files are never touched, and the patch the agent reads always matches the files it can open.
+
+**3. Findings that survive the next round.** Each finding has a severity and a `file:line`, and is tracked across rounds as new, persistent or unverified. A problem is not marked fixed just because the model forgot to mention it again. Results come out as Markdown or JSON, with an exit code for CI or for another agent to act on.
+
+## How it compares
+
+| | Mission Control | [CodeRabbit](https://www.coderabbit.ai) | [GitHub Copilot code review](https://docs.github.com/en/copilot) | [PR-Agent](https://github.com/The-PR-Agent/pr-agent) |
+|---|---|---|---|---|
+| Runs | Your machine | Hosted service (PR bot + CLI) | GitHub / VS Code | Self-hosted, usually in CI |
+| Model | Any model your agent CLI supports | Chosen by the vendor | Chosen by GitHub | Any, with your own API key |
+| Extra cost | None beyond your agent | Subscription | Copilot plan | Your API usage |
+| Uncommitted local changes | Yes | Yes (CLI) | Yes (VS Code) | No, PR-focused |
+| Open source | Yes (MIT) | No | No | Yes |
+
+<sub>Compiled October 2026 from public documentation. Corrections welcome.</sub>
+
+More reading: [design and history](docs/project-design-history.md) · [architecture and sequence diagrams](docs/architecture-and-sequence-diagrams.md)
+
+---
 
 ## Quick Start
 
@@ -79,7 +107,7 @@ amc start --no-browser      # skip browser open
 Mission Control automates code review by:
 1. Ingesting a GitHub PR (or local git diff)
 2. Compiling context from your repo (keyword extraction + file scoring)
-3. Running structured review rounds through an AI agent ([OpenCode](https://github.com/opencode-ai/opencode))
+3. Running structured review rounds through your agent CLI (OpenCode, Claude Code, Codex or Copilot CLI)
 4. Extracting structured findings (severity / file / line)
 5. Enforcing review policy (blocks dangerous commands)
 
@@ -335,11 +363,34 @@ pytest -q
 
 # Mission Control（中文文档）
 
-> **本地优先、AI 驱动的代码审查控制台。**
-> 可作为 Web UI 或 CLI 工具使用；MCP 代码保留但已归档。
+> **用你已经在用的 AI Agent，在本地、push 之前审查你的改动。**
 
-项目设计与开发历程：[`docs/project-design-history.md`](docs/project-design-history.md)
-架构图与关键时序图：[`docs/architecture-and-sequence-diagrams.md`](docs/architecture-and-sequence-diagrams.md)
+## 为什么选 Mission Control
+
+**1. 直接用你已有的 Agent。** Mission Control 调用你本机已经装好的 coding agent CLI：OpenCode、Claude Code、Codex 或 Copilot CLI。它会自动检测装了哪些、各自能用哪些模型，你在界面里选一个就行。不用再买一份席位，也不用把 API Key 交给另一个服务。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/settings-dark.png">
+  <img alt="模型选择页：列出检测到的 Agent CLI 和各自可用的模型" src="docs/screenshots/settings-light.png" width="680">
+</picture>
+
+**2. 审查的就是你磁盘上的代码。** 已暂存、未暂存和未跟踪的改动会通过一个临时 git index 存成快照 commit，Agent 在隔离的 worktree 里审查这个快照。你的 index、`HEAD` 和工作区文件都不会被改动，Agent 读到的 patch 和它能打开的文件始终一致。
+
+**3. 问题不会在下一轮“消失”。** 每条问题都带严重程度和 `文件:行号`，并在多轮之间标记为新增、持续或待验证。模型这一轮没再提到某个问题，不代表它已经修好。结果可以输出为 Markdown 或 JSON，并提供退出码，方便接入 CI 或交给其他 Agent 继续处理。
+
+## 和同类工具对比
+
+| | Mission Control | [CodeRabbit](https://www.coderabbit.ai) | [GitHub Copilot 代码审查](https://docs.github.com/en/copilot) | [PR-Agent](https://github.com/The-PR-Agent/pr-agent) |
+|---|---|---|---|---|
+| 运行位置 | 你的电脑 | 托管服务（PR 机器人 + CLI） | GitHub / VS Code | 自部署，通常在 CI 中 |
+| 模型 | 你的 Agent CLI 支持的任意模型 | 由厂商决定 | 由 GitHub 决定 | 任意，需自备 API Key |
+| 额外费用 | 无（只用你现有的 Agent） | 订阅 | Copilot 套餐 | 按你的 API 用量 |
+| 未提交的本地改动 | 支持 | 支持（CLI） | 支持（VS Code） | 不支持，面向 PR |
+| 开源 | 是（MIT） | 否 | 否 | 是 |
+
+<sub>根据 2026 年 10 月的公开文档整理，如有错误欢迎指正。</sub>
+
+延伸阅读：[设计与开发历程](docs/project-design-history.md) · [架构图与关键时序图](docs/architecture-and-sequence-diagrams.md)
 
 ## 快速开始
 
@@ -404,7 +455,7 @@ amc start --no-browser      # 不自动打开浏览器
 Mission Control 自动化代码审查流程：
 1. 接入 GitHub PR（或本地 git diff）
 2. 从仓库编译上下文（关键词提取 + 文件评分）
-3. 通过 AI Agent（[OpenCode](https://github.com/opencode-ai/opencode)）执行结构化审查
+3. 通过你的 Agent CLI（OpenCode、Claude Code、Codex 或 Copilot CLI）执行结构化审查
 4. 提取结构化发现（严重程度 / 文件 / 行号）
 5. 执行审查策略（阻止危险命令）
 
