@@ -48,9 +48,9 @@ class PullRequestRefreshError(RuntimeError):
 @dataclass
 class ActiveProcess:
     task_id: str
-    run_id: str
+    run_id: str | None
     process: subprocess.Popen[str] | None
-    worker: threading.Thread
+    worker: threading.Thread | None
 
 
 class ExecutionService:
@@ -91,7 +91,27 @@ class ExecutionService:
         with self._lock:
             if task_id in self._active:
                 raise RuntimeError('a review round is already in progress for this PR')
+            # Reserve the slot atomically with the check. All the prepare work
+            # below used to happen before registration, so two concurrent
+            # starts could both pass the check and launch rounds into the
+            # same worktree.
+            placeholder = ActiveProcess(task_id=task_id, run_id=None, process=None, worker=None)
+            self._active[task_id] = placeholder
+        try:
+            return self._launch_round(task, prompt, review_note, language, placeholder)
+        except BaseException:
+            with self._lock:
+                self._active.pop(task_id, None)
+            raise
 
+    def _launch_round(
+        self,
+        task: Task,
+        prompt: str | None,
+        review_note: str | None,
+        language: str,
+        placeholder: ActiveProcess,
+    ) -> Run:
         adapter = self.adapters.get(task.backend)
         if self.adapter_factory is not None:
             resolved = resolve_backend_config(task.repo_path, backend=task.backend)
@@ -196,9 +216,8 @@ class ExecutionService:
             ),
             daemon=True,
         )
-        placeholder = ActiveProcess(task_id=task.id, run_id=run.id, process=None, worker=worker)
-        with self._lock:
-            self._active[task.id] = placeholder
+        placeholder.run_id = run.id
+        placeholder.worker = worker
         worker.start()
         return run
 
