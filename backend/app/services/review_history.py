@@ -113,14 +113,29 @@ class ReviewHistoryStore:
         except (json.JSONDecodeError, KeyError):
             return []
 
-    def get_last_reviewed_sha(self) -> str | None:
-        """Get the HEAD SHA from the last review."""
-        latest = self.get_latest()
+    def _latest_for_mode(self, mode: str | None) -> ReviewRecord | None:
+        """Most recent record, optionally restricted to one review mode.
+
+        latest.json is overwritten by every review, PR or local, so the
+        local-diff incremental flow must scan history.json instead of blindly
+        trusting it — otherwise a PR review's SHA and findings leak into the
+        next local review as unverified noise.
+        """
+        if mode is None:
+            return self.get_latest()
+        for record in self.get_history():
+            if record.mode == mode:
+                return record
+        return None
+
+    def get_last_reviewed_sha(self, mode: str | None = None) -> str | None:
+        """Get the HEAD SHA from the last review (optionally of a given mode)."""
+        latest = self._latest_for_mode(mode)
         return latest.head_sha if latest else None
 
-    def get_previous_findings(self) -> list[StoredFinding]:
-        """Get findings from the most recent review."""
-        latest = self.get_latest()
+    def get_previous_findings(self, mode: str | None = None) -> list[StoredFinding]:
+        """Get findings from the most recent review (optionally of a given mode)."""
+        latest = self._latest_for_mode(mode)
         return latest.findings if latest else []
 
     # ------------------------------------------------------------------
@@ -170,13 +185,15 @@ class ReviewHistoryStore:
         self,
         new_findings: list[StoredFinding],
         previous_findings: list[StoredFinding] | None = None,
+        *,
+        mode: str | None = None,
     ) -> dict[str, list[FindingStatus]]:
         """Compare new findings against previous to determine status.
 
         Returns dict with keys: 'new', 'persistent', 'resolved'
         """
         if previous_findings is None:
-            previous_findings = self.get_previous_findings()
+            previous_findings = self.get_previous_findings(mode=mode)
 
         # Compute fingerprints
         for f in new_findings:

@@ -172,6 +172,65 @@ def test_incremental_clear_keeps_unmatched_prior_finding(git_repo, tmp_path, iso
     assert history.get_previous_findings() == []
 
 
+def test_pr_history_does_not_seed_local_incremental_review(git_repo, tmp_path, isolated_config, monkeypatch):
+    import subprocess as _sp
+
+    head = _sp.run(
+        ['git', '-C', str(git_repo), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    history = ReviewHistoryStore(str(git_repo))
+    history.save_review(ReviewRecord(
+        review_id='local-1', timestamp=1, head_sha=head, base_ref='main', mode='local_diff',
+        verdict='concerns', findings=[StoredFinding(severity='low', path='a.txt', line=2, summary='local issue')],
+        finding_count=1,
+    ))
+    # A newer PR review overwrites latest.json; its findings must stay out of
+    # the next local incremental review.
+    history.save_review(ReviewRecord(
+        review_id='pr-1', timestamp=2, head_sha=head, base_ref='main', mode='pr',
+        pr_url='https://github.com/org/repo/pull/1',
+        verdict='concerns', findings=[StoredFinding(severity='high', path='other.go', line=9, summary='PR-only issue')],
+        finding_count=1,
+    ))
+
+    engine = ReviewEngine(
+        db_path=str(tmp_path / 'review.db'), runtime_root=str(tmp_path / 'runtime'), backend='opencode',
+    )
+    monkeypatch.setattr(engine, 'start_review', lambda _task_id: None)
+    monkeypatch.setattr(engine, 'wait_for_completion', lambda task_id, **_kwargs: engine._db.get_task(task_id))
+    monkeypatch.setattr(engine, 'get_result', lambda _task_id: ReviewResult(verdict=ReviewVerdict.CLEAR, summary='No issues'))
+    monkeypatch.setattr(engine._db, 'list_runs', lambda _task_id: [Run(task_id='t', backend='opencode', started_at=1)])
+
+    report = engine.review(str(git_repo), base='main')
+
+    assert report.is_incremental
+    summaries = [f.summary for f in report.unverified_findings]
+    assert summaries == ['local issue']
+    assert 'PR-only issue' not in summaries
+
+    # The just-finished local review is now latest; its record must carry the
+    # retained local finding forward, but never the PR one.
+    saved = history.get_latest()
+    assert saved.mode == 'local_diff'
+    assert [f.summary for f in saved.findings] == ['local issue']
+    assert [f.summary for f in history.get_previous_findings(mode='local_diff')] == ['local issue']
+
+
+def test_pr_only_history_yields_no_local_incremental_base(git_repo):
+    history = ReviewHistoryStore(str(git_repo))
+    history.save_review(ReviewRecord(
+        review_id='pr-only', timestamp=1, head_sha='abc123', base_ref='main', mode='pr',
+        pr_url='https://github.com/org/repo/pull/2', verdict='concerns',
+        findings=[StoredFinding(severity='high', path='x.py', line=1, summary='PR finding')],
+        finding_count=1,
+    ))
+
+    assert history.get_last_reviewed_sha(mode='local_diff') is None
+    assert history.get_previous_findings(mode='local_diff') == []
+    # Unfiltered access keeps the old cross-mode behaviour for display uses.
+    assert history.get_last_reviewed_sha() == 'abc123'
+
+
 def test_wait_for_completion_waits_for_worker_cleanup(tmp_path, isolated_config, monkeypatch):
     engine = _engine(tmp_path)
     task = engine._engine.create_task(title='t', repo_path=str(tmp_path))
