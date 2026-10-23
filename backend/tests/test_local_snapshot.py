@@ -6,6 +6,7 @@ from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
 from app.core.execution import ExecutionService
 from app.core.mission_engine import MissionEngine
+from app.core.models import TaskStatus
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
 from app.services.local_review_service import capture_local_snapshot
@@ -37,6 +38,7 @@ def test_snapshot_uses_final_worktree_without_touching_real_index(git_repo, tmp_
     (repo / 'runtime' / 'tasks' / 'old-task').mkdir(parents=True)
     (repo / 'runtime' / 'tasks' / 'old-task' / 'context.json').write_text('generated\n', encoding='utf-8')
     _git(repo, 'add', '-f', 'runtime/tasks/old-task/context.json')
+    (repo / 'runtime' / 'tasks' / 'old-task' / 'context.json').write_text('new generated content\n', encoding='utf-8')
     (repo / '.gitignore').write_text('forced.txt\n', encoding='utf-8')
     (repo / 'forced.txt').write_text('force-added ignored content\n', encoding='utf-8')
     _git(repo, 'add', '-f', 'forced.txt')
@@ -155,4 +157,64 @@ def test_execution_refreshes_local_snapshot_each_round(git_repo, tmp_path, isola
     assert refreshed.local_snapshot_sha != local.snapshot_sha
     assert {'a.txt', 'new.txt'} <= set(refreshed.review_paths)
     assert '+second round changed line' in patch and '+new second round file' in patch
+    db.close()
+
+
+def test_prepare_failure_cleans_worktree_marks_failed_and_allows_retry(git_repo, tmp_path, isolated_config, monkeypatch):
+    (git_repo / 'a.txt').write_text('review me\n', encoding='utf-8')
+    local = build_local_review_source(str(git_repo), base='main')
+    db = Database(str(tmp_path / 'db.sqlite'))
+    mission = MissionEngine(db)
+    artifacts = ArtifactStore(str(tmp_path / 'runtime'))
+    worktrees = WorktreeManager(str(tmp_path / 'runtime'))
+    task = mission.create_task(
+        title=local.title,
+        repo_path=str(git_repo),
+        source_type='local_diff',
+        pr_base_ref=local.base_branch,
+        review_paths=local.changed_files,
+        local_head_sha=local.head_sha,
+        local_snapshot_sha=local.snapshot_sha,
+    )
+    artifacts.write_text(task.id, 'context/local_diff.patch', local.diff_text)
+
+    class FakeAdapter:
+        def make_command(self, **_kwargs):
+            return ['true']
+
+    execution = ExecutionService(
+        db=db,
+        mission=mission,
+        adapters={'opencode': FakeAdapter()},
+        worktrees=worktrees,
+        artifacts=artifacts,
+        contexts=ContextCompiler(artifacts),
+    )
+    monkeypatch.setattr(execution, '_preflight_check', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(execution.contexts, 'build_prompt', lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError('prompt failed')))
+
+    try:
+        execution.start_task(task.id)
+        raise AssertionError('expected prompt preparation to fail')
+    except ValueError as exc:
+        assert str(exc) == 'prompt failed'
+
+    failed = db.get_task(task.id)
+    assert failed.status == TaskStatus.FAILED
+    assert failed.current_stage == 'review_prepare_failed'
+    assert failed.branch_name is None
+    assert failed.worktree_path is None
+    assert not (tmp_path / 'runtime' / 'worktrees' / task.id).exists()
+    assert not _git(git_repo, 'branch', '--list', f'review/{task.id}').stdout.strip()
+
+    monkeypatch.setattr(execution.contexts, 'build_prompt', lambda *_args, **_kwargs: 'retry prompt')
+    monkeypatch.setattr(execution, '_run_task', lambda *_args, **_kwargs: None)
+    run = execution.start_task(task.id)
+    worker = execution._active[task.id].worker
+    worker.join(timeout=2)
+    assert run.id
+    assert db.get_task(task.id).worktree_path
+    with execution._lock:
+        execution._active.pop(task.id, None)
+    worktrees.cleanup_worktree(db.get_task(task.id))
     db.close()

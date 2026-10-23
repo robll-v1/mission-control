@@ -187,6 +187,7 @@ class ReviewHistoryStore:
         result: dict[str, list[FindingStatus]] = {
             'new': [],
             'persistent': [],
+            'unverified': [],
             'resolved': [],
         }
 
@@ -208,12 +209,12 @@ class ReviewHistoryStore:
                     status='new',
                 ))
 
-        # Previous findings not matched in new = resolved
+        # A finding absent from this incremental result was outside the reviewed scope.
         for idx, prev_f in enumerate(previous_findings):
             if idx not in matched_previous:
-                result['resolved'].append(FindingStatus(
+                result['unverified'].append(FindingStatus(
                     finding=prev_f,
-                    status='resolved',
+                    status='unverified',
                 ))
 
         return result

@@ -7,8 +7,9 @@ import pytest
 
 from app.core.db import Database
 from app.core.mission_engine import MissionEngine
-from app.core.models import ReviewResult, ReviewVerdict, Run
+from app.core.models import ReviewResult, ReviewVerdict, Run, TaskStatus
 from app.sdk import ReviewEngine
+from app.services.review_history import ReviewHistoryStore, ReviewRecord, StoredFinding
 
 
 # --- model resolution ------------------------------------------------------
@@ -95,6 +96,99 @@ def test_explicit_backend_does_not_inherit_other_backend_model(tmp_path, isolate
     resolved = _engine(tmp_path, backend='codex')._resolve_review_config(str(tmp_path))
     assert resolved['backend'] == 'codex'
     assert resolved['model'] is None
+
+
+def test_explicit_model_reaches_adapter_factory_over_repo_model(tmp_path, isolated_config, monkeypatch):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    (repo / '.amc.yaml').write_text(
+        'backend:\n  default: opencode\n  opencode:\n    model: repo-model\n', encoding='utf-8'
+    )
+    monkeypatch.chdir(tmp_path)
+    engine = _engine(tmp_path, model='explicit-model')
+    adapter = engine._execution.adapter_factory('opencode', model='repo-model', variant='fast')
+    assert adapter.model == 'explicit-model'
+    assert adapter.variant == 'fast'
+
+
+def test_start_task_preflight_receives_explicit_model_adapter(tmp_path, isolated_config, monkeypatch):
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    (repo / '.amc.yaml').write_text(
+        'backend:\n  default: opencode\n  opencode:\n    model: repo-model\n', encoding='utf-8'
+    )
+    engine = _engine(tmp_path, model='explicit-model')
+    task = engine._engine.create_task(title='review', repo_path=str(repo), backend='opencode')
+    captured = {}
+
+    def capture_adapter(_task, *, adapter=None):
+        captured['adapter'] = adapter
+        raise RuntimeError('stop after adapter selection')
+
+    monkeypatch.setattr(engine._execution, '_preflight_check', capture_adapter)
+    with pytest.raises(RuntimeError, match='stop after adapter selection'):
+        engine._execution.start_task(task.id)
+
+    assert captured['adapter'].model == 'explicit-model'
+
+
+def test_incremental_clear_keeps_unmatched_prior_finding(git_repo, tmp_path, isolated_config, monkeypatch):
+    head = __import__('subprocess').run(
+        ['git', '-C', str(git_repo), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    history = ReviewHistoryStore(str(git_repo))
+    history.save_review(ReviewRecord(
+        review_id='old', timestamp=1, head_sha=head, base_ref='main', mode='local_diff',
+        verdict='concerns', findings=[StoredFinding(severity='high', path='a.txt', line=1, summary='validate input')],
+        finding_count=1,
+    ))
+    engine = ReviewEngine(
+        db_path=str(tmp_path / 'review.db'), runtime_root=str(tmp_path / 'runtime'), backend='opencode',
+    )
+    monkeypatch.setattr(engine, 'start_review', lambda _task_id: None)
+    monkeypatch.setattr(engine, 'wait_for_completion', lambda task_id, **_kwargs: engine._db.get_task(task_id))
+    monkeypatch.setattr(engine, 'get_result', lambda _task_id: ReviewResult(verdict=ReviewVerdict.CLEAR, summary='No issues'))
+    monkeypatch.setattr(engine._db, 'list_runs', lambda _task_id: [Run(task_id='t', backend='opencode', started_at=1)])
+
+    report = engine.review(str(git_repo), base='main')
+
+    assert report.is_incremental
+    assert report.verdict == ReviewVerdict.CONCERNS
+    assert not report.passed
+    assert report.unverified_findings[0].summary == 'validate input'
+    assert 'remain unverified' in report.summary
+    assert history.get_previous_findings()[0].summary == 'validate input'
+
+    second_incremental = engine.review(str(git_repo), base='main')
+    assert second_incremental.is_incremental
+    assert len(second_incremental.unverified_findings) == 1
+    assert history.get_previous_findings()[0].summary == 'validate input'
+
+    full_review = engine.review(str(git_repo), base='main', incremental=False)
+
+    assert not full_review.is_incremental
+    assert full_review.passed
+    assert full_review.unverified_findings == []
+    assert history.get_previous_findings() == []
+
+
+def test_wait_for_completion_waits_for_worker_cleanup(tmp_path, isolated_config, monkeypatch):
+    engine = _engine(tmp_path)
+    task = engine._engine.create_task(title='t', repo_path=str(tmp_path))
+    engine._engine.set_stage(task.id, status=TaskStatus.WAITING_HUMAN, stage='awaiting_next_round')
+    with engine._execution._lock:
+        engine._execution._active[task.id] = None
+
+    def finish_worker(_interval):
+        with engine._execution._lock:
+            engine._execution._active.pop(task.id, None)
+
+    monkeypatch.setattr('app.sdk.time.sleep', finish_worker)
+
+    completed = engine.wait_for_completion(task.id, timeout_sec=1, poll_interval=0.001)
+
+    assert completed.status == TaskStatus.WAITING_HUMAN
+    assert not engine._execution.is_active(task.id)
 
 
 # --- run ordering ----------------------------------------------------------

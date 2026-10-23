@@ -9,9 +9,10 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from app.adapters.base import RunnerAdapter, resolve_executable
-from app.core.config import load_repo_config
+from app.core.config import load_repo_config, resolve_backend_config
 from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
 from app.core.github_ingest import fetch_pull_request
@@ -20,6 +21,7 @@ from app.core.models import EventLevel, Run, Task, TaskStatus
 from app.core.review_policy import prepare_static_review_env
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
+from app.services.local_review_service import capture_local_snapshot
 from app.services.review_result_service import ReviewResultService
 
 
@@ -61,6 +63,7 @@ class ExecutionService:
         worktrees: WorktreeManager,
         artifacts: ArtifactStore,
         contexts: ContextCompiler,
+        adapter_factory=None,
     ):
         self.db = db
         self.mission = mission
@@ -68,14 +71,19 @@ class ExecutionService:
         self.worktrees = worktrees
         self.artifacts = artifacts
         self.contexts = contexts
+        self.adapter_factory = adapter_factory
         self._lock = threading.Lock()
         self._active: dict[str, ActiveProcess] = {}
+
+    def is_active(self, task_id: str) -> bool:
+        with self._lock:
+            return task_id in self._active
 
     def start_task(self, task_id: str, prompt: str | None = None, review_note: str | None = None, language: str = 'zh') -> Run:
         task = self.db.get_task(task_id)
         if task is None:
             raise KeyError(f'task not found: {task_id}')
-        if task.backend not in self.adapters:
+        if task.backend not in self.adapters and self.adapter_factory is None:
             raise BackendUnavailableError(
                 f'backend adapter not found: {task.backend}. '
                 f'Available: {", ".join(sorted(self.adapters)) or "(none)"}'
@@ -84,35 +92,60 @@ class ExecutionService:
             if task_id in self._active:
                 raise RuntimeError('a review round is already in progress for this PR')
 
-        self._preflight_check(task)
+        adapter = self.adapters.get(task.backend)
+        if self.adapter_factory is not None:
+            resolved = resolve_backend_config(task.repo_path, backend=task.backend)
+            adapter = self.adapter_factory(task.backend, model=resolved['model'], variant=resolved['variant'])
+        if adapter is None:
+            raise BackendUnavailableError(f'backend adapter not found: {task.backend}')
+        self._preflight_check(task, adapter=adapter)
 
         task = self._refresh_pull_request_snapshot(task)
+        if task.source_type == 'local_diff':
+            try:
+                task = self._refresh_local_snapshot(task)
+            except Exception:
+                self.worktrees.cleanup_worktree(task)
+                task.branch_name = None
+                task.worktree_path = None
+                self.db.save_task(task)
+                raise
         task = self.mission.set_stage(task.id, status=TaskStatus.INGESTING, stage='prepare_review')
-        branch_name, worktree_path, revision = self.worktrees.ensure_worktree(task)
-        task.branch_name = branch_name
-        task.worktree_path = worktree_path
-        compile_started_at = time.perf_counter()
-        compiled = self.contexts.compile_task(task, worktree_path=worktree_path)
-        compile_context_ms = int((time.perf_counter() - compile_started_at) * 1000)
-        prompt_build_ms = 0
-        prompt_text = prompt
-        if prompt_text is None:
-            prompt_started_at = time.perf_counter()
-            prompt_text = self.contexts.build_prompt(task, compiled, review_note=review_note, language=language)
-            prompt_build_ms = int((time.perf_counter() - prompt_started_at) * 1000)
-        prepare_metrics = {
-            'context_compile_ms': compile_context_ms,
-            'prompt_build_ms': prompt_build_ms,
-            'context_markdown_bytes': compiled.markdown_bytes,
-            'context_json_bytes': compiled.json_bytes,
-            'prompt_bytes': len(prompt_text.encode('utf-8')),
-            'changed_file_count': len(task.review_paths),
-            'patch_count': len(compiled.payload.get('review', {}).get('file_patches', []) or []),
-            'candidate_file_count': len(compiled.payload.get('candidate_files', []) or []),
-            'snippet_count': len(compiled.payload.get('related_snippets', []) or []),
-            'top_level_entry_count': len(compiled.payload.get('repo', {}).get('top_level_entries', []) or []),
-            'recent_commit_count': len(compiled.payload.get('repo', {}).get('recent_commits', []) or []),
-        }
+        try:
+            branch_name, worktree_path, revision = self.worktrees.ensure_worktree(task)
+            task.branch_name = branch_name
+            task.worktree_path = worktree_path
+            compile_started_at = time.perf_counter()
+            compiled = self.contexts.compile_task(task, worktree_path=worktree_path)
+            compile_context_ms = int((time.perf_counter() - compile_started_at) * 1000)
+            prompt_build_ms = 0
+            prompt_text = prompt
+            if prompt_text is None:
+                prompt_started_at = time.perf_counter()
+                prompt_text = self.contexts.build_prompt(task, compiled, review_note=review_note, language=language)
+                prompt_build_ms = int((time.perf_counter() - prompt_started_at) * 1000)
+            prepare_metrics = {
+                'context_compile_ms': compile_context_ms,
+                'prompt_build_ms': prompt_build_ms,
+                'context_markdown_bytes': compiled.markdown_bytes,
+                'context_json_bytes': compiled.json_bytes,
+                'prompt_bytes': len(prompt_text.encode('utf-8')),
+                'changed_file_count': len(task.review_paths),
+                'patch_count': len(compiled.payload.get('review', {}).get('file_patches', []) or []),
+                'candidate_file_count': len(compiled.payload.get('candidate_files', []) or []),
+                'snippet_count': len(compiled.payload.get('related_snippets', []) or []),
+                'top_level_entry_count': len(compiled.payload.get('repo', {}).get('top_level_entries', []) or []),
+                'recent_commit_count': len(compiled.payload.get('repo', {}).get('recent_commits', []) or []),
+            }
+        except Exception:
+            try:
+                self.worktrees.cleanup_worktree(task)
+            except Exception:
+                pass
+            task.branch_name = None
+            task.worktree_path = None
+            self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_prepare_failed')
+            raise
         self.mission.append_event(
             task_id=task.id,
             kind='task.review_context_compiled',
@@ -159,6 +192,7 @@ class ExecutionService:
                 prompt_text,
                 idle_timeout_sec,
                 language,
+                adapter,
             ),
             daemon=True,
         )
@@ -207,6 +241,7 @@ class ExecutionService:
         prompt: str,
         idle_timeout_sec: int,
         language: str = 'en',
+        adapter=None,
     ) -> None:
         task = self.db.get_task(task_id)
         run = next((item for item in self.db.list_runs(task_id) if item.id == run_id), None)
@@ -215,7 +250,7 @@ class ExecutionService:
 
         proc: subprocess.Popen[str] | None = None
         try:
-            adapter = self.adapters[task.backend]
+            adapter = adapter or self.adapters[task.backend]
             cmd = adapter.make_command(task=task, prompt=prompt)
             llm_started_at = time.perf_counter()
             agent_event_count = 0
@@ -466,8 +501,8 @@ class ExecutionService:
                 except OSError:
                     pass
 
-    def _preflight_check(self, task: Task) -> None:
-        adapter = self.adapters.get(task.backend)
+    def _preflight_check(self, task: Task, *, adapter: RunnerAdapter | None = None) -> None:
+        adapter = adapter or self.adapters.get(task.backend)
         if adapter is None:
             raise BackendUnavailableError(
                 f'backend adapter not configured: {task.backend}. '
@@ -615,6 +650,50 @@ class ExecutionService:
                 'reviews': len(pull_request.reviews),
                 'comments': len(pull_request.issue_comments) + len(pull_request.review_comments),
                 'artifact_paths': [pr_json_path, pr_md_path],
+            },
+        )
+        return self.db.get_task(task.id) or task
+
+    def _refresh_local_snapshot(self, task: Task) -> Task:
+        """Recapture local changes before every review round."""
+        repo = Path(task.repo_path).resolve()
+        candidates = (
+            self.artifacts.runtime_root / 'tasks',
+            self.db.path,
+            self.worktrees._worktrees_root_for_repo(task.repo_path),
+            Path(f'{self.db.path}-journal'),
+            Path(f'{self.db.path}-wal'),
+            Path(f'{self.db.path}-shm'),
+        )
+        generated_paths: list[str] = []
+        for path in candidates:
+            absolute = path.resolve()
+            try:
+                generated_paths.append(absolute.relative_to(repo).as_posix())
+            except ValueError:
+                continue
+        previous_head = task.local_head_sha
+        previous_snapshot = task.local_snapshot_sha
+        head_sha, snapshot_sha, base, changed_files, patch = capture_local_snapshot(
+            str(repo), task.pr_base_ref, generated_paths=generated_paths,
+        )
+        task.local_head_sha = head_sha
+        task.local_snapshot_sha = snapshot_sha
+        task.pr_base_ref = base
+        task.review_paths = changed_files
+        task.updated_at = time.time()
+        self.db.save_task(task)
+        patch_path = self.artifacts.write_text(task.id, 'context/local_diff.patch', patch)
+        self.mission.append_event(
+            task_id=task.id,
+            kind='task.local_snapshot_refreshed',
+            payload={
+                'previous_head_sha': previous_head,
+                'head_sha': head_sha,
+                'previous_snapshot_sha': previous_snapshot,
+                'snapshot_sha': snapshot_sha,
+                'changed_files': len(changed_files),
+                'artifact_path': patch_path,
             },
         )
         return self.db.get_task(task.id) or task

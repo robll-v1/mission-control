@@ -120,7 +120,7 @@ def capture_local_snapshot(
             pathspecs.extend((f':(exclude){generated}/**', f':(exclude){generated}'))
         if excluded_paths:
             remove_generated = run_git(
-                repo, ['rm', '-r', '--cached', '--ignore-unmatch', '--', *excluded_paths], timeout=60, env=env,
+                repo, ['rm', '-r', '-f', '--cached', '--ignore-unmatch', '--', *excluded_paths], timeout=60, env=env,
             )
             if remove_generated.returncode:
                 raise RuntimeError(remove_generated.stderr.strip() or 'failed to exclude generated files from snapshot')

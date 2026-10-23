@@ -18,6 +18,7 @@ from typing import Iterator
 
 from app.adapters import get_adapter, AVAILABLE_BACKENDS
 from app.core.context_compiler import ContextCompiler
+from app.core.config import resolve_backend_config
 from app.core.db import Database
 from app.core.execution import ExecutionService
 from app.core.github_ingest import fetch_pull_request, is_github_pr_url
@@ -68,6 +69,7 @@ class ReviewReport:
     # Incremental review fields
     finding_statuses: list[FindingStatus] = field(default_factory=list)
     resolved_findings: list[StoredFinding] = field(default_factory=list)
+    unverified_findings: list[StoredFinding] = field(default_factory=list)
     is_incremental: bool = False
     previous_sha: str | None = None
     inferred_focus: str = ''
@@ -90,22 +92,23 @@ class ReviewEngine:
         db_path: str = 'data/amc.db',
         runtime_root: str = 'runtime',
         language: str = 'en',
-        backend: str = 'opencode',
+        backend: str | None = None,
         model: str | None = None,
     ):
         self.language = language
-        self.backend_name = backend
-
-        # Model resolution: explicit param > env var > .amc.yaml > None (use backend default)
-        self.model = model or self._resolve_model()
+        self._explicit_backend = backend
+        self._explicit_model = model
+        initial = self._resolve_review_config('.')
+        self.backend_name = str(initial['backend'])
+        self.model = initial['model']
 
         self._db = Database(db_path)
         self._engine = MissionEngine(self._db)
         # direct_api backend doesn't use subprocess adapters
-        if backend == 'direct_api':
+        if self.backend_name == 'direct_api':
             self._adapters = {}
         else:
-            self._adapters = {self.backend_name: get_adapter(self.backend_name, model=self.model)}
+            self._adapters = {self.backend_name: get_adapter(self.backend_name, model=self.model, variant=initial['variant'])}
         self._worktrees = WorktreeManager(runtime_root)
         self._artifacts = ArtifactStore(runtime_root)
         self._contexts = ContextCompiler(self._artifacts)
@@ -116,6 +119,9 @@ class ReviewEngine:
             worktrees=self._worktrees,
             artifacts=self._artifacts,
             contexts=self._contexts,
+            adapter_factory=lambda name, *, model=None, variant=None: get_adapter(
+                name, model=self._explicit_model or model, variant=variant,
+            ),
         )
         self._validation = ValidationService(
             db=self._db,
@@ -134,29 +140,13 @@ class ReviewEngine:
         ``except Exception``, so configured models were silently ignored and
         only ``--model`` / ``$AMC_MODEL`` ever took effect.
         """
-        import os
+        return self._resolve_review_config(repo_path)['model']
 
-        env_model = os.environ.get('AMC_MODEL', '').strip()
-        if env_model:
-            return env_model
-
-        from app.core.config import load_repo_config
-        config = load_repo_config(repo_path)
-        backend_config = config.get('backend', {})
-        if not isinstance(backend_config, dict):
-            return None
-
-        def _model_of(key: str) -> str:
-            section = backend_config.get(key)
-            if not isinstance(section, dict):
-                return ''
-            return str(section.get('model') or '').strip()
-
-        # Backend-specific first, then whatever the configured default backend uses.
-        return (
-            _model_of(self.backend_name)
-            or _model_of(str(backend_config.get('default', 'opencode')))
-            or None
+    def _resolve_review_config(self, repo_path: str, *, backend: str | None = None) -> dict:
+        return resolve_backend_config(
+            repo_path,
+            backend=backend if backend is not None else self._explicit_backend,
+            model=self._explicit_model,
         )
 
     # ------------------------------------------------------------------
@@ -180,6 +170,10 @@ class ReviewEngine:
         repo = Path(repo_path).resolve()
         if not repo.exists():
             raise ValueError(f'repo_path does not exist: {repo_path}')
+
+        resolved = self._resolve_review_config(str(repo))
+        self.backend_name = str(resolved['backend'])
+        self.model = resolved['model']
 
         if pr_url:
             return self._create_pr_task(str(repo), pr_url, review_focus)
@@ -313,7 +307,7 @@ class ReviewEngine:
             if task is None:
                 raise KeyError(f'task not found: {task_id}')
             task = ReviewResultService.backfill_task(db=self._db, task=task)
-            if task.status in terminal_states:
+            if task.status in terminal_states and not self._execution.is_active(task_id):
                 return task
             time.sleep(poll_interval)
 
@@ -406,6 +400,9 @@ class ReviewEngine:
         """
         start_time = time.time()
         repo = Path(repo_path).resolve()
+        resolved = self._resolve_review_config(str(repo))
+        self.backend_name = str(resolved['backend'])
+        self.model = resolved['model']
         history = ReviewHistoryStore(str(repo))
 
         # --- Incremental: detect last reviewed SHA ---
@@ -414,14 +411,8 @@ class ReviewEngine:
         if incremental and not pr_url:
             previous_sha = history.get_last_reviewed_sha()
             if previous_sha:
-                # Check if we have new commits since last review
-                current_sha = self._get_head_sha(str(repo))
-                if current_sha and current_sha != previous_sha:
-                    is_incremental = True
-                    # Use last reviewed SHA as base for incremental diff
-                    base = previous_sha
-                else:
-                    is_incremental = False  # no new changes
+                is_incremental = True
+                base = previous_sha
 
         # --- Context auto-inference ---
         inferred_focus = review_focus
@@ -488,7 +479,6 @@ class ReviewEngine:
             )
 
         passed = result.verdict == ReviewVerdict.CLEAR
-        can_continue = not passed and rounds_executed < max_rounds
         latest_runs = self._db.list_runs(task.id)
         latest_run = latest_runs[-1] if latest_runs else None
         metrics: dict[str, object] = dict(latest_run.metrics) if latest_run and latest_run.metrics else {}
@@ -496,6 +486,7 @@ class ReviewEngine:
         # --- Finding dedup against history ---
         finding_statuses: list[FindingStatus] = []
         resolved_findings: list[StoredFinding] = []
+        unverified_findings: list[StoredFinding] = []
 
         if is_incremental:
             new_stored = [
@@ -508,8 +499,23 @@ class ReviewEngine:
                 for f in result.findings
             ]
             comparison = history.compare_findings(new_stored)
-            finding_statuses = comparison['new'] + comparison['persistent']
-            resolved_findings = [fs.finding for fs in comparison['resolved']]
+            finding_statuses = comparison['new'] + comparison['persistent'] + comparison['unverified']
+            unverified_findings = [fs.finding for fs in comparison['unverified']]
+
+        report_verdict = result.verdict
+        report_passed = passed
+        report_summary = result.summary
+        report_severity_counts = dict(result.severity_counts)
+        for finding in unverified_findings:
+            report_severity_counts[finding.severity] = report_severity_counts.get(finding.severity, 0) + 1
+        if unverified_findings:
+            if result.verdict == ReviewVerdict.CLEAR:
+                report_verdict = ReviewVerdict.CONCERNS
+                report_passed = False
+            report_summary = (
+                f'{report_summary}\n\n{len(unverified_findings)} earlier finding(s) were not covered by this incremental review and remain unverified.'
+            ).strip()
+        can_continue = not report_passed and rounds_executed < max_rounds
 
         # --- Save review to history ---
         self._save_review_history(
@@ -522,21 +528,23 @@ class ReviewEngine:
             previous_sha=previous_sha,
             duration_sec=time.time() - start_time,
             metrics=metrics,
+            retained_findings=unverified_findings,
         )
 
         return ReviewReport(
             task_id=task.id,
-            verdict=result.verdict,
-            passed=passed,
+            verdict=report_verdict,
+            passed=report_passed,
             findings=result.findings,
-            finding_count=result.finding_count,
-            severity_counts=result.severity_counts,
-            summary=result.summary,
+            finding_count=result.finding_count + len(unverified_findings),
+            severity_counts=report_severity_counts,
+            summary=report_summary,
             rounds_executed=rounds_executed,
             duration_sec=time.time() - start_time,
             can_continue=can_continue,
             finding_statuses=finding_statuses,
             resolved_findings=resolved_findings,
+            unverified_findings=unverified_findings,
             is_incremental=is_incremental,
             previous_sha=previous_sha,
             inferred_focus=inferred_focus,
@@ -616,7 +624,20 @@ class ReviewEngine:
         # Compile context and build prompt
         try:
             compile_started_at = time.perf_counter()
-            compiled = self._contexts.compile_task(task, worktree_path=task.repo_path)
+            if task.source_type == 'local_diff':
+                branch_name, worktree_path, _ = self._worktrees.ensure_worktree(task)
+                task.branch_name = branch_name
+                task.worktree_path = worktree_path
+                self._db.save_task(task)
+                try:
+                    compiled = self._contexts.compile_task(task, worktree_path=worktree_path)
+                finally:
+                    self._worktrees.cleanup_worktree(task)
+                    task.branch_name = None
+                    task.worktree_path = None
+                    self._db.save_task(task)
+            else:
+                compiled = self._contexts.compile_task(task, worktree_path=task.repo_path)
             compile_context_ms = int((time.perf_counter() - compile_started_at) * 1000)
             prompt_started_at = time.perf_counter()
             prompt = self._contexts.build_prompt(task, compiled, language=self.language)
@@ -771,9 +792,10 @@ class ReviewEngine:
         previous_sha: str | None,
         duration_sec: float,
         metrics: dict[str, object],
+        retained_findings: list[StoredFinding] | None = None,
     ) -> None:
         """Append a review to the repo-local history store."""
-        current_sha = self._get_head_sha(str(repo)) or ''
+        current_sha = task.local_head_sha or self._get_head_sha(str(repo)) or ''
         record = ReviewRecord(
             review_id=str(uuid.uuid4())[:8],
             timestamp=time.time(),
@@ -782,7 +804,10 @@ class ReviewEngine:
             mode='pr' if pr_url else 'local_diff',
             pr_url=pr_url,
             focus=focus,
-            verdict=result.verdict.value if hasattr(result.verdict, 'value') else str(result.verdict),
+            verdict=(
+                'concerns' if retained_findings and result.verdict == ReviewVerdict.CLEAR
+                else result.verdict.value if hasattr(result.verdict, 'value') else str(result.verdict)
+            ),
             findings=[
                 StoredFinding(
                     severity=f.severity,
@@ -791,8 +816,8 @@ class ReviewEngine:
                     summary=f.summary,
                 )
                 for f in result.findings
-            ],
-            finding_count=result.finding_count,
+            ] + list(retained_findings or []),
+            finding_count=result.finding_count + len(retained_findings or []),
             duration_sec=duration_sec,
             changed_files=list(task.review_paths) if task.review_paths else [],
             commit_range=(
