@@ -239,6 +239,7 @@ class ReviewEngine:
             base=base,
             review_focus=review_focus,
             context=context,
+            generated_paths=self._generated_paths_for_repo(repo_path),
         )
 
         task = self._engine.create_task(
@@ -251,6 +252,8 @@ class ReviewEngine:
             review_focus=review_focus,
             pr_base_ref=local.base_branch,
             review_paths=local.changed_files,
+            local_head_sha=local.head_sha,
+            local_snapshot_sha=local.snapshot_sha,
         )
 
         # Save local diff as artifact
@@ -822,6 +825,27 @@ class ReviewEngine:
     def _get_commit_messages(repo_path: str, base: str) -> list[str]:
         """Get commit messages since base branch."""
         return get_commit_messages(repo_path, base)
+
+    def _generated_paths_for_repo(self, repo_path: str) -> list[str]:
+        """Get list of generated/runtime paths to exclude from snapshot."""
+        repo = Path(repo_path).resolve()
+        paths = [
+            (self._artifacts.runtime_root / 'tasks').resolve(),
+            self._db.path.resolve(),
+            self._worktrees._worktrees_root_for_repo(str(repo)),
+        ]
+        excluded: list[str] = []
+        for path in paths:
+            try:
+                excluded.append(path.relative_to(repo).as_posix())
+            except ValueError:
+                continue
+        for suffix in ('-journal', '-wal', '-shm'):
+            try:
+                excluded.append(Path(f'{self._db.path}{suffix}').resolve().relative_to(repo).as_posix())
+            except ValueError:
+                continue
+        return excluded
 
     @staticmethod
     def _get_head_sha(repo_path: str) -> str | None:

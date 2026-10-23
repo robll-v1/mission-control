@@ -66,6 +66,37 @@ def test_no_config_means_backend_default(tmp_path, isolated_config, monkeypatch)
     assert _engine(tmp_path).model is None
 
 
+def test_review_resolves_model_from_target_repo_and_explicit_backend_wins(tmp_path, isolated_config, monkeypatch):
+    repo = tmp_path / 'target'
+    repo.mkdir()
+    (repo / '.amc.yaml').write_text(
+        'backend:\n  default: codex\n  codex:\n    model: target-codex\n  opencode:\n    model: target-opencode\n',
+        encoding='utf-8',
+    )
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / '.amc.yaml').write_text(
+        'backend:\n  default: opencode\n  opencode:\n    model: caller-model\n', encoding='utf-8'
+    )
+    engine = _engine(tmp_path, backend=None)
+    assert engine._resolve_review_config(str(repo))['backend'] == 'codex'
+    assert engine._resolve_review_config(str(repo))['model'] == 'target-codex'
+
+    explicit = _engine(tmp_path, backend='opencode', model='forced-model')
+    resolved = explicit._resolve_review_config(str(repo))
+    assert resolved['backend'] == 'opencode'
+    assert resolved['model'] == 'forced-model'
+
+
+def test_explicit_backend_does_not_inherit_other_backend_model(tmp_path, isolated_config, monkeypatch):
+    (tmp_path / '.amc.yaml').write_text(
+        'backend:\n  default: opencode\n  opencode:\n    model: from-opencode\n', encoding='utf-8'
+    )
+    monkeypatch.chdir(tmp_path)
+    resolved = _engine(tmp_path, backend='codex')._resolve_review_config(str(tmp_path))
+    assert resolved['backend'] == 'codex'
+    assert resolved['model'] is None
+
+
 # --- run ordering ----------------------------------------------------------
 
 def test_list_runs_is_ordered_by_round_index(tmp_path):

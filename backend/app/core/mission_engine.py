@@ -27,6 +27,8 @@ class MissionEngine:
         pr_head_sha: str | None = None,
         pr_base_ref: str | None = None,
         review_paths: list[str] | None = None,
+        local_head_sha: str | None = None,
+        local_snapshot_sha: str | None = None,
     ) -> Task:
         now = time.time()
         task = Task(
@@ -44,6 +46,8 @@ class MissionEngine:
             pr_head_sha=pr_head_sha,
             pr_base_ref=pr_base_ref,
             review_paths=review_paths or [],
+            local_head_sha=local_head_sha,
+            local_snapshot_sha=local_snapshot_sha,
             created_at=now,
             updated_at=now,
         )

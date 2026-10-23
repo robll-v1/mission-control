@@ -154,6 +154,10 @@ class WorktreeManager:
                 f'latest PR commit is not available locally: {short_sha}. '
                 'Fetch the PR into the target repository or run the review from the repo you used to push the change.'
             )
+        if task.source_type == 'local_diff' and task.local_snapshot_sha:
+            if self._commit_exists(task.repo_path, task.local_snapshot_sha):
+                return task.local_snapshot_sha
+            raise RuntimeError('captured local review snapshot is no longer available')
         return 'HEAD'
 
     @staticmethod
