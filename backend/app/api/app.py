@@ -20,6 +20,7 @@ from app.core.db import Database
 from app.core.execution import ExecutionService
 from app.core.mission_engine import MissionEngine
 from app.core.models import TaskStatus
+from app.core.recovery import recover_stale_tasks
 from app.core.validation import ValidationService
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
@@ -78,34 +79,11 @@ def _prune_startup_worktrees() -> None:
             continue
 
 
-def _recover_stale_tasks() -> None:
-    """Mark tasks that were left in active states (from a previous crash) as FAILED."""
-    stale_statuses = {TaskStatus.INGESTING, TaskStatus.RUNNING}
-    tasks = db.list_tasks()
-    recovered = 0
-    for task in tasks:
-        if task.status in stale_statuses:
-            logger.warning(
-                'Recovering stale task %s (was %s → marking FAILED)',
-                task.id, task.status,
-            )
-            engine.set_stage(task.id, status=TaskStatus.FAILED, stage='interrupted')
-            engine.append_event(
-                task_id=task.id,
-                run_id=None,
-                kind='task.recovered',
-                payload={
-                    'previous_status': task.status,
-                    'reason': 'Process terminated unexpectedly. Task was recovered on restart.',
-                },
-            )
-            recovered += 1
-    if recovered:
-        logger.info('Recovered %d stale task(s)', recovered)
-
-
+# Recovery runs before pruning: worktree pruning treats VALIDATING (and the
+# other mid-flight statuses) as active and skips those tasks, so the stale
+# states must be cleared first for their worktrees to be cleaned up too.
+recover_stale_tasks(db, engine)
 _prune_startup_worktrees()
-_recover_stale_tasks()
 
 
 @asynccontextmanager
