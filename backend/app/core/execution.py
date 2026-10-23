@@ -48,9 +48,9 @@ class PullRequestRefreshError(RuntimeError):
 @dataclass
 class ActiveProcess:
     task_id: str
-    run_id: str
+    run_id: str | None
     process: subprocess.Popen[str] | None
-    worker: threading.Thread
+    worker: threading.Thread | None
 
 
 class ExecutionService:
@@ -91,7 +91,27 @@ class ExecutionService:
         with self._lock:
             if task_id in self._active:
                 raise RuntimeError('a review round is already in progress for this PR')
+            # Reserve the slot atomically with the check. All the prepare work
+            # below used to happen before registration, so two concurrent
+            # starts could both pass the check and launch rounds into the
+            # same worktree.
+            placeholder = ActiveProcess(task_id=task_id, run_id=None, process=None, worker=None)
+            self._active[task_id] = placeholder
+        try:
+            return self._launch_round(task, prompt, review_note, language, placeholder)
+        except BaseException:
+            with self._lock:
+                self._active.pop(task_id, None)
+            raise
 
+    def _launch_round(
+        self,
+        task: Task,
+        prompt: str | None,
+        review_note: str | None,
+        language: str,
+        placeholder: ActiveProcess,
+    ) -> Run:
         adapter = self.adapters.get(task.backend)
         if self.adapter_factory is not None:
             resolved = resolve_backend_config(task.repo_path, backend=task.backend)
@@ -196,26 +216,57 @@ class ExecutionService:
             ),
             daemon=True,
         )
-        placeholder = ActiveProcess(task_id=task.id, run_id=run.id, process=None, worker=worker)
-        with self._lock:
-            self._active[task.id] = placeholder
+        placeholder.run_id = run.id
+        placeholder.worker = worker
         worker.start()
         return run
 
     def abort_task(self, task_id: str) -> bool:
         with self._lock:
             active = self._active.get(task_id)
-        if active is None or active.process is None:
-            return False
+            if active is None or active.process is None:
+                return False
+            with self.db.locked():
+                run = next((r for r in self.db.list_runs(task_id) if r.id == active.run_id), None)
+                task = self.db.get_task(task_id)
+                if run is None or run.status != 'running' or task is None or task.status == TaskStatus.ABORTED:
+                    return False
+                # Publish cancellation before termination can wake the worker.
+                # Finalisation uses the same lock, so a completed round cannot
+                # accept a late abort while its worktree is being cleaned up.
+                self.mission.set_stage(task_id, status=TaskStatus.ABORTED, stage='aborted')
+                self.mission.append_event(
+                    task_id=task_id,
+                    run_id=active.run_id,
+                    kind='control.accepted',
+                    payload={'action': 'abort'},
+                )
         self._terminate_process(active.process)
-        self.mission.set_stage(task_id, status=TaskStatus.ABORTED, stage='aborted')
-        self.mission.append_event(
-            task_id=task_id,
-            run_id=active.run_id,
-            kind='control.accepted',
-            payload={'action': 'abort'},
-        )
         return True
+
+    def _persist_round_result(self, task_id: str, run: Run, language: str) -> bool:
+        """Commit the result and task state together with respect to abort."""
+        with self.db.locked():
+            task = self.db.get_task(task_id)
+            was_aborted = task is not None and task.status == TaskStatus.ABORTED
+            if was_aborted:
+                run.status = 'aborted'
+                # Partial agent output must never certify a cancelled review.
+                run.review_result = ReviewResultService.extract_result(
+                    events=self.db.list_events(task_id), run=run, language=language
+                )
+            self.db.save_run(run)
+            if task is not None:
+                task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task_id))
+                self.db.save_task(task)
+                if not was_aborted:
+                    completed = run.status == 'completed'
+                    self.mission.set_stage(
+                        task_id,
+                        status=TaskStatus.WAITING_HUMAN if completed else TaskStatus.FAILED,
+                        stage='awaiting_next_round' if completed else 'review_failed',
+                    )
+            return was_aborted
 
     def cleanup_task_worktree(self, task_id: str, *, reason: str = 'manual') -> dict[str, object]:
         task = self.db.get_task(task_id)
@@ -356,14 +407,7 @@ class ExecutionService:
                 'agent_text_bytes': agent_text_bytes,
                 'round_duration_ms': int((run.ended_at - run.started_at) * 1000),
             })
-            self.db.save_run(run)
-            task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task.id))
-            self.db.save_task(task)
-
-            if exit_code == 0:
-                self.mission.set_stage(task.id, status=TaskStatus.WAITING_HUMAN, stage='awaiting_next_round')
-            else:
-                self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
+            was_aborted = self._persist_round_result(task.id, run, language)
 
             if run.review_result is not None:
                 self.mission.append_event(
@@ -395,6 +439,7 @@ class ExecutionService:
                     'exit_code': exit_code,
                     'session_id': run.backend_session_id,
                     'round_index': round_index,
+                    **({'reason': 'aborted'} if was_aborted else {}),
                     'verdict': run.review_result.verdict if run.review_result is not None else None,
                     'finding_count': run.review_result.finding_count if run.review_result is not None else 0,
                     'severity_counts': run.review_result.severity_counts if run.review_result is not None else {},
@@ -419,9 +464,7 @@ class ExecutionService:
                 'agent_text_bytes': agent_text_bytes if 'agent_text_bytes' in locals() else 0,
                 'round_duration_ms': int((run.ended_at - run.started_at) * 1000),
             })
-            self.db.save_run(run)
-            task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task.id))
-            self.db.save_task(task)
+            was_aborted = self._persist_round_result(task.id, run, language)
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
@@ -429,7 +472,6 @@ class ExecutionService:
                 level=EventLevel.ERROR,
                 payload={'message': str(exc), 'type': exc.__class__.__name__, 'round_index': round_index},
             )
-            self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_failed')
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
@@ -444,7 +486,7 @@ class ExecutionService:
                 payload={
                     'exit_code': run.exit_code,
                     'session_id': run.backend_session_id,
-                    'reason': 'idle_timeout' if isinstance(exc, IdleTimeoutError) else 'exception',
+                    'reason': 'aborted' if was_aborted else ('idle_timeout' if isinstance(exc, IdleTimeoutError) else 'exception'),
                     'round_index': round_index,
                     'verdict': run.review_result.verdict if run.review_result is not None else 'failed',
                     'finding_count': run.review_result.finding_count if run.review_result is not None else 0,

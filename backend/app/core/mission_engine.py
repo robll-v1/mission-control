@@ -65,19 +65,25 @@ class MissionEngine:
         return task
 
     def set_stage(self, task_id: str, *, status: TaskStatus, stage: str) -> Task:
-        task = self.db.get_task(task_id)
-        if task is None:
-            raise KeyError(f'task not found: {task_id}')
-        task.status = status
-        task.current_stage = stage
-        task.updated_at = time.time()
-        self.db.save_task(task)
-        self.append_event(
-            task_id=task.id,
-            kind='task.stage_changed',
-            payload={'status': task.status, 'stage': task.current_stage},
-        )
-        return task
+        with self.db.locked():
+            task = self.db.get_task(task_id)
+            if task is None:
+                raise KeyError(f'task not found: {task_id}')
+            if task.status == TaskStatus.ABORTED and status != TaskStatus.INGESTING:
+                # An accepted abort is final for the round. Worker finalisation
+                # racing the abort (exit handling, result extraction) must not
+                # repaint the task as failed; only starting a new round may.
+                return task
+            task.status = status
+            task.current_stage = stage
+            task.updated_at = time.time()
+            self.db.save_task(task)
+            self.append_event(
+                task_id=task.id,
+                kind='task.stage_changed',
+                payload={'status': task.status, 'stage': task.current_stage},
+            )
+            return task
 
     def append_event(
         self,
@@ -89,20 +95,21 @@ class MissionEngine:
         run_id: str | None = None,
         touch_task: bool = True,
     ) -> Event:
-        seq = len(self.db.list_events(task_id)) + 1
-        event = Event(
-            task_id=task_id,
-            run_id=run_id,
-            seq=seq,
-            ts=time.time(),
-            kind=kind,
-            level=level,
-            payload=payload,
-        )
-        self.db.append_event(event)
-        if touch_task:
-            task = self.db.get_task(task_id)
-            if task is not None:
-                task.updated_at = event.ts
-                self.db.save_task(task)
-        return event
+        with self.db.locked():
+            seq = len(self.db.list_events(task_id)) + 1
+            event = Event(
+                task_id=task_id,
+                run_id=run_id,
+                seq=seq,
+                ts=time.time(),
+                kind=kind,
+                level=level,
+                payload=payload,
+            )
+            self.db.append_event(event)
+            if touch_task:
+                task = self.db.get_task(task_id)
+                if task is not None:
+                    task.updated_at = event.ts
+                    self.db.save_task(task)
+            return event

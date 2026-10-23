@@ -406,10 +406,13 @@ class ReviewEngine:
         history = ReviewHistoryStore(str(repo))
 
         # --- Incremental: detect last reviewed SHA ---
+        # Only local-diff history counts here: a PR review's base SHA and
+        # findings describe a different change set and must not seed a local
+        # incremental review.
         previous_sha = None
         is_incremental = False
         if incremental and not pr_url:
-            previous_sha = history.get_last_reviewed_sha()
+            previous_sha = history.get_last_reviewed_sha(mode='local_diff')
             if previous_sha:
                 is_incremental = True
                 base = previous_sha
@@ -498,7 +501,7 @@ class ReviewEngine:
                 )
                 for f in result.findings
             ]
-            comparison = history.compare_findings(new_stored)
+            comparison = history.compare_findings(new_stored, mode='local_diff')
             finding_statuses = comparison['new'] + comparison['persistent'] + comparison['unverified']
             unverified_findings = [fs.finding for fs in comparison['unverified']]
 

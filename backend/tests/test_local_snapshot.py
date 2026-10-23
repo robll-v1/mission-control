@@ -122,6 +122,38 @@ def test_worktree_and_compiled_context_use_the_captured_snapshot(git_repo, tmp_p
     db.close()
 
 
+def test_deleted_and_space_path_files_reach_the_review_prompt(git_repo, tmp_path, isolated_config):
+    (git_repo / 'my file.txt').write_text('space content\n', encoding='utf-8')
+    (git_repo / 'a.txt').unlink()  # a.txt exists in HEAD, so this is a deletion
+    local = build_local_review_source(str(git_repo), base='main')
+    db = Database(str(tmp_path / 'db.sqlite'))
+    mission = MissionEngine(db)
+    task = mission.create_task(
+        title=local.title,
+        repo_path=str(git_repo),
+        source_type='local_diff',
+        pr_base_ref=local.base_branch,
+        review_paths=local.changed_files,
+        local_head_sha=local.head_sha,
+        local_snapshot_sha=local.snapshot_sha,
+    )
+    artifacts = ArtifactStore(str(tmp_path / 'runtime'))
+    artifacts.write_text(task.id, 'context/local_diff.patch', local.diff_text)
+    worktrees = WorktreeManager(str(tmp_path / 'runtime'))
+    _, worktree_path, _ = worktrees.ensure_worktree(task)
+    task.branch_name = f'review/{task.id}'
+    task.worktree_path = worktree_path
+    compiled = ContextCompiler(artifacts).compile_task(task, worktree_path=worktree_path)
+
+    assert {'my file.txt', 'a.txt'} <= set(local.changed_files)
+    patches = {item['path']: item for item in compiled.payload['review']['file_patches']}
+    assert '+space content' in patches['my file.txt']['patch']
+    assert patches['a.txt']['status'] == 'deleted'
+    assert '-two' in patches['a.txt']['patch']
+    worktrees.cleanup_worktree(task)
+    db.close()
+
+
 def test_execution_refreshes_local_snapshot_each_round(git_repo, tmp_path, isolated_config):
     (git_repo / 'a.txt').write_text('first round\n', encoding='utf-8')
     local = build_local_review_source(str(git_repo), base='main')

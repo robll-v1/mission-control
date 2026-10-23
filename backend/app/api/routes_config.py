@@ -3,7 +3,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.core.backend_detector import BackendDetector, ModelFilter
-from app.core.config import DEFAULT_CONFIG, save_global_config, load_global_config
+from app.core.config import (
+    DEFAULT_CONFIG,
+    ConfigError,
+    global_config_lock,
+    load_global_config,
+    save_global_config,
+)
 
 router = APIRouter(prefix='/api/config', tags=['config'])
 
@@ -104,22 +110,35 @@ def save_config(request: SaveConfigRequest):
     try:
         if not request.backend.strip():
             raise HTTPException(status_code=400, detail='backend is required')
-        config = load_global_config()
-        backend_config = config.setdefault('backend', {})
-        if not isinstance(backend_config, dict):
-            backend_config = {}
-            config['backend'] = backend_config
-        backend_config['default'] = request.backend
-        selected = backend_config.setdefault(request.backend, {})
-        if not isinstance(selected, dict):
-            selected = {}
-            backend_config[request.backend] = selected
-        selected['model'] = request.model
-        if request.variant is not None:
-            selected['variant'] = request.variant
-
-        # Save to global config
-        save_global_config(config)
+        try:
+            with global_config_lock:
+                # strict load: a corrupt file must abort the save, not be
+                # silently treated as empty and overwritten.
+                config = load_global_config(strict=True)
+                backend_config = config.setdefault('backend', {})
+                if not isinstance(backend_config, dict):
+                    backend_config = {}
+                    config['backend'] = backend_config
+                backend_config['default'] = request.backend
+                selected = backend_config.setdefault(request.backend, {})
+                if not isinstance(selected, dict):
+                    selected = {}
+                    backend_config[request.backend] = selected
+                selected['model'] = request.model
+                if request.variant is not None:
+                    selected['variant'] = request.variant
+                # Save inside the same lock: the atomic replace below prevents
+                # torn files, but only serialising the whole read-modify-write
+                # prevents one concurrent save from erasing another's backend.
+                save_global_config(config)
+        except ConfigError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    'Global config file is unreadable and was NOT overwritten. '
+                    f'Repair or remove it first, then save again. ({exc})'
+                ),
+            ) from exc
 
         from app.core.config import _global_config_path
         config_path = str(_global_config_path())

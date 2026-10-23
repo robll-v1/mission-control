@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
@@ -39,6 +40,12 @@ class Database:
         """Close the underlying connection. Safe to call more than once."""
         with self._lock:
             self.conn.close()
+
+    @contextmanager
+    def locked(self):
+        """Serialize a read-modify-write operation on this shared connection."""
+        with self._lock:
+            yield
 
     def _init_schema(self) -> None:
         with self._lock:

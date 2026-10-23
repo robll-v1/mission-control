@@ -61,32 +61,34 @@ def _message(key: str, language: str) -> str:
 class ReviewResultService:
     @staticmethod
     def backfill_task(*, db: Database, task: Task) -> Task:
-        rounds = db.list_runs(task.id)
-        events = db.list_events(task.id)
-        updated = False
-        for run in rounds:
-            if run.review_result is None and run.status in {'completed', 'failed'}:
-                run.review_result = ReviewResultService.extract_result(events=events, run=run)
-                db.save_run(run)
+        with db.locked():
+            task = db.get_task(task.id) or task
+            rounds = db.list_runs(task.id)
+            events = db.list_events(task.id)
+            updated = False
+            for run in rounds:
+                if run.review_result is None and run.status in {'completed', 'failed'}:
+                    run.review_result = ReviewResultService.extract_result(events=events, run=run)
+                    db.save_run(run)
+                    updated = True
+            latest_round = rounds[-1] if rounds else None
+            if latest_round is not None and task.status in {TaskStatus.RUNNING, TaskStatus.INGESTING, TaskStatus.VALIDATING}:
+                if latest_round.status == 'completed':
+                    task.status = TaskStatus.WAITING_HUMAN
+                    task.current_stage = 'awaiting_next_round'
+                    updated = True
+                elif latest_round.status == 'failed':
+                    task.status = TaskStatus.FAILED
+                    task.current_stage = 'review_failed'
+                    updated = True
+            latest = ReviewResultService.latest_result(db.list_runs(task.id))
+            if latest != task.latest_review_result:
+                task.latest_review_result = latest
                 updated = True
-        latest_round = rounds[-1] if rounds else None
-        if latest_round is not None and task.status in {TaskStatus.RUNNING, TaskStatus.INGESTING, TaskStatus.VALIDATING}:
-            if latest_round.status == 'completed':
-                task.status = TaskStatus.WAITING_HUMAN
-                task.current_stage = 'awaiting_next_round'
-                updated = True
-            elif latest_round.status == 'failed':
-                task.status = TaskStatus.FAILED
-                task.current_stage = 'review_failed'
-                updated = True
-        latest = ReviewResultService.latest_result(db.list_runs(task.id))
-        if latest != task.latest_review_result:
-            task.latest_review_result = latest
-            updated = True
-        if updated:
-            db.save_task(task)
-            return db.get_task(task.id) or task
-        return task
+            if updated:
+                db.save_task(task)
+                return db.get_task(task.id) or task
+            return task
 
     @staticmethod
     def extract_result(*, events: list[Event], run: Run, language: str = DEFAULT_LANGUAGE) -> ReviewResult:
@@ -217,6 +219,8 @@ class ReviewResultService:
 
     @staticmethod
     def _derive_verdict(*, run: Run, findings: list[ReviewFinding], text: str) -> ReviewVerdict:
+        if run.status == 'aborted':
+            return ReviewVerdict.INCONCLUSIVE
         if run.status == 'failed':
             return ReviewVerdict.FAILED
         if findings:
