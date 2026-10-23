@@ -19,6 +19,11 @@
 
 **1. Bring your own agent.** Mission Control drives the coding-agent CLI you already have — OpenCode, Claude Code, Codex or Copilot CLI. It detects which ones are installed and which models each can use, and you pick one in the UI. No extra seat, and no API key handed to another service.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/settings-dark.png">
+  <img alt="Model selection page listing the detected agent CLIs and their models" src="docs/screenshots/settings-light.png" width="680">
+</picture>
+
 **2. Reviews exactly what is on disk.** Staged, unstaged and untracked changes are captured into a snapshot commit through a temporary git index, and the agent reviews that snapshot in an isolated worktree. Your index, your `HEAD` and your working files are never touched, and the patch the agent reads always matches the files it can open.
 
 **3. Findings that survive the next round.** Each finding has a severity and a `file:line`, and is tracked across rounds as new, persistent or unverified. A problem is not marked fixed just because the model forgot to mention it again. Results come out as Markdown or JSON, with an exit code for CI or for another agent to act on.
@@ -363,6 +368,11 @@ pytest -q
 ## 为什么选 Mission Control
 
 **1. 直接用你已有的 Agent。** Mission Control 调用你本机已经装好的 coding agent CLI：OpenCode、Claude Code、Codex 或 Copilot CLI。它会自动检测装了哪些、各自能用哪些模型，你在界面里选一个就行。不用再买一份席位，也不用把 API Key 交给另一个服务。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/settings-dark.png">
+  <img alt="模型选择页：列出检测到的 Agent CLI 和各自可用的模型" src="docs/screenshots/settings-light.png" width="680">
+</picture>
 
 **2. 审查的就是你磁盘上的代码。** 已暂存、未暂存和未跟踪的改动会通过一个临时 git index 存成快照 commit，Agent 在隔离的 worktree 里审查这个快照。你的 index、`HEAD` 和工作区文件都不会被改动，Agent 读到的 patch 和它能打开的文件始终一致。
 
