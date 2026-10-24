@@ -567,10 +567,15 @@ class ExecutionService:
 
         probe = adapter.probe_command()
         if probe is not None:
+            # 150s, not 60s: the first call after a backend's background
+            # service cold-starts (observed with opencode) can exceed 60s and
+            # must not fail the round with "backend may be unreachable".
+            probe_timeout_sec = 150
             try:
                 result = subprocess.run(
                     probe,
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
+                    capture_output=True, text=True, encoding='utf-8', errors='replace',
+                    timeout=probe_timeout_sec,
                     cwd=task.repo_path,
                 )
                 if result.returncode != 0:
@@ -581,8 +586,8 @@ class ExecutionService:
                     )
             except subprocess.TimeoutExpired:
                 raise PreflightError(
-                    f'{executable} preflight test timed out after 60s. '
-                    f'The LLM backend may be unreachable.'
+                    f'{executable} preflight test timed out after {probe_timeout_sec}s. '
+                    f'The LLM backend may be unreachable or still cold-starting.'
                 )
             except FileNotFoundError:
                 raise PreflightError(f'{executable} executable not found.')
