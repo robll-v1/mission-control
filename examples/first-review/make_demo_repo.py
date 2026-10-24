@@ -129,10 +129,72 @@ def main() -> int:
 
     if args.apply_fix:
         notes = repo / "notes.py"
-        if not notes.exists():
-            print(f"error: {notes} not found", file=sys.stderr)
+        if not notes.is_file() or notes.is_symlink():
+            print(f"error: {notes} is missing or is not a regular file", file=sys.stderr)
             return 1
-        notes.write_text(FIX_NOTES, encoding="utf-8")
+
+        try:
+            root = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            print(f"error: could not inspect Git repo at {repo}: {exc}", file=sys.stderr)
+            return 1
+        if root.returncode != 0 or Path(root.stdout.strip()).resolve() != repo:
+            print(f"error: {repo} is not a generated first-review fixture repo", file=sys.stderr)
+            return 1
+
+        try:
+            baseline = subprocess.run(
+                ["git", "-C", str(repo), "show", "HEAD:notes.py"],
+                capture_output=True,
+                check=False,
+            )
+            identity = subprocess.run(
+                ["git", "-C", str(repo), "show", "-s", "--format=%s", "HEAD"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            print(f"error: could not inspect Git repo at {repo}: {exc}", file=sys.stderr)
+            return 1
+        if (
+            baseline.returncode != 0
+            or baseline.stdout != SAFE_NOTES.encode("utf-8")
+            or identity.returncode != 0
+            or identity.stdout.strip() != "Add note store with parameterized queries"
+        ):
+            print(f"error: {repo} does not have the expected first-review fixture baseline", file=sys.stderr)
+            return 1
+
+        try:
+            current = notes.read_bytes()
+        except OSError as exc:
+            print(f"error: could not read {notes}: {exc}", file=sys.stderr)
+            return 1
+        if current == FIX_NOTES.encode("utf-8"):
+            print(f"Fix is already applied in {repo}.")
+            return 0
+        if current != BUGGY_NOTES.encode("utf-8"):
+            print(
+                f"error: {notes} has unrecognized contents; refusing to overwrite it",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            notes.write_bytes(FIX_NOTES.encode("utf-8"))
+        except OSError as exc:
+            print(f"error: could not write {notes}: {exc}", file=sys.stderr)
+            return 1
         print(f"Fix applied in {repo} (uncommitted, keeps a real LIKE-escaping improvement).")
         return 0
 
@@ -144,10 +206,12 @@ def main() -> int:
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, capture_output=True)
     git(repo, "config", "user.name", "Demo User")
     git(repo, "config", "user.email", "demo@example.com")
-    (repo / "notes.py").write_text(SAFE_NOTES, encoding="utf-8")
+    git(repo, "config", "core.autocrlf", "false")
+    git(repo, "config", "commit.gpgsign", "false")
+    (repo / "notes.py").write_bytes(SAFE_NOTES.encode("utf-8"))
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "Add note store with parameterized queries")
-    (repo / "notes.py").write_text(BUGGY_NOTES, encoding="utf-8")  # uncommitted change
+    (repo / "notes.py").write_bytes(BUGGY_NOTES.encode("utf-8"))  # uncommitted change
 
     print(f"Demo repo ready at {repo}")
     print(f"HEAD is the safe base; the working tree adds an SQL-injection bug in notes.py:search().")

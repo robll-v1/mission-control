@@ -10,10 +10,10 @@ are not committed.
 | Item | Value |
 |---|---|
 | Date | 2026-10-24 |
-| Machine | macOS (arm64), user `robll` |
+| Machine | macOS (arm64) |
 | Backend CLI | opencode v2.0.14 (`~/.opencode/bin/opencode`) |
-| Auth used | Existing login (Z.AI Coding Plan + free tier); nothing installed or purchased |
-| Model (round 1+2) | `opencode/glm-5.3-flash-free` — free tier, no plan quota consumed |
+| Auth used | Existing CLI login; no new account or purchase |
+| Model (round 1+2) | `opencode/glm-5.3-flash-free` — the model identifier reported by the CLI |
 | amc build | Branch `codex/release-readiness-glm`, base `origin/main` @ `7a093bd` (contains PR #21 fixes) |
 | Isolation | `XDG_CONFIG_HOME=$ISOL/config`; the user's `~/.config/amc` was never touched (verified). The review agent only ever saw the synthetic repo |
 
@@ -29,9 +29,8 @@ each run an independent code checkout. The chdir behaviour itself is in
 `cli.py`, which belongs to another workstream and was not modified here.
 
 Real model usage: exactly **two full review rounds** plus a handful of tiny
-"Reply OK" preflight probes. The Z.AI plan itself was quota-exhausted
-(`provider.quota`, resets 2026-10-30), which is why the free-tier model was
-used; the exhaustion was surfaced correctly in the event stream after the
+"Reply OK" preflight probes. The initially selected provider returned quota exhaustion
+(`provider.quota`), so a different model exposed by the CLI was used; the exhaustion was surfaced correctly in the event stream after the
 error-detail fix below.
 
 **Scope of the real-call conclusion:** only `opencode/glm-5.3-flash-free` —
@@ -42,13 +41,16 @@ cannot be verified by detection, which makes no model calls.
 
 ## 2. Fixes made during this acceptance (not demo code — product bugs found live)
 
-1. **opencode adapter used flags the current CLI removed** — `opencode run`
+1. **opencode adapter used flags removed by opencode v2.0.14** — on the
+   tested v2.0.14 CLI, `opencode run`
    has no `--dir` (cwd already set by the executor) and no `--variant`
    (variants are `model#variant`). Old args made every round fail in seconds
    with the CLI's usage text as its summary.
 2. **Preflight probe timeout 60s → 150s** — the first probe after opencode's
    background service cold-starts can exceed 60s (observed: cold >60s, warm
-   8–20s) and failed rounds with "backend may be unreachable".
+   8–20s) and failed rounds with "backend may be unreachable". The preflight
+   subprocess has no cancellation path, so aborting during this wait does not
+   stop it; the caller must wait for the timeout or probe to finish.
 3. **Stream error events kept no detail** — `{"type":"error","error":{…}}`
    lost the nested message, hiding a clear "Weekly/Monthly Limit Exhausted"
    behind a content-less failure.
@@ -142,9 +144,11 @@ Marketing must not present the SDK's unverified-retention as a Web feature.
   parent-repo snapshot. "Reviews what is on disk" means the parent repo.
 - **PATH shim is a guard-rail, not a sandbox** (absolute paths bypass it) —
   already documented in the README.
-- **Claude Code / Copilot / Codex expose no model-listing command**; the
-  Settings page will show an empty model list for them until their CLIs
-  offer enumeration (see §8).
+- **Model enumeration differs by backend.** Codex can enumerate IDs from its
+  local cache and configuration; these are still not account-callability
+  checks. Claude Code and Copilot do not expose model enumeration here, so
+  their lists can be empty while the backend default or a saved model remains
+  selectable.
 
 ## 7. Messaging boundaries (copy guidance)
 
@@ -154,40 +158,64 @@ Accurate phrasing for README / demo narration:
   agent CLI — **not** that model inference is offline.
 - "Uses the agent you already have" means **no extra seat/key for Mission
   Control** — your agent's own model usage and quota still apply.
-- A model list — whether from a CLI query or a cache — is **enumeration,
-  not a permission check**. `opencode models` proves which IDs the CLI
+- A model list — whether from a CLI query, catalog/cache, or local
+  configuration — is **enumeration, not a permission check**. `opencode models` proves which IDs the CLI
   exposes under the current configuration; it does not prove this account
   may call each one. Neither does the catalog cache. Only a model that has
   actually run a round is smoke-verified.
 - The **SDK's unverified retention is CLI/SDK behaviour**, not (yet) a Web
   UI feature — say so explicitly.
 - **Submodules and sandbox caveats** as in §6.
-- Model lists shown in Settings are **enumerated from the installed CLIs**
-  (or honestly empty with a reason) — never a curated hardcoded list.
+- Model lists in Settings can come from a CLI, catalog cache, Codex cache, or
+  local configuration. Where a backend cannot enumerate models, the list is
+  honestly empty with a reason; enumeration never proves account permission.
 
-## 8. 30-second demo script (record after #20 merges)
+## 8. 30-second demo plan (record only after the fixed-diff round is accepted)
 
-1. *(5s)* Terminal: `python3 examples/first-review/make_demo_repo.py /tmp/demo`
-   — "a real bug, a synthetic repo".
-2. *(10s)* `amc review --repo /tmp/demo --backend opencode --model
-   opencode/glm-5.3-flash-free` — point at the console output as it lands:
-   verdict `concerns`, the critical SQL-injection finding at `notes.py:24`.
-3. *(8s)* `--apply-fix`, re-run — scroll to `unverified`: the earlier
-   critical finding is retained, not forgotten. "A problem doesn't disappear
-   just because the model stopped mentioning it."
-4. *(7s)* Cut to the Web UI (screenshot after #20): task list → verdict
-   card → findings with `file:line`.
+1. Seed the synthetic repo and start the first review. Show only the result
+   actually observed: the initial run reported SQL injection at `notes.py:24`.
+2. Apply the fix and confirm the next review has a real, non-empty diff before
+   recording it. This corrected flow has not yet had a live model run; do not
+   predict its verdict, findings, or cross-round statuses.
+3. Show the model selection page and a review result in the merged PR #20 UI.
+
+The 30 seconds describes the edited video length, not review runtime. Waits
+must be cut down and identified as edited rather than presented as model speed.
+Recheck the flow with a fresh run and a current screenshot before filming.
 
 Recording notes: reuse the fixture script for seeding (also useful for the
 README GIF); record light and dark themes separately.
 
-## 9. Frontend handoff (belongs to #20+, not touched here)
+## 9. Frontend integration status
 
 `/api/config/detect` now returns additive `models_source`
 (`cli`/`catalog_cache`/`cache`/`config`/`unknown`), `models_note` and
 `models_call_verified: false` per backend — source and call-availability are
-separate facts, and detection never verifies calls. The Settings page
-currently ignores all three; showing the note where a backend has no
-enumerable models (e.g. Claude Code), or an "enumeration only" hint where a
-list exists, would close the loop. `frontend/src/App.tsx`, `Settings.tsx`,
-`styles.css` were not modified.
+separate facts, and detection never verifies calls. The integration page now
+shows the model-list source and warns that enumeration does not verify account
+call permission. When no list is available, it explains that the backend
+default or an already configured model can still be selected. PR #20 is merged;
+the current frontend also has the follow-up compatibility treatment for older
+API responses that omit source metadata.
+
+## 10. Integrated local acceptance (2026-10-24)
+
+The final integrated working tree was checked locally after combining the GLM,
+Qoder, and WorkBuddy work:
+
+- Backend full suite: `pytest -q` — **147 passed, 1 skipped**, 34.04 seconds,
+  exit code 0.
+- Frontend: `npx tsc --noEmit` and `npm run build` — both passed.
+- Qoder CLI focused tests: **23 passed**; demo-fixture focused tests:
+  **4 passed**. These are automated checks, not a live model review.
+- An independent reviewer accepted the fixture overwrite guard. The guard
+  only applies the fix to the recognized generated fixture and preserves
+  unknown file bytes.
+- The branch has not been pushed; **there is no CI result for this integrated
+  tree**.
+
+The release blocker remains the real fixed-diff second review: the earlier
+second model call reviewed an empty diff, and the corrected non-empty-diff
+flow has not been run with a model. Also not verified here: clean-machine
+installation and a full Web UI flow. The 147-test result and focused tests do
+not substitute for those live checks.

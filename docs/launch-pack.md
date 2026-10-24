@@ -2,10 +2,10 @@
 
 面向**已经在用 AI 编程 CLI**的开发者，可直接审稿后发布。
 
-- 代码基线：`7a093bd`（`main`，已包含 PR #21 / `f90a46e` 的修复），后端 `98 passed, 1 skipped`。
+- 代码基线：`7a093bd`（`main`，已包含 PR #21 / `f90a46e` 的修复），后端 `98 passed, 1 skipped`。本文源码行号均按该基线标注。
 - 本文只写**能从仓库代码或测试里指出位置**的能力。每条承诺都标注证据等级：**已验证** / **实现支持但未实机验证** / **规划**。
 - 卖点是**稳定的输入快照、结构化结论、跨轮追踪**。不靠"你的 agent 审不了未提交代码"这类错误对比做钩子——现有 coding agent 本来就能读未提交内容。
-- 不含真实用户评价、速度提升、百分比收益。演示案例是占位，**验收前不得引用为结果**。
+- 不含真实用户评价、速度提升、百分比收益。合成仓库首轮结果已实测；修复后的非空 diff 复审仍未验收，不得提前引用其跨轮结果。
 - 不重写 README（README 首屏由 #18 负责），不重复截图。
 
 ---
@@ -56,7 +56,7 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 
 ### 价值点三：结论是结构化的，而且下一轮不会替你"宣布修好"
 
-在 **SDK 增量路径**（`incremental=True` 且存在本地历史）下，每条 finding 带 severity 与 `file:line`，跨轮状态为 `new` / `persistent` / `unverified`：再次被提到是 `persistent`，没被提到才是 `unverified`——后者不等于 resolved。Web 界面不走这条聚合逻辑，只看最新一轮。
+在 **SDK 增量路径**（`incremental=True` 且存在本地历史）下，finding 带 severity；只有 agent 提供且可解析的位置才会有 `file:line`，并不保证每条都有。跨轮状态为 `new` / `persistent` / `unverified`：再次被提到是 `persistent`，没被提到才是 `unverified`——后者不等于 resolved。Web 界面不走这条聚合逻辑，只看最新一轮。
 
 | 项 | 内容 |
 |---|---|
@@ -75,22 +75,22 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 
 ### 草稿 A · 角度：输入一致性（pre-push）
 
-> Reviewing uncommitted work is a consistency problem, not a reading problem. The diff you paste, the files the agent opens, and the code you keep editing are three different states.
+> Reviewing uncommitted work is a consistency problem. While you edit, the diff, files the agent opens, and code on disk can be three different states.
 >
-> Mission Control freezes them into one snapshot commit and runs your existing agent CLI on it.
+> Mission Control freezes one snapshot and runs your agent CLI on it.
 
-- 字符数：**275 / 280**
+- 字符数：**218 / 280**
 - 主张对应：价值点二
 - 钩子说明：不写"agent 审不了未提交代码"——它本来就能读。这里说的是**同一份输入**的问题，不是能力有无的问题。
 - 注意：不配"提升 N 倍"之类的图；如果要配图，用现有 `docs/screenshots/review-*.png`，不新拍。
 
 ### 草稿 B · 角度：编排已有 CLI + 结构化结果
 
-> You already run a coding agent CLI. Mission Control turns it into a reviewer: it drives that CLI against a frozen snapshot of your working tree and returns findings with severity and file:line.
+> You already run a coding agent CLI. Mission Control turns it into a reviewer: it drives that CLI against a frozen snapshot and returns severity plus a parseable file:line when the agent supplies one.
 >
 > Login, model access and quota stay with that CLI.
 
-- 字符数：**244 / 280**
+- 字符数：**250 / 280**
 - 主张对应：价值点一 + 价值点三
 - 注意：不要再补"no new key / no cost / works with any model"。后半句已经把归属讲清楚了，加绝对化承诺会和事实冲突（`direct_api` 直连模式还要自己配 key）。
 
@@ -98,9 +98,9 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 
 ## 4. 短线程（4 条，每条 ≤280 字符）
 
-**1/4** — 210 字符
+**1/4** — 224 字符
 
-> Reviewing uncommitted work is a consistency problem, not a reading problem. git diff shows one slice, the agent opens live files, and you keep typing while it reads.
+> Reviewing uncommitted work is a consistency problem, not a reading problem. While files keep changing, git diff shows one slice and the agent may open a different state from disk.
 >
 > So Mission Control freezes the input first.
 
@@ -113,9 +113,9 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 >
 > Your index, HEAD and files are untouched. The patch and the files the agent opens are the same commit.
 
-**3/4** — 199 字符
+**3/4** — 192 字符
 
-> In incremental local reviews (SDK), findings come back with severity + file:line and are tracked as new / persistent / unverified. Mentioned again = persistent. Not mentioned = unverified, not fixed.
+> In incremental local reviews (SDK), findings include a parseable file:line when the agent supplies one. Statuses are new / persistent / unverified. Not mentioned again = unverified, not fixed.
 
 **4/4** — 215 字符
 
@@ -126,8 +126,8 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 
 线程注意：
 - 第 2 条是纯实现描述，`copy ... GIT_INDEX_FILE` 对得上 `local_review_service.py:91`，可以放心发。
-- 第 3 条只说"不会被标为已修复"，没说"自动验证修复"——因为 `resolved` 还没接线；也刻意**没提** JSON / 退出码（见 §6 的分工说明）。
-- 第 4 条里 `amc review` 子命令的**参数与错误处理由 Qoder 分支负责，待最终验收**；验收前先只发 1–3 条，或把第 4 条的启动命令去掉。不要加"5 分钟上手""比 X 快"这类没测过的说法。
+- 第 3 条只说"不会被标为已修复"，没说"自动验证修复"——因为 `resolved` 还没接线。
+- Qoder 的 CLI 自动化验收已通过（23 项 focused tests）；这不代表真实完整修复后复审已验收。不要加"5 分钟上手""比 X 快"这类没测过的说法。
 
 ---
 
@@ -141,9 +141,9 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 
 **三个价值点（口语版）**
 
-1. **不引入第二套模型账号。** 它自己不调模型，而是驱动你本机装的 OpenCode / Claude Code / Copilot / Codex；登录方式、模型权限和订阅额度仍然由那个 CLI 决定，框架只管编排和结果解析。
+1. **复用已有的 Agent CLI。** 它自己不调模型，而是驱动你本机装的 OpenCode / Claude Code / Copilot / Codex；登录方式、模型权限和订阅额度仍然由那个 CLI 决定，框架只管编排和结果解析。
 2. **审的是冻结下来的工作区。** 已暂存、未暂存、未跟踪的改动会被打成一个快照提交，Agent 在独立 worktree 里读；你的 index、HEAD、工作区不被碰，prompt 里的 patch 和它能打开的文件来自同一个 commit。
-3. **结论结构化，跨轮不乱报喜（仅指 SDK 增量审查）。** 在 `incremental=True` 的本地审查里，每条问题带严重程度和 `file:line`，跨轮状态为 new / persistent / unverified：再次被提到是 persistent，没被提到才是 unverified，而不是"已修复"。Web 界面只看最新一轮，不走这套聚合。（Markdown / JSON / 退出码由 CLI 分支验收后再对外讲。）
+3. **结论结构化，跨轮不乱报喜（仅指 SDK 增量审查）。** 在 `incremental=True` 的本地审查里，每条问题有严重程度；agent 提供且可解析位置时才有 `file:line`。跨轮状态为 new / persistent / unverified：再次被提到是 persistent，没被提到才是 unverified，而不是"已修复"。Web 界面只看最新一轮，不走这套聚合。CLI 的 Markdown / JSON / 退出码行为有自动化测试覆盖并已通过；真实完整修复后复审仍未验收。
 
 **中文帖的一条红线**：不要写"自动修复验证""零误报""任意模型都能用""完全免费"。当前 `resolved` 状态没有接线；模型可用性和额度跟着各 CLI 走。
 
@@ -157,11 +157,11 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 | 未提交改动进入审查（快照） | `local_review_service.py:76-167` | 已验证 | "a frozen snapshot of your working tree" |
 | 索引/HEAD/工作区不被修改 | 同上 + `test_local_snapshot.py:24` | 已验证 | "your index and HEAD are never touched" |
 | patch 与可打开文件同源 | `worktree.py:146-161` + `execution.py:699-741` | 已验证 | "the patch and the files are the same commit" |
-| `file:line` + 严重程度 | `review_result_service.py:173-205` | 已验证 | "severity + file:line" |
+| 严重程度与可选位置 | `review_result_service.py:173-205` | 已验证（位置仅在 agent 提供且可解析时出现） | "severity, plus a parseable file:line when the agent provides one" |
 | new / persistent / unverified | `review_history.py:185-238`、`sdk.py:494-520` | 已验证（SDK 增量） | 文案本身必须带 "in incremental local reviews"，不能只靠后文备注补 |
-| Markdown / JSON / 退出码 | `cli.py:1008-1023` | **实现支持，待 Qoder 分支最终验收**；基线无 CLI 自动化测试 | **验收前不写进文案**；不要写"已测试" |
+| Markdown / JSON / 退出码 | `cli.py:1008-1023`（行号按 `7a093bd` 基线） | CLI 自动化测试 23 项通过；真实完整修复后复审仍未验收 | 可说 CLI 格式/退出码有自动化覆盖，不可暗示修复后多轮 E2E 已完成 |
 | Web 实时进度（SSE） | `backend/app/api/routes_stream.py` | 实现支持，未做 UI E2E | 可提，不承诺延迟指标 |
-| 模型自动发现 | `backend/app/core/backend_detector.py` | 实现支持，**含固定兜底列表**，正在另一工作区验收（GLM） | **暂不宣传**，等验收结论 |
+| 模型枚举与来源说明 | `backend/app/core/backend_detector.py` | 已实现并经单元测试；枚举结果不代表账号调用权限 | 只说“本机可枚举模型”，不推断权限或可调用性 |
 | 跨轮 `resolved` | `review_history.py:295`（无调用方） | **未接线**（属规划） | 不许提"自动标记已修复" |
 | pre-commit 集成 | 无 | **规划** | 不提，先看试用反馈 |
 | PATH shim 护栏 | `backend/app/core/review_policy.py:38-77` | 已验证 | 只能叫"guard-rail"，不能叫 sandbox |
@@ -171,25 +171,27 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 
 ---
 
-## 7. 演示案例占位（未验收，禁止提前引用）
+## 7. 演示案例（只引用已实测的首轮）
 
-> **状态：占位。** 在发布验收完成前（由 GLM 在合成仓库做实机记录，验收由 Codex 统一做），下面的字段必须保持为空。**不要**用推测值、截图或旧日志填充，也不要预设问题种类、数量或某一轮的结论。
+首轮已在合成仓库用 `opencode/glm-5.3-flash-free` 实测：模型报告 `notes.py:24` 存在由 f-string SQL 插值导致的注入风险。该位置是这次 agent 实际提供且解析出的结果；不能据此承诺每条 finding 都有位置。详见 [release-readiness.md](release-readiness.md)。
+
+修复后的第二轮**尚未完成有效的非空 diff 复审验收**，因此不在发布文案中写跨轮结果、`unverified` 结果或 finding 数量。修复后的 fixture 只做过离线校验，仍需先重新实测再决定是否录制这段流程。
 
 ```text
-案例编号：DEMO-001（待 GLM 真实记录）
+案例编号：DEMO-001（首轮已实测；修复复审未验收）
 仓库：合成演示仓库（新建，不引用任何真实用户代码）
-输入：（待填：按实际准备的内容记录）
-执行：（待填：实际命令与轮次；跑了几轮就写几轮）
-实际结果：（待填：verdict、每条 finding 的 severity 与 file:line）
-跨轮状态：（待填：按实际输出记录，口径见下）
-采集时间/基线：（待填）
+输入：未提交改动将参数化查询改为 f-string SQL 插值
+执行：首次 `amc review`；修复后第二轮需要有真实非空 diff 并重新验收
+实际结果：首轮为 `concerns`；agent 报出 `notes.py:24` SQL 注入风险
+跨轮状态：第二轮有效修复复审尚未验收，不作结论
+采集时间/基线：见 [release-readiness.md](release-readiness.md)
 ```
 
-跨轮状态口径：**再次被提到是 `persistent`，没被提到才是 `unverified`**。不要预设第二轮一定出现 `unverified`，也不要预设哪条会被"解决"——`resolved` 目前恒为空。
+跨轮状态口径：**再次被提到是 `persistent`，没被提到才是 `unverified`**。不得把此前空 diff 轮次的状态当成有效修复复审结果；不要预设第二轮一定出现某种 finding 或 `unverified`，也不要预设哪条会被"解决"——`resolved` 目前恒为空。
 
 填充规则：
 1. 只填**实际跑出来**的内容，命令、时间、基线 sha 一起记录。
-2. 如果出现"上一轮问题没再被提到、但代码也没改"，**照原样记录**，这正是 `unverified` 语义要说明的点，不要修饰。
+2. 修复后先确认审查输入确有非空 diff，再记录实际结果；等待与剪辑过程需在视频中压缩或标注，30 秒是成片长度，不代表真实运行耗时。
 3. 演示只用于说明流程，不用于证明准确率。
 
 ---
@@ -214,7 +216,7 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 - [ ] **没有** "any model" / "every model" / "no new key" / "no cost" / "free" 这类不归框架管的绝对承诺。
 - [ ] 没有出现具体耗时、准确率、用户数量、用户评价。
 - [ ] 没有出现"自动修复验证""零误报""完全离线""强沙箱"。
-- [ ] CLI 相关的 Markdown / JSON / 退出码表述，已确认 Qoder 分支验收通过；未通过则整句删除。
+- [x] CLI 相关的 Markdown / JSON / 退出码自动化测试已通过（Qoder focused 23 项）；不将其表述为真实修复后复审 E2E。
 - [ ] 演示段落仍是占位，或已由验收记录替换。
 - [ ] 本文引用的路径与测试名均在 `7a093bd` 上存在（测试名以 `grep '^def test_'` 的实际输出为准，不按含义推测）。
 
@@ -232,5 +234,5 @@ Mission Control 不自己调模型。它把 prompt 交给本机已有的 agent C
 | `test_parses_severity_path_and_line`（`test_result_service.py:22`） | 同上 | 一致 |
 | `test_incremental_clear_keeps_unmatched_prior_finding`（`test_sdk_and_db.py:135`） | 同上 | 一致 |
 | `test_unmatched_findings_remain_unverified_across_incremental_rounds`（`test_local_snapshot.py:71`） | 同上 | 一致 |
-| `cli.py:1008-1023`（`init` / `review` / `--format` / `--exit-code`） | 读行内容 | 参数确实存在；**验收归属 Qoder**，不作为已验收证据 |
+| `cli.py:1008-1023`（`init` / `review` / `--format` / `--exit-code`，按 `7a093bd` 基线） | 读行内容 + Qoder CLI focused tests | 参数存在；CLI 自动化验收 23 项通过；未覆盖真实完整修复后复审 |
 | `check_code_modified` 无调用方 | 全仓 grep | 只有定义（`review_history.py:295`），无调用点 |

@@ -26,7 +26,7 @@ Mission Control（命令 `amc`）：本地优先的 AI 代码审查控制台。
 ## 3. 用户偏好
 
 - 用中文沟通。代码、commit、PR 用英文。
-- **UI 里不用系统 emoji**（包括 💡📝🔍 这类）。美化以后统一处理，现阶段保持朴素。`cli.py` 里的 emoji 是历史遗留，还没清理。
+- **UI 里不用系统 emoji**（包括 💡📝🔍 这类）。美化以后统一处理，现阶段保持朴素。本轮 `cli.py` 的历史 emoji 已清理。
 - 设置页的标题叫「模型选择」，不要叫「智能模型选择器」。
 - 模型列表必须从本机动态读取，不能写死（用户实际在用 GPT-6 系列等新模型）。
 - 喜欢直接、真实的评价，不需要客套。
@@ -56,7 +56,7 @@ docs/                    设计历程、架构图、screenshots/
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
-pytest -q                                  # 后端测试（目前 74 passed, 1 skipped）
+pytest -q                                  # 后端测试；数量以当前提交的 CI 为准
 cd frontend && npm ci && npx tsc --noEmit && npm run build
 amc start            # 启动后端 + 前端并打开浏览器；amc stop / amc status
 amc review           # 审查当前仓库的本地改动
@@ -71,7 +71,7 @@ CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.
   - 显式指定了 backend 时，不能继承其他 backend 的 model。
 - **保存配置：** `/api/config/save` 先读出全局配置，只更新 `backend.default` 和所选 backend 的 model/variant，然后原子写入（临时文件 + `os.replace`）。**不能整份覆盖**，否则会丢掉用户的其他配置。
 - **后端检测：**
-  - codex 的模型来自 `~/.codex/models_cache.json`；opencode 的模型来自 `~/.local/share/opencode/opencode.db` 中的 `models-dev:catalog`。
+  - codex 的模型来自本地 cache/config；opencode 优先查询 CLI，再读取本地 catalog cache。来源只证明枚举，不证明账号可调用；无法枚举时保留后端默认和显式配置模型。
   - 检测会阻塞，所以 `routes_config` 里的路由是同步 `def`，由 FastAPI 放进线程池执行。**不要改成 `async def`**，否则会卡住事件循环。
 - **本地快照：** `capture_local_snapshot` 复制真实 index 到一个临时 `GIT_INDEX_FILE`，然后执行 `add -A`、`write-tree`、`commit-tree`，生成一个父提交为 HEAD 的快照 commit。
   - 全程不碰用户的 index、HEAD 和工作区。
@@ -95,32 +95,23 @@ CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.
 
 ## 9. 当前状态（2026-10-24 更新）
 
-审查补充（2026-10-24，Codex，只读源码审查）：
-- 基线 HEAD `316116a`，后端 `75 passed, 1 skipped`；未修改业务代码。
-- 优先待修：本地 diff 的空格路径/删除内容未进入 prompt；同任务并发 start 可创建两轮。
-- 其他已复现：PR/local 历史串用、abort 最终变 failed、损坏 YAML 保存时被覆盖、并发配置保存丢更新、重启恢复遗漏 VALIDATING 且 Run/CheckRun 未收尾。
-- 能力边界：Web 完整轮次结果与 SDK 增量聚合语义不同；部分模型列表仍是固定值；子模块未提交内容不在父仓库快照内；PATH shim 不是强制沙箱。
-
-已合并到 `main`：
-- #17：后端和模型自动检测、设置页（模型选择）、配置真正作用于 Web 审查、本地快照一致性、unverified 状态修复、MCP 固定在 v1。
-
-进行中：
-- **#18** `docs/readme-first-screen`：重写 README 首屏（一句话定位、截图、三个差异点、竞品对比表），中英文都改了。CI 全部通过。**等用户在 GitHub 上看过亮色和暗色两种主题的渲染效果后再合并。**
-
-本地遗留（等用户确认后再清理）：
-- `git stash` 中有两条：`stash@{0}` 是 #17 的工作，已全部提交；`stash@{1}` 是更早的整体备份。
-- 三个未跟踪的草稿文件（见第 2 节第 6 条）。
-- 本地分支 `fix/p1-3-local-snapshot` 已合并，可以删除。
-
-待办（按投入产出排序）：
-1. 给设置页（模型选择）截图，加进 README。
-2. 录一段约 30 秒的 GIF：选模型 → 发起审查 → 看结果。
-3. UI 视觉美化，并清理 `cli.py` 里的 emoji。
-4. 写一篇技术文章：快照一致性和多后端适配，用于面试。
+- PR #17、#18、#19、#20、#21 均已合并；本轮整合基线 `main` / `7a093bd`。
+- 当前分支 `codex/launch-acceptance`：Codex 统一验收 GLM、Qoder、WorkBuddy 的独立工作，尚未合并。GLM 源提交 `0587e1f`，Qoder 源提交 `ad90dab`，WorkBuddy 源提交 `f088429`。
+- GLM：去除模型硬编码兜底，保留来源/未知原因，缓存与 TOML 解析容错；修正本机 opencode v2.0.14 参数和错误详情；补合成示例与真实调用记录。
+- Qoder：CLI 错误可操作、JSON stdout 纯净、失败退出码非零、非正轮数/超时拒绝；清理 CLI emoji。`argparse` 语法错误仍走标准 stderr，JSON 语法错误封装不在本轮范围。
+- WorkBuddy：发布文案及快照/并发/增量设计文章。Codex 已删改夸大表述，并在设置页显示模型来源和调用权限未验证提示。
+- 最终整合工作区后端全量 `pytest -q`：`147 passed, 1 skipped`，34.04s，退出码 0；前端 `npx tsc --noEmit` 与 `npm run build` 通过。Qoder CLI focused 测试 `23 passed`，演示 fixture focused 测试 `4 passed`；独立 reviewer 接受 fixture 防覆盖修复。
+- 这些是本地验收结果；当前尚未 push，因此没有本轮 CI 结论，不能声称 CI 通过。
+- 真实模型首轮已识别合成 SQL 注入；第二轮虽真实调用，但原示例恢复为 HEAD 导致空 diff，**有效修复 diff 复审未验收**。后补示例已离线验证，不允许额外调用或冒充 E2E 通过。
+- 发布判断：工程补强可进入 PR 审查和小范围试用；正式演示推广前，需完成非空修复 diff 的真实复审、干净环境安装与 Web 操作流程验证，再录约 30 秒剪辑演示。
+- 已知边界：150 秒 preflight 阶段不可取消；opencode 旧版本未验证；SDK 增量历史仍基于 HEAD 而非上一轮未提交快照；Web 只看最新一轮，不能宣称有 SDK 增量聚合；子模块内部未提交内容不在父仓库快照中；PATH shim 不是沙箱。
+- 原工作区未由 Codex 切换或修改；他人继续工作后的 HEAD 为 `5055c69`（含截图与 `seed_demo_simple.py` 提交），另有 `frontend/src/styles.css` 未提交改动，均未纳入本轮验收。两份原 stash 的 hash 保持不变；原未跟踪文档/草稿及其他代理 worktree 保留供追溯。
 
 ## 10. 交接日志
 
 每次收工追加一条，最新的放在最上面。格式：日期 · 谁 · 分支/PR · 做了什么 · 没做完或没验证的 · 下一步建议。
+
+- 2026-10-24 · Codex（协调 GLM/Qoder/WorkBuddy）· `codex/launch-acceptance` · 整合模型来源、CLI 边界与发布文案；本地后端全量 `147 passed, 1 skipped`（34.04s，exit 0）、前端 tsc/build 通过；CLI focused 23 项、fixture focused 4 项通过，fixture 补修获独立 reviewer ACCEPT · 未 push，故无 CI 结论；真实非空修复 diff 复审、干净安装、Web E2E 未验收 · 先小范围试用，完成发布门槛后再录演示。
 
 - 2026-10-24 · Codex · `docs/readme-first-screen` / HEAD `316116a` · 4 个只读 subagent 分域探索，父代理和独立 reviewer 复跑临时复现；确认上述遗留问题，未改业务代码或用户数据 · 未做真实 Agent/Web E2E 与 Windows 路径攻击验证 · 优先修 diff 解析遗漏和并发启动；细节见本轮审查报告。
 - 2026-10-24 · Claude · #18 · README 首屏重写已推送，PR 已开，CI 全部通过 · 还没在 GitHub 上看实际渲染效果 · 用户合并 #18 后，从待办第 1 项开始。

@@ -1,7 +1,7 @@
 # 为什么"把 git diff 丢给模型"不够
 
 > 技术文章草稿，用于作品集与面试讲解。
-> 代码基线：`7a093bd`（`main`，含 PR #21）。文中所有路径与函数名都在该提交上存在。
+> 代码基线：`7a093bd`（`main`，含 PR #21）。文中源码行号、路径与函数名均按该提交标注。
 
 ## 起点：一个最小实现能跑，但结论不可信
 
@@ -59,7 +59,7 @@
 
 再加两道保险：`MissionEngine.set_stage` 拒绝把 ABORTED 改成任何状态（除非开新一轮，`mission_engine.py:67-86`）；被取消的 run 在解析结论时强制 `inconclusive`（`review_result_service.py:221-223`），避免半截输出里那句"未发现明显问题"被当成 `clear`——`test_abort_semantics.py:162` 就是专门钉这个的。
 
-`Database` 用单连接 + `RLock` 也不是偷懒：`check_same_thread=False` 只关掉 Python 的所有权检查，`Connection.execute()` 建游标和 step 是两次操作，跨线程交错会出 `IndexError`。所以"读—改—写"必须显式包进 `locked()`，不能指望 GIL。
+`Database` 使用单连接和 `RLock`。涉及并发状态更新时，读、判断和写入需要放在同一个 `locked()` 区间里，避免另一个线程在这段读改写过程中插入更新；不能只依赖 GIL。
 
 ## 增量：没被提到，不等于已修复
 
