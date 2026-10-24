@@ -97,3 +97,24 @@ def test_opencode_command_has_no_dir_flag_and_folds_variant_into_model(tmp_path)
     plain = get_adapter('opencode', model='zai-coding-plan/glm-5.3')
     cmd2 = plain.make_command(task=_task('opencode', tmp_path), prompt='p')
     assert cmd2[cmd2.index('--model') + 1] == 'zai-coding-plan/glm-5.3'
+
+
+def test_opencode_error_events_keep_the_nested_message():
+    """A provider error (e.g. quota exhaustion) must stay diagnosable.
+
+    OpenCode emits {"type":"error","error":{"type":"provider.quota",
+    "message":"...","status":429}}; dropping the nested object turned a clear
+    quota message into a content-less agent.error.
+    """
+    adapter = get_adapter('opencode')
+    events = adapter.parse_stdout_line(
+        '{"type":"error","sessionID":"ses_x","error":{'
+        '"type":"provider.quota","message":"Limit Exhausted","status":429}}'
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event.kind == 'agent.error'
+    assert event.level == 'error'
+    assert event.payload['error_type'] == 'provider.quota'
+    assert event.payload['error_message'] == 'Limit Exhausted'
+    assert event.payload['error_status'] == 429
