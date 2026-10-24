@@ -17,11 +17,15 @@ class OpenCodeAdapter(RunnerAdapter):
                 'Reply with exactly one word: OK']
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
-        work_dir = task.worktree_path or task.repo_path
-        cmd = [resolve_executable('opencode'), 'run', '--dir', work_dir, '--format', 'json']
-        if self.model:
-            cmd.extend(['--model', self.model])
-        if self.variant:
-            cmd.extend(['--variant', self.variant])
+        # The working directory comes from the process cwd, which
+        # ExecutionService already sets to the task worktree. Current opencode
+        # (v2) has no --dir flag and expresses variants as model#variant, so
+        # passing them as separate args makes it print usage and exit.
+        cmd = [resolve_executable('opencode'), 'run', '--format', 'json']
+        model = self.model
+        if model and self.variant:
+            model = f'{model}#{self.variant}'
+        if model:
+            cmd.extend(['--model', model])
         cmd.append(prompt)
         return cmd

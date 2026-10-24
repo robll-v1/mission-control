@@ -80,3 +80,20 @@ def test_cli_backend_map_comes_from_the_adapter_registry():
     mapping = _backend_executables()
     for backend in AVAILABLE_BACKENDS:
         assert mapping[backend] == get_adapter(backend).executable_name()
+
+
+def test_opencode_command_has_no_dir_flag_and_folds_variant_into_model(tmp_path):
+    """Current opencode (v2) rejects --dir/--variant with a usage dump.
+
+    The working directory comes from the process cwd (set by ExecutionService
+    to the worktree), and variants are expressed as model#variant.
+    """
+    adapter = get_adapter('opencode', model='zai-coding-plan/glm-5.3', variant='high')
+    cmd = adapter.make_command(task=_task('opencode', tmp_path), prompt='p')
+    assert '--dir' not in cmd
+    assert '--variant' not in cmd
+    assert cmd[cmd.index('--model') + 1] == 'zai-coding-plan/glm-5.3#high'
+
+    plain = get_adapter('opencode', model='zai-coding-plan/glm-5.3')
+    cmd2 = plain.make_command(task=_task('opencode', tmp_path), prompt='p')
+    assert cmd2[cmd2.index('--model') + 1] == 'zai-coding-plan/glm-5.3'
