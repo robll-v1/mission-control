@@ -27,6 +27,9 @@ class BackendResponse(BaseModel):
     # existing clients keep working and just ignore them.
     models_source: str = 'unknown'
     models_note: str | None = None
+    # Enumeration never proves usability: detection makes no model calls, so
+    # this stays false until a real review round has run that model.
+    models_call_verified: bool = False
 
 
 class DetectResponse(BaseModel):
@@ -67,6 +70,7 @@ def detect_backends():
                     models=b.models,
                     models_source=b.models_source,
                     models_note=b.models_note,
+                    models_call_verified=b.models_call_verified,
                     command=b.command,
                     model_count=len(b.models),
                     grouped_models=ModelFilter.group_models(b.models) if len(b.models) > 20 else None,

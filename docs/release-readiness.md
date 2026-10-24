@@ -23,6 +23,12 @@ Real model usage: exactly **two full review rounds** plus a handful of tiny
 used; the exhaustion was surfaced correctly in the event stream after the
 error-detail fix below.
 
+**Scope of the real-call conclusion:** only `opencode/glm-5.3-flash-free` —
+the model actually used in both rounds — is smoke-verified as callable.
+Every other ID returned by `opencode models` (or any cache) is
+enumeration-only for this machine; per-model call availability was not and
+cannot be verified by detection, which makes no model calls.
+
 ## 2. Fixes made during this acceptance (not demo code — product bugs found live)
 
 1. **opencode adapter used flags the current CLI removed** — `opencode run`
@@ -121,8 +127,11 @@ Accurate phrasing for README / demo narration:
   agent CLI — **not** that model inference is offline.
 - "Uses the agent you already have" means **no extra seat/key for Mission
   Control** — your agent's own model usage and quota still apply.
-- A **cached model list is not an account permission check**; for OpenCode
-  the CLI query reflects the current login, the catalog cache does not.
+- A model list — whether from a CLI query or a cache — is **enumeration,
+  not a permission check**. `opencode models` proves which IDs the CLI
+  exposes under the current configuration; it does not prove this account
+  may call each one. Neither does the catalog cache. Only a model that has
+  actually run a round is smoke-verified.
 - The **SDK's unverified retention is CLI/SDK behaviour**, not (yet) a Web
   UI feature — say so explicitly.
 - **Submodules and sandbox caveats** as in §6.
@@ -148,7 +157,10 @@ README GIF); record light and dark themes separately.
 ## 9. Frontend handoff (belongs to #20+, not touched here)
 
 `/api/config/detect` now returns additive `models_source`
-(`cli`/`catalog_cache`/`cache`/`config`/`unknown`) and `models_note` per
-backend. The Settings page currently ignores both; showing the note where a
-backend has no enumerable models (e.g. Claude Code) would close the loop.
-`frontend/src/App.tsx`, `Settings.tsx`, `styles.css` were not modified.
+(`cli`/`catalog_cache`/`cache`/`config`/`unknown`), `models_note` and
+`models_call_verified: false` per backend — source and call-availability are
+separate facts, and detection never verifies calls. The Settings page
+currently ignores all three; showing the note where a backend has no
+enumerable models (e.g. Claude Code), or an "enumeration only" hint where a
+list exists, would close the loop. `frontend/src/App.tsx`, `Settings.tsx`,
+`styles.css` were not modified.

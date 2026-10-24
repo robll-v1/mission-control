@@ -13,13 +13,16 @@ from typing import Any
 class BackendInfo:
     """Information about a detected backend.
 
-    ``models_source`` says where the model list came from so callers can tell
-    an account-validated list apart from a local cache, and ``models_note``
-    explains why the list is empty when it is. An empty list never means the
-    backend is unusable — it only means we could not enumerate its models.
+    ``models_source`` says where the model list came from. It is a fact about
+    enumeration, never about usability: a list from any source only proves
+    those IDs were returned by the CLI, its config or a catalog cache. Whether
+    the current account may actually call a given model is NOT verified by
+    detection — ``models_call_verified`` stays False until a real round has
+    run that model, and ``models_note`` states the caveat. An empty list never
+    means the backend is unusable, only that we could not enumerate.
     """
 
-    SOURCE_CLI = 'cli'                # live CLI query, reflects current login
+    SOURCE_CLI = 'cli'                # live CLI enumeration query
     SOURCE_CATALOG_CACHE = 'catalog_cache'  # full public catalog, NOT account-validated
     SOURCE_CACHE = 'cache'            # backend's own local cache file
     SOURCE_CONFIG = 'config'          # model explicitly set in backend config
@@ -33,6 +36,7 @@ class BackendInfo:
         models: list[str],
         models_source: str = SOURCE_UNKNOWN,
         models_note: str | None = None,
+        models_call_verified: bool = False,
     ):
         self.name = name
         self.command = command
@@ -40,6 +44,7 @@ class BackendInfo:
         self.models = models
         self.models_source = models_source
         self.models_note = models_note
+        self.models_call_verified = models_call_verified
 
     def __repr__(self) -> str:
         return (
@@ -208,14 +213,20 @@ class BackendDetector:
         success, output = BackendDetector._run_command(['opencode', '--version'])
         version = 'installed' if not success else (output.split('\n')[0] if output else 'unknown')
 
-        # `opencode models` is the authoritative source: it lists what the
-        # current login can actually use. No hardcoded fallback — if we cannot
-        # enumerate, we say so instead of inventing model names.
+        # `opencode models` is the best enumeration source, but it is still
+        # only enumeration: it proves which IDs the CLI exposes under the
+        # current configuration, not that this account may call each one.
+        # No hardcoded fallback — if we cannot enumerate, we say so instead
+        # of inventing model names.
         models, note = BackendDetector._probe_opencode_models_cli()
         if models:
             return BackendInfo(
                 'opencode', 'opencode', version, models,
-                models_source=BackendInfo.SOURCE_CLI, models_note=None,
+                models_source=BackendInfo.SOURCE_CLI,
+                models_note=(
+                    'IDs enumerated by `opencode models`; per-model call '
+                    'availability for this account is not verified.'
+                ),
             )
 
         # Secondary: the models-dev catalog cache in opencode.db. This lists
@@ -228,8 +239,8 @@ class BackendDetector:
                 'opencode', 'opencode', version, catalog,
                 models_source=BackendInfo.SOURCE_CATALOG_CACHE,
                 models_note=(
-                    'List from the local models-dev catalog cache; '
-                    'not validated against the current account.'
+                    'List from the local models-dev catalog cache; account '
+                    'permissions and per-model call availability are not verified.'
                 ),
             )
 
@@ -386,7 +397,11 @@ class BackendDetector:
                                 if visibility in ('list', 'default'):
                                     models.append(model['slug'])
                         if models:
-                            return models, BackendInfo.SOURCE_CACHE, None
+                            return (
+                                models, BackendInfo.SOURCE_CACHE,
+                                "From Codex's own model cache; per-model call "
+                                'availability is not verified.',
+                            )
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -403,7 +418,11 @@ class BackendDetector:
                         if len(parts) == 2:
                             model = parts[1].strip().strip('"').strip("'")
                             if model:
-                                return [model], BackendInfo.SOURCE_CONFIG, None
+                                return (
+                                    [model], BackendInfo.SOURCE_CONFIG,
+                                    'The model configured in ~/.codex/config.toml; '
+                                    'call availability is not verified.',
+                                )
             except (OSError, UnicodeDecodeError):
                 pass
 
@@ -438,6 +457,8 @@ def main() -> None:
         if backend.models:
             print(f'   Models: {", ".join(backend.models[:3])}{"..." if len(backend.models) > 3 else ""}')
             print(f'   Source: {backend.models_source}')
+            if not backend.models_call_verified:
+                print('   Call availability: not verified (enumeration only)')
         elif backend.models_note:
             print(f'   Models: (not enumerated — {backend.models_note})')
         print()

@@ -68,7 +68,10 @@ def test_opencode_models_come_from_the_cli_when_it_answers(tmp_path, monkeypatch
     assert info is not None
     assert info.models == ['zai-coding-plan/glm-5.3', 'openai/gpt-6']
     assert info.models_source == 'cli'
-    assert info.models_note is None
+    # Enumeration is recorded separately from call availability: the CLI
+    # listing proves the IDs exist, not that this account may call them.
+    assert info.models_call_verified is False
+    assert 'not verified' in info.models_note
 
 
 def test_opencode_cli_timeout_falls_back_to_catalog_cache(tmp_path, monkeypatch):
@@ -88,7 +91,8 @@ def test_opencode_cli_timeout_falls_back_to_catalog_cache(tmp_path, monkeypatch)
     assert info is not None
     assert info.models == ['gpt-6']
     assert info.models_source == 'catalog_cache'
-    assert 'not validated against the current account' in info.models_note
+    assert info.models_call_verified is False
+    assert 'not verified' in info.models_note
 
 
 def test_opencode_corrupt_catalog_and_dead_cli_report_unknown(tmp_path, monkeypatch):
@@ -154,6 +158,7 @@ def test_claude_code_reports_unknown_models_with_reason(monkeypatch):
     assert info is not None
     assert info.models == []
     assert info.models_source == 'unknown'
+    assert info.models_call_verified is False
     assert 'no model-listing command' in info.models_note
 
 
@@ -189,6 +194,8 @@ def test_codex_models_from_its_own_cache(tmp_path, monkeypatch):
     assert info is not None
     assert info.models == ['gpt-6']
     assert info.models_source == 'cache'
+    assert info.models_call_verified is False
+    assert 'not verified' in info.models_note
 
 
 def test_codex_corrupt_cache_falls_back_to_configured_model(tmp_path, monkeypatch):
@@ -203,6 +210,8 @@ def test_codex_corrupt_cache_falls_back_to_configured_model(tmp_path, monkeypatc
 
     assert info.models == ['gpt-5.2-codex']
     assert info.models_source == 'config'
+    assert info.models_call_verified is False
+    assert 'not verified' in info.models_note
 
 
 def test_codex_with_no_cache_or_config_reports_unknown(tmp_path, monkeypatch):
@@ -240,3 +249,31 @@ def test_unknown_model_list_does_not_clear_explicit_config(tmp_path, monkeypatch
     assert info.models == []
     assert resolved['backend'] == 'claude-code'
     assert resolved['model'] == 'my-explicit-model'
+
+
+def test_no_enumeration_source_ever_claims_verified_calls(tmp_path, monkeypatch):
+    """Whatever the source, detection makes no model calls.
+
+    Every backend that returns a non-empty list must say so: call_verified
+    False plus an explicit note. This keeps 'where the list came from' and
+    'is it usable' as two separate recorded facts.
+    """
+    home = _isolate_home(tmp_path, monkeypatch)
+    _only_cli(monkeypatch, {'opencode': '/bin/opencode', 'codex': '/bin/codex'})
+    _stub_commands(monkeypatch, {
+        ('opencode', '--version'): (True, 'opencode 1.2.3'),
+        ('opencode', 'models'): (True, 'prov/one\nprov/two\n'),
+        ('codex', '--version'): (True, 'codex-cli 0.4.0'),
+    })
+    codex_dir = home / '.codex'
+    codex_dir.mkdir()
+    (codex_dir / 'models_cache.json').write_text(
+        json.dumps({'models': [{'slug': 'gpt-6', 'visibility': 'list'}]}), encoding='utf-8'
+    )
+
+    for info in BackendDetector.detect_all():
+        if info.models:
+            assert info.models_call_verified is False
+            assert 'not verified' in (info.models_note or '')
+        else:
+            assert info.models_call_verified is False
