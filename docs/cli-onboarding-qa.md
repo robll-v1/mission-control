@@ -124,11 +124,12 @@ PYTHONPATH=backend /Users/robll/code/mission-control/.venv/bin/python -m pytest 
 # 17 passed in 22.40s；退出码 0
 
 PYTHONPATH=backend /Users/robll/code/mission-control/.venv/bin/python -m pytest -q
-# 115 passed, 1 skipped in 48.24s；退出码 0
+# 115 passed, 1 skipped in 46.68s；退出码 0
 ```
 
 ## 6. 未修项与边界
 
+- **argparse 语法错误**：未知参数、非法 `--format` 值等仍由 argparse 处理，表现为 exit 2、stderr usage、stdout 为空；这条路径不会输出 JSON error 对象，因为参数解析发生在 CLI 逻辑之前。
 - **真实 Agent 未验证**：所有 review 结果来自 fake adapter；真实 OpenCode/Claude/Codex/Copilot 的行为由 GLM 的实测覆盖。
 - **Windows 未实际执行**：本机是 macOS。代码使用 `subprocess` 参数列表、`Path`、`shutil.which` 和 UTF-8 字节输出；测试覆盖含空格/非 ASCII 的路径，但没有 Windows 运行时证据。
 - **无改动仍 exit 0**：保留原有“没有东西可审”语义；JSON 用 `status=no_changes`、`passed=true` 表示“无 finding 可报告”，不等同于“代码已审且通过”。`--exit-code` 也不会把它变成失败。
