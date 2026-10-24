@@ -154,6 +154,23 @@ class BackendDetector:
     """Detect available AI coding backends on the system."""
 
     @staticmethod
+    def _detect_safely(name: str, command: str, detector) -> BackendInfo | None:
+        """Run one backend's detection; a crash must not sink the whole API.
+
+        Unexpected failures (a cache with a shape nobody anticipated) degrade
+        to an unknown-model entry carrying the reason, so one bad source can
+        never take /api/config/detect down with it.
+        """
+        try:
+            return detector()
+        except Exception as exc:  # noqa: BLE001 - isolation boundary by design
+            return BackendInfo(
+                name, command, 'unknown', [],
+                models_source=BackendInfo.SOURCE_UNKNOWN,
+                models_note=f'model discovery failed unexpectedly: {exc.__class__.__name__}: {exc}',
+            )
+
+    @staticmethod
     def detect_all() -> list[BackendInfo]:
         """Detect all available backends.
 
@@ -164,25 +181,25 @@ class BackendDetector:
 
         # OpenCode
         if shutil.which('opencode'):
-            info = BackendDetector._detect_opencode()
+            info = BackendDetector._detect_safely('opencode', 'opencode', BackendDetector._detect_opencode)
             if info:
                 backends.append(info)
 
         # Claude Code
         if shutil.which('claude'):
-            info = BackendDetector._detect_claude_code()
+            info = BackendDetector._detect_safely('claude-code', 'claude', BackendDetector._detect_claude_code)
             if info:
                 backends.append(info)
 
         # GitHub Copilot
         if shutil.which('gh'):
-            info = BackendDetector._detect_copilot()
+            info = BackendDetector._detect_safely('copilot', 'gh', BackendDetector._detect_copilot)
             if info:
                 backends.append(info)
 
         # Codex CLI
         if shutil.which('codex'):
-            info = BackendDetector._detect_codex()
+            info = BackendDetector._detect_safely('codex', 'codex', BackendDetector._detect_codex)
             if info:
                 backends.append(info)
 
@@ -261,12 +278,14 @@ class BackendDetector:
         success, output = BackendDetector._run_command(['opencode', 'models'], timeout=15)
         if not success:
             return [], 'command failed or timed out'
-        # Output is one `provider/model` per line; ignore any header noise.
-        models = [
-            line.strip()
-            for line in output.splitlines()
-            if re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', line.strip())
-        ]
+        # Output is one or more `provider/model` IDs per line (they can nest
+        # further, e.g. openrouter/anthropic/claude-sonnet); ignore header
+        # noise and bare IDs without a provider namespace.
+        models = []
+        for line in output.splitlines():
+            candidate = line.strip()
+            if re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+', candidate) and candidate not in models:
+                models.append(candidate)
         if not models:
             return [], 'unrecognized output format'
         return models, None
@@ -298,24 +317,43 @@ class BackendDetector:
             if not row:
                 return [], 'catalog cache is empty'
 
-            # Parse the JSON value
+            # Parse the JSON value; validate the shape before trusting it —
+            # a well-formed file can still carry a non-dict body.
             catalog_data = json.loads(row[0])
+            if not isinstance(catalog_data, dict) or not isinstance(catalog_data.get('body'), str):
+                return [], 'catalog cache has an unexpected structure'
             body = json.loads(catalog_data['body'])
+            if not isinstance(body, dict):
+                return [], 'catalog cache body is not a mapping'
 
-            # Extract model IDs from all providers
-            models = []
+            # Extract model IDs from all providers. The catalog keys models
+            # per provider (bare IDs); namespace them as provider/model so a
+            # saved selection stays executable by the CLI, which uses the
+            # same namespace, and drop duplicates.
+            models: list[str] = []
+            seen: set[str] = set()
             for provider_key, provider_data in body.items():
-                if isinstance(provider_data, dict) and 'models' in provider_data:
-                    for model_id, model_info in provider_data['models'].items():
-                        # Only include non-deprecated models
-                        if model_info.get('status') != 'deprecated':
-                            models.append(model_id)
+                if not isinstance(provider_key, str) or not isinstance(provider_data, dict):
+                    continue
+                provider_models = provider_data.get('models')
+                if not isinstance(provider_models, dict):
+                    continue
+                for model_id, model_info in provider_models.items():
+                    if not isinstance(model_id, str) or not model_id.strip():
+                        continue
+                    # Only include non-deprecated models
+                    if isinstance(model_info, dict) and model_info.get('status') == 'deprecated':
+                        continue
+                    namespaced = f'{provider_key}/{model_id}'
+                    if namespaced not in seen:
+                        seen.add(namespaced)
+                        models.append(namespaced)
 
             if not models:
                 return [], 'catalog cache has no models'
             return models, None
 
-        except (sqlite3.Error, json.JSONDecodeError, KeyError):
+        except (sqlite3.Error, json.JSONDecodeError, KeyError, TypeError, AttributeError, ValueError):
             # Corrupt or unreadable cache — say so rather than guess.
             return [], 'catalog cache is corrupt or unreadable'
 
@@ -381,49 +419,53 @@ class BackendDetector:
     @staticmethod
     def _probe_codex_models() -> tuple[list[str], str, str | None]:
         """Read models from Codex's own cache/config; returns (models, source, note)."""
-        # First try models_cache.json (written by Codex itself)
+        # First try models_cache.json (written by Codex itself). A well-formed
+        # file can still carry the wrong structure (models: null, slug: null),
+        # so validate shapes instead of trusting the JSON to be typed.
         cache_path = Path.home() / '.codex' / 'models_cache.json'
         if cache_path.exists():
             try:
                 with open(cache_path, 'r') as f:
                     data = json.load(f)
-                    if 'models' in data:
-                        # Extract model slugs from cache
-                        models = []
-                        for model in data['models']:
-                            if isinstance(model, dict) and 'slug' in model:
-                                # Filter out models marked as hidden
-                                visibility = model.get('visibility', 'list')
-                                if visibility in ('list', 'default'):
-                                    models.append(model['slug'])
-                        if models:
-                            return (
-                                models, BackendInfo.SOURCE_CACHE,
-                                "From Codex's own model cache; per-model call "
-                                'availability is not verified.',
-                            )
+                models = []
+                if isinstance(data, dict) and isinstance(data.get('models'), list):
+                    for model in data['models']:
+                        if not isinstance(model, dict):
+                            continue
+                        slug = model.get('slug')
+                        if not isinstance(slug, str) or not slug.strip():
+                            continue
+                        visibility = model.get('visibility', 'list')
+                        if isinstance(visibility, str) and visibility in ('list', 'default'):
+                            models.append(slug)
+                if models:
+                    return (
+                        models, BackendInfo.SOURCE_CACHE,
+                        "From Codex's own model cache; per-model call "
+                        'availability is not verified.',
+                    )
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # Secondary: the model explicitly set in config.toml
+        # Secondary: the model explicitly set in config.toml. Parse it as
+        # real TOML — line-prefix matching misread model_provider="my-proxy"
+        # and model_reasoning_effort as model names and swallowed inline
+        # comments. Only the top-level `model` key counts.
         config_path = Path.home() / '.codex' / 'config.toml'
         if config_path.exists():
             try:
-                content = config_path.read_text()
-                # Simple TOML parsing for the configured model
-                for line in content.split('\n'):
-                    line = line.strip()
-                    if line.startswith('model') and '=' in line and not line.startswith('['):
-                        parts = line.split('=', 1)
-                        if len(parts) == 2:
-                            model = parts[1].strip().strip('"').strip("'")
-                            if model:
-                                return (
-                                    [model], BackendInfo.SOURCE_CONFIG,
-                                    'The model configured in ~/.codex/config.toml; '
-                                    'call availability is not verified.',
-                                )
-            except (OSError, UnicodeDecodeError):
+                import tomllib
+
+                with open(config_path, 'rb') as f:
+                    config = tomllib.load(f)
+                model = config.get('model')
+                if isinstance(model, str) and model.strip():
+                    return (
+                        [model.strip()], BackendInfo.SOURCE_CONFIG,
+                        'The model configured in ~/.codex/config.toml; '
+                        'call availability is not verified.',
+                    )
+            except (tomllib.TOMLDecodeError, OSError, ValueError):
                 pass
 
         return (

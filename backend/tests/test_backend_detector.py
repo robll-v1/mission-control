@@ -89,7 +89,7 @@ def test_opencode_cli_timeout_falls_back_to_catalog_cache(tmp_path, monkeypatch)
     info = BackendDetector._detect_opencode()
 
     assert info is not None
-    assert info.models == ['gpt-6']
+    assert info.models == ['openai/gpt-6']
     assert info.models_source == 'catalog_cache'
     assert info.models_call_verified is False
     assert 'not verified' in info.models_note
@@ -277,3 +277,153 @@ def test_no_enumeration_source_ever_claims_verified_calls(tmp_path, monkeypatch)
             assert 'not verified' in (info.models_note or '')
         else:
             assert info.models_call_verified is False
+
+
+# --- acceptance follow-up: parsing precision and structural safety -------------
+
+def test_codex_config_ignores_model_prefixed_keys_and_inline_comments(tmp_path, monkeypatch):
+    """model_provider="my-proxy" is not a model; comments are not part of the value."""
+    home = _isolate_home(tmp_path, monkeypatch)
+    codex_dir = home / '.codex'
+    codex_dir.mkdir()
+    (codex_dir / 'config.toml').write_text(
+        'model = "gpt-5.2"  # via work proxy\n'
+        'model_provider = "my-proxy"\n'
+        'model_reasoning_effort = "high"\n',
+        encoding='utf-8',
+    )
+    _stub_commands(monkeypatch, {('codex', '--version'): (True, 'codex-cli 0.4.0')})
+
+    info = BackendDetector._detect_codex()
+
+    assert info.models == ['gpt-5.2']
+    assert 'my-proxy' not in info.models
+    assert 'high' not in info.models
+    assert '#' not in info.models[0]
+
+
+def test_codex_config_respects_sections(tmp_path, monkeypatch):
+    """A `model` key inside a [profiles.*] section is not the configured model."""
+    home = _isolate_home(tmp_path, monkeypatch)
+    codex_dir = home / '.codex'
+    codex_dir.mkdir()
+    (codex_dir / 'config.toml').write_text(
+        '[profiles.fast]\nmodel = "profile-only-model"\n',
+        encoding='utf-8',
+    )
+    _stub_commands(monkeypatch, {('codex', '--version'): (True, 'codex-cli 0.4.0')})
+
+    info = BackendDetector._detect_codex()
+
+    assert info.models == []
+    assert 'profile-only-model' not in info.models
+    assert info.models_source == 'unknown'
+
+
+def test_codex_cache_wrong_shapes_degrade_instead_of_crashing(tmp_path, monkeypatch):
+    home = _isolate_home(tmp_path, monkeypatch)
+    codex_dir = home / '.codex'
+    codex_dir.mkdir()
+    _stub_commands(monkeypatch, {('codex', '--version'): (True, 'codex-cli 0.4.0')})
+
+    (codex_dir / 'models_cache.json').write_text('{"models": null}', encoding='utf-8')
+    info = BackendDetector._detect_codex()
+    assert info.models == []  # null list must not raise
+
+    (codex_dir / 'models_cache.json').write_text(
+        json.dumps({'models': [{'slug': None}, {'slug': 'gpt-6'}, 'not-a-dict']}), encoding='utf-8'
+    )
+    info = BackendDetector._detect_codex()
+    assert info.models == ['gpt-6']  # null slug and stray strings skipped
+    assert info.models_source == 'cache'
+
+
+def test_opencode_catalog_array_body_degrades_without_killing_detect(tmp_path, monkeypatch):
+    """A structurally wrong catalog must not take the whole detect API down."""
+    home = _isolate_home(tmp_path, monkeypatch)
+    _only_cli(monkeypatch, {'opencode': '/bin/opencode', 'codex': '/bin/codex'})
+    _stub_commands(monkeypatch, {
+        ('opencode', '--version'): (True, 'opencode 1.2.3'),
+        ('opencode', 'models'): (False, ''),
+        ('codex', '--version'): (True, 'codex-cli 0.4.0'),
+    })
+    db_dir = home / '.local' / 'share' / 'opencode'
+    db_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(db_dir / 'opencode.db'))
+    conn.execute('CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)')
+    # valid JSON, wrong shape: body is an array, not a mapping
+    conn.execute(
+        'INSERT INTO kv (key, value) VALUES (?, ?)',
+        ('models-dev:catalog', json.dumps({'body': '[]'})),
+    )
+    conn.commit()
+    conn.close()
+    codex_dir = home / '.codex'
+    codex_dir.mkdir()
+    (codex_dir / 'models_cache.json').write_text(
+        json.dumps({'models': [{'slug': 'gpt-6', 'visibility': 'list'}]}), encoding='utf-8'
+    )
+
+    backends = {b.name: b for b in BackendDetector.detect_all()}
+
+    assert set(backends) == {'opencode', 'codex'}  # both survived
+    assert backends['opencode'].models == []
+    assert backends['opencode'].models_source == 'unknown'
+    assert 'mapping' in backends['opencode'].models_note
+    assert backends['codex'].models == ['gpt-6']
+
+
+def test_opencode_catalog_ids_keep_provider_namespace(tmp_path, monkeypatch):
+    home = _isolate_home(tmp_path, monkeypatch)
+    _only_cli(monkeypatch, {'opencode': '/bin/opencode'})
+    _stub_commands(monkeypatch, {
+        ('opencode', '--version'): (True, 'opencode 1.2.3'),
+        ('opencode', 'models'): (False, ''),
+    })
+    _write_catalog_cache(home, {
+        'openai': {'models': {'gpt-6': {'status': 'active'}}},
+        'anthropic': {'models': {'claude-sonnet': {'status': 'active'}}},
+    })
+
+    info = BackendDetector._detect_opencode()
+
+    assert info.models == ['openai/gpt-6', 'anthropic/claude-sonnet']
+    assert all('/' in model for model in info.models)  # executable after save
+
+
+def test_opencode_cli_keeps_multi_segment_ids_and_dedupes(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    _only_cli(monkeypatch, {'opencode': '/bin/opencode'})
+    _stub_commands(monkeypatch, {
+        ('opencode', '--version'): (True, 'opencode 1.2.3'),
+        ('opencode', 'models'): (True,
+            'openrouter/anthropic/claude-sonnet\n'
+            'zai-coding-plan/glm-5.3\n'
+            'zai-coding-plan/glm-5.3\n'   # duplicate line
+            'bare-model-no-provider\n'     # no namespace: ignored
+            'header noise\n'),
+    })
+
+    info = BackendDetector._detect_opencode()
+
+    assert info.models == ['openrouter/anthropic/claude-sonnet', 'zai-coding-plan/glm-5.3']
+    assert info.models_source == 'cli'
+
+
+def test_detect_all_degrades_when_one_detector_crashes(monkeypatch):
+    """One backend's unexpected crash must not sink the rest of detection."""
+    import app.core.backend_detector as detector
+
+    _only_cli(monkeypatch, {'opencode': '/bin/opencode', 'codex': '/bin/codex'})
+
+    def exploding():
+        raise RuntimeError('unanticipated cache shape')
+
+    monkeypatch.setattr(detector.BackendDetector, '_detect_opencode', staticmethod(exploding))
+    _stub_commands(monkeypatch, {('codex', '--version'): (True, 'codex-cli 0.4.0')})
+
+    backends = {b.name: b for b in detector.BackendDetector.detect_all()}
+
+    assert set(backends) == {'opencode', 'codex'}
+    assert backends['opencode'].models == []
+    assert 'unanticipated cache shape' in backends['opencode'].models_note
