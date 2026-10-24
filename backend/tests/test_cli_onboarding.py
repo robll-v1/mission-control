@@ -142,6 +142,7 @@ def test_help_and_review_help(monkeypatch, capsys):
     assert _invoke(monkeypatch, ['review', '--help']) == 0
     captured = capsys.readouterr()
     assert '--format' in captured.out
+    assert 'Positive integer' in captured.out
     assert 'setup/runtime errors' in captured.out
     assert 'exit 2' in captured.out
 
@@ -248,6 +249,64 @@ def test_backend_failure_exits_two_with_error_json(monkeypatch, capsys, git_repo
     assert payload['error']['code'] == 'review_failed'
     assert 'Starting review' not in captured.out
     assert 'Review failed' in captured.err
+
+
+def test_report_to_json_marks_inconclusive_error_as_failed():
+    report = sdk.ReviewReport(
+        task_id='task',
+        verdict=sdk.ReviewVerdict.INCONCLUSIVE,
+        passed=False,
+        rounds_executed=0,
+        error={'code': 'no_result', 'message': 'Review completed but no result extracted', 'recoverable': True},
+    )
+    payload = cli._report_to_json(report)
+    assert payload['status'] == 'failed'
+    assert payload['verdict'] == 'inconclusive'
+    assert payload['error']['code'] == 'no_result'
+
+
+def test_inconclusive_sdk_error_is_parseable_and_exits_two(monkeypatch, capsys, git_repo, tmp_path):
+    (git_repo / 'a.txt').write_text('changed\n', encoding='utf-8')
+    _run_review(monkeypatch, tmp_path)
+
+    def fake_review(self, *args, **kwargs):
+        return sdk.ReviewReport(
+            task_id='task',
+            verdict=sdk.ReviewVerdict.INCONCLUSIVE,
+            passed=False,
+            rounds_executed=0,
+            error={'code': 'no_result', 'message': 'Review completed but no result extracted', 'recoverable': True},
+        )
+
+    monkeypatch.setattr(sdk.ReviewEngine, 'review', fake_review)
+    assert _invoke(monkeypatch, ['review', '--repo', str(git_repo), '--format', 'json']) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload['status'] == 'failed'
+    assert payload['verdict'] == 'inconclusive'
+    assert payload['error']['code'] == 'no_result'
+    assert 'Review failed' in captured.err
+
+
+@pytest.mark.parametrize(
+    ('flag', 'value', 'code'),
+    [
+        ('--rounds', '0', 'invalid_rounds'),
+        ('--rounds', '-1', 'invalid_rounds'),
+        ('--timeout', '0', 'invalid_timeout'),
+        ('--timeout', '-1', 'invalid_timeout'),
+    ],
+)
+def test_non_positive_rounds_and_timeout_are_rejected(monkeypatch, capsys, git_repo, flag, value, code):
+    assert _invoke(
+        monkeypatch,
+        ['review', '--repo', str(git_repo), flag, value, '--format', 'json'],
+    ) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload['status'] == 'error'
+    assert payload['error']['code'] == code
+    assert flag in captured.err
 
 
 def test_timeout_exits_two_with_timeout_error(monkeypatch, capsys, git_repo, tmp_path):

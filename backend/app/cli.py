@@ -811,6 +811,20 @@ def cmd_review(args: argparse.Namespace) -> None:
     # Save user's working directory BEFORE chdir
     user_cwd = os.getcwd()
     output_format = args.format
+    if args.rounds < 1:
+        _review_error(
+            f'--rounds must be a positive integer: got {args.rounds}.',
+            code='invalid_rounds',
+            output_format=output_format,
+            hints=['Use --rounds 1 or greater.'],
+        )
+    if args.timeout < 1:
+        _review_error(
+            f'--timeout must be a positive integer of seconds: got {args.timeout}.',
+            code='invalid_timeout',
+            output_format=output_format,
+            hints=['Use --timeout 1 or greater.'],
+        )
     raw_repo = args.repo or user_cwd
     repo_path_obj = Path(raw_repo).expanduser()
     if not repo_path_obj.exists():
@@ -1001,7 +1015,7 @@ def cmd_review(args: argparse.Namespace) -> None:
         _print_review_markdown(report)
 
     verdict = str(getattr(report.verdict, 'value', report.verdict))
-    if report.error:
+    if report.error is not None:
         _eprint(f'{_SYM_FAIL} Review failed: {report.error.get("message", "unknown error")}')
         sys.exit(2)
     if verdict == 'failed':
@@ -1020,7 +1034,7 @@ def _report_to_json(report) -> dict:
         error_message = str(report.error.get('message') or '')
     output = {
         'task_id': report.task_id,
-        'status': 'failed' if verdict == 'failed' else 'reviewed',
+        'status': 'failed' if report.error is not None or verdict == 'failed' else 'reviewed',
         'verdict': verdict,
         'passed': report.passed,
         'finding_count': report.finding_count,
@@ -1066,7 +1080,7 @@ def _report_to_json(report) -> dict:
             ],
         }
 
-    if report.error:
+    if report.error is not None:
         output['error'] = report.error
     elif verdict == 'failed':
         output['error'] = {
@@ -1195,11 +1209,13 @@ def main() -> None:
     review_p.add_argument('--base', '-b', default=None, help='Base branch for local diff (default: auto-detect)')
     review_p.add_argument('--backend', default=None, help='Backend agent (opencode, claude-code, copilot, codex)')
     review_p.add_argument('--model', '-m', default=None, help='Model override (priority: --model > $AMC_MODEL > .amc.yaml)')
-    review_p.add_argument('--rounds', type=int, default=1, help='Max review rounds (default: 1)')
+    review_p.add_argument('--rounds', type=int, default=1,
+                          help='Positive integer, max review rounds (default: 1)')
     review_p.add_argument('--format', choices=['markdown', 'json'], default='markdown',
                           help='Output format (json: stdout is JSON only; progress goes to stderr)')
     review_p.add_argument('--focus', '-f', default=None, help='Review focus (e.g. "security", "performance")')
-    review_p.add_argument('--timeout', type=int, default=600, help='Per-round timeout in seconds (default: 600)')
+    review_p.add_argument('--timeout', type=int, default=600,
+                          help='Positive integer, per-round timeout in seconds (default: 600)')
     review_p.add_argument('--exit-code', action='store_true',
                           help='Exit 1 if review has concerns; setup/runtime errors exit 2')
     review_p.add_argument('--no-incremental', action='store_true', help='Review all current changes and replace prior findings')

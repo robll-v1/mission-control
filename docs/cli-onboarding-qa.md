@@ -81,6 +81,12 @@ unset AMC_MODEL
    - `amc init` 没有可用后端时 exit 1，并给出安装与重试提示。
    - 配置文件写入失败时给出路径和 OS 错误，不再裸 traceback。
 
+7. **Codex 验收补修（P2）**
+   - 验收复现：`--rounds 0` 时 SDK 返回 `rounds_executed=0`、`verdict=inconclusive`、`error=no_result`，旧 JSON 却是 `status=reviewed`，而 CLI 已 exit 2。
+   - `--rounds` / `--timeout` 必须是正整数；`0` 或负数分别返回 `invalid_rounds` / `invalid_timeout`，exit 2，JSON 仍可解析。
+   - `_report_to_json` 改为 `report.error` 优先决定 `status`：SDK 返回 `inconclusive + error(no_result)` 时输出 `status=failed`，与 CLI 的 exit 2 保持一致。
+   - 新增 inconclusive+error 的单元与 CLI 回归，不再只覆盖 `verdict=failed`。
+
 ## 4. 修复后实测
 
 | 场景 | 结果 |
@@ -96,6 +102,9 @@ unset AMC_MODEL
 | 后端未安装 | exit 2；`code=backend_unavailable`，stderr 给出安装提示 |
 | Agent 失败（JSON） | exit 2；`status=failed`、`error.code=review_failed` |
 | 超时（JSON） | exit 2；`error.code=timeout`，`summary` 含超时信息 |
+| inconclusive + error（SDK no_result） | exit 2；`status=failed`、`verdict=inconclusive`、`error.code=no_result` |
+| `--rounds 0` / 负数（JSON） | exit 2；`code=invalid_rounds` |
+| `--timeout 0` / 负数（JSON） | exit 2；`code=invalid_timeout` |
 | clear + `--exit-code` | exit 0 |
 | concerns + `--exit-code` | exit 1；JSON 含 finding |
 | concerns + JSON（无 `--exit-code`） | exit 0；JSON 可直接 `json.loads` |
@@ -106,12 +115,14 @@ unset AMC_MODEL
 
 ## 5. 新增回归测试
 
-`backend/tests/test_cli_onboarding.py` 共 17 项，覆盖：
+`backend/tests/test_cli_onboarding.py` 共 23 项，覆盖：
 
-- `--help` / `review --help`。
+- `--help` / `review --help`（含正整数约束）。
 - 路径不存在、非 Git 目录、无提交仓库、无改动、只有未跟踪改动。
 - 无效后端名与未安装后端的区分。
 - Agent 失败、超时、`--exit-code` 的 0/1/2 语义。
+- `inconclusive + error(no_result)` 的 status/JSON/退出码。
+- `--rounds` / `--timeout` 为非正数时 JSON 可解析且 exit 2。
 - JSON stdout 纯净性、中文/空格路径、markdown 无 emoji。
 - 无效 PR URL、`amc init` 无后端时 exit 1。
 - `cli.py` 源码不含系统 emoji 的防回归检查。
@@ -121,10 +132,10 @@ unset AMC_MODEL
 ```bash
 cd /Users/robll/code/amc-cli-qoder
 PYTHONPATH=backend /Users/robll/code/mission-control/.venv/bin/python -m pytest -q backend/tests/test_cli_onboarding.py
-# 17 passed in 22.40s；退出码 0
+# 23 passed in 21.42s；退出码 0
 
 PYTHONPATH=backend /Users/robll/code/mission-control/.venv/bin/python -m pytest -q
-# 115 passed, 1 skipped in 46.68s；退出码 0
+# 121 passed, 1 skipped in 41.16s；退出码 0
 ```
 
 ## 6. 未修项与边界
@@ -136,7 +147,7 @@ PYTHONPATH=backend /Users/robll/code/mission-control/.venv/bin/python -m pytest 
 - **inconclusive 且无 error 时**：未指定 `--exit-code` 仍 exit 0；只有 `verdict=failed`、超时或显式 `error` 才 exit 2。没有改变 SDK 的 finding/verdict 定义。
 - **Agent 非零退出没有 SDK error 对象**：`ReviewEngine.review` 返回 `verdict=failed` 但没有 `report.error`；CLI 在 JSON 中补 `review_failed` 并 exit 2。未修改 SDK。
 - **未验证**：交互式 `amc init` 的完整选择流程（只测了“无后端”分支）；`amc start` 的启动/停止；真实 Web/SSE；模型发现；子模块快照。
-- **未改变**：`--rounds` / `--timeout` 的非正数仍由 SDK 行为决定；PR 模式的 GitHub 网络错误仍以 `create_failed` 形式经 CLI exit 2 报出。
+- **未改变**：PR 模式的 GitHub 网络错误仍以 `create_failed` 形式经 CLI exit 2 报出；`--rounds` / `--timeout` 现在由 CLI 拒绝非正数，不再依赖 SDK 行为。
 
 ## 7. 结论
 
