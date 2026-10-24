@@ -15,7 +15,18 @@ are not committed.
 | Auth used | Existing login (Z.AI Coding Plan + free tier); nothing installed or purchased |
 | Model (round 1+2) | `opencode/glm-5.3-flash-free` — free tier, no plan quota consumed |
 | amc build | Branch `codex/release-readiness-glm`, base `origin/main` @ `7a093bd` (contains PR #21 fixes) |
-| Isolation | `XDG_CONFIG_HOME=$ISOL/config`; user's `~/.config/amc` untouched. Note: `amc review` chdirs to the project root, so `data/` and `runtime/` land there (both gitignored); the review agent only ever touched the synthetic repo |
+| Isolation | `XDG_CONFIG_HOME=$ISOL/config`; the user's `~/.config/amc` was never touched (verified). The review agent only ever saw the synthetic repo |
+
+**Where db/runtime actually landed (verified, not assumed):** `amc review`
+(`cmd_review`) does `os.chdir(project_root)` internally, so a temp cwd does
+NOT relocate its database or runtime — both were created inside the
+mission-control worktree (`data/amc.db`, gitignored; confirmed by reading
+the run's events back from that exact file), while review worktrees were
+created under `$ISOL/demo/runtime`. For strict isolation in future runs,
+invoke the SDK directly with explicit paths —
+`ReviewEngine(db_path=<tmp>/amc.db, runtime_root=<tmp>/runtime)` — or give
+each run an independent code checkout. The chdir behaviour itself is in
+`cli.py`, which belongs to another workstream and was not modified here.
 
 Real model usage: exactly **two full review rounds** plus a handful of tiny
 "Reply OK" preflight probes. The Z.AI plan itself was quota-exhausted
@@ -71,13 +82,27 @@ amc review --repo $DEMO --backend opencode --model opencode/glm-5.3-flash-free -
 ### Observed — round 2 (after `--apply-fix`)
 
 - 197.4s, incremental (base = previous reviewed SHA), verdict `concerns`.
-- Round-1 findings were **not** silently dropped: 4 came back as
-  `unverified` (incl. the critical injection), 1 as `persistent`; 1 new
-  low finding. The report summary explicitly lists the retained findings.
-- Honest quirk observed: the fix restores `notes.py` to be byte-identical
-  with `HEAD`, so the local diff is empty. The agent said so ("couldn't
-  obtain the actual diff"), fell back to reading the file on disk, and still
-  produced sensible findings. See §6 for the underlying limitation.
+- The model **was** called (call #2 of the budget): real agent output, and
+  round-1 findings were **not** silently dropped — 4 came back as
+  `unverified` (incl. the critical injection), 1 as `persistent`, 1 new
+  low finding.
+- **But this was not a genuine fix-diff re-review, and must not be claimed
+  as one.** The original fixture's `--apply-fix` restored `notes.py`
+  byte-identical to `HEAD`, so the local diff was empty; the agent said so
+  itself ("couldn't obtain the actual diff"), fell back to reading files on
+  disk, and inferred the rest. A true "review the fixed diff" round has
+  therefore **not** been exercised live — see the correction below.
+
+### Fixture correction (post-acceptance, offline-verified only)
+
+`make_demo_repo.py --apply-fix` now restores the parameterized query AND
+escapes LIKE wildcards (addressing round 1's low finding), deliberately
+leaving a real, harmless change in the working tree so the re-review has a
+non-empty diff to verify. Offline validation: both versions compile, the
+post-fix diff vs `HEAD` is non-empty, and the behaviour genuinely changes
+(`find "%"` matches only a literal-% title instead of every note). Not
+re-run with the model: the 2-call budget was already spent on the rounds
+above.
 
 ## 4. CLI/SDK vs Web — what each actually does (do not conflate)
 
@@ -93,7 +118,9 @@ Marketing must not present the SDK's unverified-retention as a Web feature.
 
 | Scenario | Status | Evidence |
 |---|---|---|
-| First-review → fix → re-review (happy path, real model) | ✅ verified live | §3, evidence `round1.json`/`round2.json` |
+| First review (real model) | ✅ verified live | §3, evidence `round1.json` |
+| Round 2 = real model call | ✅ verified live (call #2) | §3, evidence `round2.json` |
+| Fix-diff re-review (intended flow) | ❌ not exercised live: original fixture made the worktree byte-identical to HEAD, round 2 degraded to file-reading; fixture corrected, offline-validated | §3 correction |
 | Backend cold start (>60s probe) | ✅ verified live, fixed (150s) | §2.2 |
 | Quota exhaustion mid-flow | ✅ verified live, now diagnosable | §1, §2.3 |
 | Synthetic-fixture offline flow (no model) | ✅ verified | generator round-trip incl. compile + diff check |

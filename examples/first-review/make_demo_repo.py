@@ -5,6 +5,10 @@ The demo repo contains one real, explainable bug: ``search()`` is rewritten
 to build its SQL with an f-string, so a caller-supplied keyword can inject
 SQL. Everything is synthetic — no credentials, no network, no private code.
 
+``--apply-fix`` restores the parameterized query and additionally escapes
+LIKE wildcards — a real improvement that stays in the working tree, so the
+re-review round has a genuine (non-empty) diff to review.
+
 Usage:
     python3 make_demo_repo.py [TARGET_DIR]     # create repo with the bug
     python3 make_demo_repo.py TARGET --apply-fix   # apply the fix (still uncommitted)
@@ -85,6 +89,29 @@ BUGGY_NOTES = SAFE_NOTES.replace(
         return cursor.fetchall()''',
 )
 
+# The fix restores the parameterized query AND escapes LIKE wildcards — a
+# real, harmless improvement (round 1 flagged the unescaped wildcards as a
+# low finding). Leaving this change in place keeps a non-empty diff for the
+# re-review round; restoring SAFE_NOTES verbatim would make the worktree
+# byte-identical to HEAD and the second round would review an empty diff.
+FIX_NOTES = SAFE_NOTES.replace(
+    '''    def search(self, keyword: str):
+        # Parameterized: the keyword is bound, never interpreted as SQL.
+        cursor = self.conn.execute(
+            "SELECT id, title, body FROM notes WHERE title LIKE ?", (f"%{keyword}%",)
+        )
+        return cursor.fetchall()''',
+    '''    def search(self, keyword: str):
+        # Parameterized: the keyword is bound, never interpreted as SQL, and
+        # LIKE wildcards in it are escaped so % and _ match literally.
+        escaped = keyword.replace("\\\\", "\\\\\\\\").replace("%", "\\\\%").replace("_", "\\\\_")
+        cursor = self.conn.execute(
+            "SELECT id, title, body FROM notes WHERE title LIKE ? ESCAPE \'\\\\\'",
+            (f"%{escaped}%",),
+        )
+        return cursor.fetchall()''',
+)
+
 
 def git(repo: Path, *args: str) -> None:
     subprocess.run(
@@ -105,8 +132,8 @@ def main() -> int:
         if not notes.exists():
             print(f"error: {notes} not found", file=sys.stderr)
             return 1
-        notes.write_text(SAFE_NOTES, encoding="utf-8")
-        print(f"Fix applied in {repo} (uncommitted). Re-run: amc review --repo {repo}")
+        notes.write_text(FIX_NOTES, encoding="utf-8")
+        print(f"Fix applied in {repo} (uncommitted, keeps a real LIKE-escaping improvement).")
         return 0
 
     if repo.exists():

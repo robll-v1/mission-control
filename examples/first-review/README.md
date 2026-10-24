@@ -26,8 +26,13 @@ Notes:
 
 - Nothing here is committed back to the mission-control repo; the demo repo is
   created wherever you point it and can be deleted afterwards.
-- Round 4 runs in incremental mode by default: a previously reported finding
-  that the new round does not cover comes back as `unverified`, not `resolved`.
-  Use `--no-incremental` for a full re-review that replaces prior findings.
+- `--apply-fix` deliberately keeps a real improvement (LIKE-wildcard
+  escaping) in the working tree, so the re-review has a non-empty diff to
+  verify — restoring the original file verbatim would leave nothing to
+  review.
+- Step 4 runs in incremental mode by default: a previously reported finding
+  that the new round does not cover comes back as `unverified`, not
+  `resolved`. Use `--no-incremental` for a full re-review that replaces
+  prior findings.
 - Full acceptance record, environment and observed results live in
   [docs/release-readiness.md](../../docs/release-readiness.md).
