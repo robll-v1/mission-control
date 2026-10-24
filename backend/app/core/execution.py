@@ -33,6 +33,10 @@ class PreflightError(RuntimeError):
     pass
 
 
+class PreflightCancelledError(RuntimeError):
+    """The round was aborted while its preflight probe (or prepare) was running."""
+
+
 class BackendUnavailableError(RuntimeError):
     """The requested backend has no adapter registered on this server.
 
@@ -51,6 +55,10 @@ class ActiveProcess:
     run_id: str | None
     process: subprocess.Popen[str] | None
     worker: threading.Thread | None
+    # Set by abort_task before any process exists to kill (preflight/prepare
+    # run synchronously on the start caller's thread). The preparing thread
+    # checks it around the probe and before creating the round.
+    cancel_requested: bool = False
 
 
 class ExecutionService:
@@ -101,7 +109,11 @@ class ExecutionService:
             return self._launch_round(task, prompt, review_note, language, placeholder)
         except BaseException:
             with self._lock:
-                self._active.pop(task_id, None)
+                # Pop only our own reservation: if the entry was replaced
+                # (a started round re-registers with its real process), it
+                # belongs to that round and must survive this unwind.
+                if self._active.get(task_id) is placeholder:
+                    self._active.pop(task_id, None)
             raise
 
     def _launch_round(
@@ -181,6 +193,10 @@ class ExecutionService:
         )
 
         idle_timeout_sec = self._idle_timeout_seconds(task.repo_path)
+        # An abort accepted during prepare must not spawn a review round at
+        # all — check the flag one last time before the Run is created.
+        if placeholder.cancel_requested:
+            raise PreflightCancelledError('review round was cancelled before the round started')
         round_index = len(self.db.list_runs(task.id)) + 1
         run = Run(
             task_id=task.id,
@@ -224,7 +240,46 @@ class ExecutionService:
     def abort_task(self, task_id: str) -> bool:
         with self._lock:
             active = self._active.get(task_id)
-            if active is None or active.process is None:
+            if active is None:
+                return False
+            # Publish the intent first: the preparing thread checks this flag
+            # around the preflight probe and before creating the round.
+            first_cancel_request = not active.cancel_requested
+            active.cancel_requested = True
+            if active.run_id is None:
+                if not first_cancel_request:
+                    # This pre-run round was already cancelled; nothing new
+                    # to abort (mirrors the live path's repeat-abort refusal).
+                    return False
+                # Pre-run cancellation: preflight/prepare run synchronously on
+                # the start caller's thread and no Run exists yet. A fresh
+                # round is cancellable even when the task already carries
+                # ABORTED from an earlier cancelled round. Publish under the
+                # db lock (same ordering as the live path below); the
+                # preparing thread unwinds and releases the slot.
+                with self.db.locked():
+                    task = self.db.get_task(task_id)
+                    if task is None:
+                        return False
+                    self.mission.set_stage(task_id, status=TaskStatus.ABORTED, stage='aborted')
+                    self.mission.append_event(
+                        task_id=task_id,
+                        run_id=None,
+                        kind='control.accepted',
+                        payload={
+                            'action': 'abort',
+                            'phase': 'preflight' if active.process is not None else 'prepare',
+                        },
+                    )
+                # The registered process at this point can only be the
+                # preflight probe — no review agent exists before the Run.
+                if active.process is not None:
+                    self._terminate_process(active.process)
+                return True
+            if active.process is None:
+                # A started round whose agent process is not registered yet:
+                # nothing to terminate, and claiming success would be a lie.
+                # The flag stays set for the pre-spawn checks.
                 return False
             with self.db.locked():
                 run = next((r for r in self.db.list_runs(task_id) if r.id == active.run_id), None)
@@ -543,7 +598,15 @@ class ExecutionService:
                 except OSError:
                     pass
 
-    def _preflight_check(self, task: Task, *, adapter: RunnerAdapter | None = None) -> None:
+    def _preflight_check(
+        self,
+        task: Task,
+        *,
+        adapter: RunnerAdapter | None = None,
+        # 150s, not 60s: the first call after a backend's background service
+        # cold-starts (observed with opencode) can exceed 60s.
+        probe_timeout_sec: int = 150,
+    ) -> None:
         adapter = adapter or self.adapters.get(task.backend)
         if adapter is None:
             raise BackendUnavailableError(
@@ -565,38 +628,102 @@ class ExecutionService:
                 f'Install it before starting a review.'
             )
 
+        # The reserved slot (if this call is part of start_task) carries the
+        # cancellation flag and receives the probe process. Standalone calls
+        # (tests, manual probes) simply run uncancellable.
+        with self._lock:
+            active = self._active.get(task.id)
+
         probe = adapter.probe_command()
         if probe is not None:
-            # 150s, not 60s: the first call after a backend's background
-            # service cold-starts (observed with opencode) can exceed 60s and
-            # must not fail the round with "backend may be unreachable".
-            probe_timeout_sec = 150
+            if active is not None and active.cancel_requested:
+                raise PreflightCancelledError('review round was cancelled before the preflight probe started')
             try:
-                result = subprocess.run(
+                # Popen (not subprocess.run) so the probe is visible in the
+                # active slot and an abort during the up-to-150s wait can
+                # terminate exactly this subprocess. Same process-group
+                # treatment as the review agent itself.
+                probe_proc = subprocess.Popen(
                     probe,
-                    capture_output=True, text=True, encoding='utf-8', errors='replace',
-                    timeout=probe_timeout_sec,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
                     cwd=task.repo_path,
-                )
-                if result.returncode != 0:
-                    stderr_preview = (result.stderr or '').strip()[:300]
-                    raise PreflightError(
-                        f'{executable} preflight test failed (exit {result.returncode}). '
-                        f'Check your API key and configuration. stderr: {stderr_preview}'
-                    )
-            except subprocess.TimeoutExpired:
-                raise PreflightError(
-                    f'{executable} preflight test timed out after {probe_timeout_sec}s. '
-                    f'The LLM backend may be unreachable or still cold-starting.'
+                    start_new_session=(sys.platform != 'win32'),
+                    **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {}),
                 )
             except FileNotFoundError:
                 raise PreflightError(f'{executable} executable not found.')
+            with self._lock:
+                if active is not None:
+                    if active.cancel_requested:
+                        # Abort landed while we were spawning: kill the probe
+                        # ourselves; abort_task saw process=None.
+                        self._terminate_process(probe_proc)
+                        raise PreflightCancelledError('review round was cancelled before the preflight probe started')
+                    active.process = probe_proc
+            try:
+                stdout_text, stderr_text = self._await_probe(
+                    probe_proc,
+                    active=active,
+                    probe_timeout_sec=probe_timeout_sec,
+                    executable=executable,
+                )
+            finally:
+                if active is not None and active.process is probe_proc:
+                    active.process = None
+            if active is not None and active.cancel_requested:
+                raise PreflightCancelledError('review round was cancelled while the preflight probe was finishing')
+            if probe_proc.returncode != 0:
+                stderr_preview = (stderr_text or '').strip()[:300]
+                raise PreflightError(
+                    f'{executable} preflight test failed (exit {probe_proc.returncode}). '
+                    f'Check your API key and configuration. stderr: {stderr_preview}'
+                )
 
         self.mission.append_event(
             task_id=task.id,
             kind='task.preflight_passed',
             payload={'backend': backend_name, 'executable': executable},
         )
+
+    def _await_probe(
+        self,
+        probe_proc: subprocess.Popen[str],
+        *,
+        active: ActiveProcess | None,
+        probe_timeout_sec: int,
+        executable: str,
+    ) -> tuple[str, str]:
+        """Wait for the probe while watching for cancellation and timeout.
+
+        The poll interval bounds both the abort latency and the timeout
+        overshoot. On cancellation or timeout the probe process is terminated
+        and reaped before raising, so nothing leaks.
+        """
+        deadline = time.monotonic() + probe_timeout_sec
+        while True:
+            try:
+                stdout_text, stderr_text = probe_proc.communicate(timeout=0.25)
+                return stdout_text or '', stderr_text or ''
+            except subprocess.TimeoutExpired:
+                cancelled = active is not None and active.cancel_requested
+                if cancelled or time.monotonic() >= deadline:
+                    self._terminate_process(probe_proc)
+                    try:
+                        probe_proc.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if cancelled:
+                        raise PreflightCancelledError(
+                            'review round was cancelled while the preflight probe was running'
+                        ) from None
+                    raise PreflightError(
+                        f'{executable} preflight test timed out after {probe_timeout_sec}s. '
+                        f'The LLM backend may be unreachable or still cold-starting.'
+                    ) from None
 
     @staticmethod
     def _idle_timeout_seconds(repo_path: str) -> int:
