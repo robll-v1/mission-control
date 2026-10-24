@@ -11,16 +11,41 @@ from typing import Any
 
 
 class BackendInfo:
-    """Information about a detected backend."""
+    """Information about a detected backend.
 
-    def __init__(self, name: str, command: str, version: str, models: list[str]):
+    ``models_source`` says where the model list came from so callers can tell
+    an account-validated list apart from a local cache, and ``models_note``
+    explains why the list is empty when it is. An empty list never means the
+    backend is unusable — it only means we could not enumerate its models.
+    """
+
+    SOURCE_CLI = 'cli'                # live CLI query, reflects current login
+    SOURCE_CATALOG_CACHE = 'catalog_cache'  # full public catalog, NOT account-validated
+    SOURCE_CACHE = 'cache'            # backend's own local cache file
+    SOURCE_CONFIG = 'config'          # model explicitly set in backend config
+    SOURCE_UNKNOWN = 'unknown'        # no reliable enumeration available
+
+    def __init__(
+        self,
+        name: str,
+        command: str,
+        version: str,
+        models: list[str],
+        models_source: str = SOURCE_UNKNOWN,
+        models_note: str | None = None,
+    ):
         self.name = name
         self.command = command
         self.version = version
         self.models = models
+        self.models_source = models_source
+        self.models_note = models_note
 
     def __repr__(self) -> str:
-        return f'BackendInfo({self.name}, version={self.version}, models={len(self.models)})'
+        return (
+            f'BackendInfo({self.name}, version={self.version}, '
+            f'models={len(self.models)}, source={self.models_source})'
+        )
 
 
 class ModelFilter:
@@ -183,51 +208,70 @@ class BackendDetector:
         success, output = BackendDetector._run_command(['opencode', '--version'])
         version = 'installed' if not success else (output.split('\n')[0] if output else 'unknown')
 
-        # Try to read models from OpenCode database
-        models = BackendDetector._probe_opencode_models()
+        # `opencode models` is the authoritative source: it lists what the
+        # current login can actually use. No hardcoded fallback — if we cannot
+        # enumerate, we say so instead of inventing model names.
+        models, note = BackendDetector._probe_opencode_models_cli()
+        if models:
+            return BackendInfo(
+                'opencode', 'opencode', version, models,
+                models_source=BackendInfo.SOURCE_CLI, models_note=None,
+            )
 
-        # Apply smart filtering if we got a huge list
-        if len(models) > 100:
-            models = ModelFilter.filter_models(models, max_models=50)
-        elif not models:
-            # Comprehensive model list including latest GPT-6 and Claude 5.5 models
-            models = [
-                # Claude 5.5 family
-                'claude-opus-5.5',
-                'claude-sonnet-5.5',
-                'claude-haiku-5.5',
-                'claude-fable-5.1',
-                # GPT-6 family (latest)
-                'gpt-6',
-                'gpt-6-turbo',
-                'gpt-6-mini',
-                # GPT-5 family
-                'gpt-5',
-                'gpt-5-turbo',
-                # GPT-4 family
-                'gpt-4',
-                'gpt-4-turbo',
-                'gpt-4o',
-                'gpt-4o-mini',
-                # DeepSeek
-                'deepseek-v3',
-                'deepseek-r1',
-                # Gemini
-                'gemini-2.5-pro',
-                'gemini-2.5-flash',
-            ]
+        # Secondary: the models-dev catalog cache in opencode.db. This lists
+        # every public model, not what this account may use.
+        catalog, catalog_note = BackendDetector._probe_opencode_catalog_cache()
+        if catalog:
+            if len(catalog) > 100:
+                catalog = ModelFilter.filter_models(catalog, max_models=50)
+            return BackendInfo(
+                'opencode', 'opencode', version, catalog,
+                models_source=BackendInfo.SOURCE_CATALOG_CACHE,
+                models_note=(
+                    'List from the local models-dev catalog cache; '
+                    'not validated against the current account.'
+                ),
+            )
 
-        return BackendInfo('opencode', 'opencode', version, models)
+        return BackendInfo(
+            'opencode', 'opencode', version, [],
+            models_source=BackendInfo.SOURCE_UNKNOWN,
+            models_note=(
+                'Could not enumerate models: `opencode models` failed'
+                f' ({note or "no output"}); catalog cache unusable'
+                f' ({catalog_note or "not found"}).'
+                ' The backend still runs with its own default or configured model.'
+            ),
+        )
 
     @staticmethod
-    def _probe_opencode_models() -> list[str]:
-        """Try to read available models from OpenCode database."""
-        # OpenCode stores models in ~/.local/share/opencode/opencode.db
+    def _probe_opencode_models_cli() -> tuple[list[str], str | None]:
+        """Ask the CLI directly; returns (models, failure reason)."""
+        success, output = BackendDetector._run_command(['opencode', 'models'], timeout=15)
+        if not success:
+            return [], 'command failed or timed out'
+        # Output is one `provider/model` per line; ignore any header noise.
+        models = [
+            line.strip()
+            for line in output.splitlines()
+            if re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', line.strip())
+        ]
+        if not models:
+            return [], 'unrecognized output format'
+        return models, None
+
+    @staticmethod
+    def _probe_opencode_catalog_cache() -> tuple[list[str], str | None]:
+        """Read the models-dev catalog cache; returns (models, failure reason).
+
+        This is a public catalog snapshot, not an account capability check.
+        """
+        # OpenCode stores the catalog in ~/.local/share/opencode/opencode.db
         import sqlite3
 
         db_path = Path.home() / '.local' / 'share' / 'opencode' / 'opencode.db'
         if not db_path.exists():
-            return []
+            return [], 'no catalog cache file'
 
         try:
             conn = sqlite3.connect(str(db_path))
@@ -241,7 +285,7 @@ class BackendDetector:
             conn.close()
 
             if not row:
-                return []
+                return [], 'catalog cache is empty'
 
             # Parse the JSON value
             catalog_data = json.loads(row[0])
@@ -256,11 +300,13 @@ class BackendDetector:
                         if model_info.get('status') != 'deprecated':
                             models.append(model_id)
 
-            return models
+            if not models:
+                return [], 'catalog cache has no models'
+            return models, None
 
         except (sqlite3.Error, json.JSONDecodeError, KeyError):
-            # Return empty on error - fallback handled by caller
-            return []
+            # Corrupt or unreadable cache — say so rather than guess.
+            return [], 'catalog cache is corrupt or unreadable'
 
     @staticmethod
     def _detect_claude_code() -> BackendInfo | None:
@@ -271,15 +317,17 @@ class BackendDetector:
 
         version = output.split('\n')[0] if output else 'unknown'
 
-        # Claude Code model list - current as of 2026
-        models = [
-            'claude-opus-5.5',
-            'claude-sonnet-5.5',
-            'claude-haiku-5.5',
-            'claude-fable-5.1',
-        ]
-
-        return BackendInfo('claude-code', 'claude', version, models)
+        # `claude` has no command to enumerate models (only --model), so we
+        # report none instead of inventing names. The backend still runs with
+        # whatever model Claude Code defaults to or is configured with.
+        return BackendInfo(
+            'claude-code', 'claude', version, [],
+            models_source=BackendInfo.SOURCE_UNKNOWN,
+            models_note=(
+                'Claude Code exposes no model-listing command; it uses its own '
+                'default or the model set via `claude config` / --model.'
+            ),
+        )
 
     @staticmethod
     def _detect_copilot() -> BackendInfo | None:
@@ -297,20 +345,13 @@ class BackendDetector:
         success, version_output = BackendDetector._run_command(['gh', '--version'])
         version = version_output.split('\n')[0] if version_output else 'unknown'
 
-        # Copilot uses GPT models - updated to latest
-        models = [
-            'gpt-6',
-            'gpt-6-turbo',
-            'gpt-5',
-            'gpt-5-turbo',
-            'gpt-4',
-            'gpt-4-turbo',
-            'gpt-4o',
-            'gpt-4o-mini',
-            'gpt-3.5-turbo',
-        ]
-
-        return BackendInfo('copilot', 'gh', version, models)
+        # The Copilot CLI has no model enumeration; the service picks the
+        # model. Report none rather than a guessed list.
+        return BackendInfo(
+            'copilot', 'gh', version, [],
+            models_source=BackendInfo.SOURCE_UNKNOWN,
+            models_note='Copilot CLI does not expose model selection; the service chooses the model.',
+        )
 
     @staticmethod
     def _detect_codex() -> BackendInfo | None:
@@ -321,29 +362,15 @@ class BackendDetector:
 
         version = output.split('\n')[0] if output else 'unknown'
 
-        # Try to read models from Codex config
-        models = BackendDetector._probe_codex_models()
-        if not models:
-            # Comprehensive GPT model list
-            models = [
-                'gpt-6',
-                'gpt-6-turbo',
-                'gpt-6-mini',
-                'gpt-5',
-                'gpt-5-turbo',
-                'gpt-4',
-                'gpt-4-turbo',
-                'gpt-4o',
-                'gpt-4o-mini',
-                'gpt-3.5-turbo',
-            ]
-
-        return BackendInfo('codex', 'codex', version, models)
+        # `codex` has no model-listing command either; its own cache/config
+        # files are the only real sources. No hardcoded fallback.
+        models, source, note = BackendDetector._probe_codex_models()
+        return BackendInfo('codex', 'codex', version, models, models_source=source, models_note=note)
 
     @staticmethod
-    def _probe_codex_models() -> list[str]:
-        """Try to read available models from Codex models cache."""
-        # First try models_cache.json (most accurate)
+    def _probe_codex_models() -> tuple[list[str], str, str | None]:
+        """Read models from Codex's own cache/config; returns (models, source, note)."""
+        # First try models_cache.json (written by Codex itself)
         cache_path = Path.home() / '.codex' / 'models_cache.json'
         if cache_path.exists():
             try:
@@ -359,37 +386,32 @@ class BackendDetector:
                                 if visibility in ('list', 'default'):
                                     models.append(model['slug'])
                         if models:
-                            return models
+                            return models, BackendInfo.SOURCE_CACHE, None
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # Fallback: try config.toml
+        # Secondary: the model explicitly set in config.toml
         config_path = Path.home() / '.codex' / 'config.toml'
-        if not config_path.exists():
-            return []
-
-        try:
-            content = config_path.read_text()
-            # Simple TOML parsing for model list
-            models = []
-            in_models_section = False
-            for line in content.split('\n'):
-                line = line.strip()
-                if line.startswith('[') and 'model' in line.lower():
-                    in_models_section = True
-                elif line.startswith('['):
-                    in_models_section = False
-                elif in_models_section and '=' in line:
-                    # Extract model name from lines like: model = "gpt-4"
-                    if 'model' in line.lower():
-                        parts = line.split('=')
+        if config_path.exists():
+            try:
+                content = config_path.read_text()
+                # Simple TOML parsing for the configured model
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if line.startswith('model') and '=' in line and not line.startswith('['):
+                        parts = line.split('=', 1)
                         if len(parts) == 2:
                             model = parts[1].strip().strip('"').strip("'")
-                            if model and model not in models:
-                                models.append(model)
-            return models
-        except (OSError, UnicodeDecodeError):
-            return []
+                            if model:
+                                return [model], BackendInfo.SOURCE_CONFIG, None
+            except (OSError, UnicodeDecodeError):
+                pass
+
+        return (
+            [], BackendInfo.SOURCE_UNKNOWN,
+            'Codex exposes no model-listing command and no usable cache/config was found; '
+            'the backend runs with its own default or the model set in ~/.codex/config.toml.',
+        )
 
 
 def main() -> None:
@@ -415,6 +437,9 @@ def main() -> None:
         print(f'   Version: {backend.version}')
         if backend.models:
             print(f'   Models: {", ".join(backend.models[:3])}{"..." if len(backend.models) > 3 else ""}')
+            print(f'   Source: {backend.models_source}')
+        elif backend.models_note:
+            print(f'   Models: (not enumerated — {backend.models_note})')
         print()
 
 
