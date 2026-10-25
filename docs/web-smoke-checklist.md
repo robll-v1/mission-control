@@ -22,19 +22,25 @@
 # 在独立 checkout 和新建临时目录中执行；不要照抄到正在使用的服务里。
 cd "$AMC_SMOKE"                         # 指向被测版本的独立 checkout
 export XDG_CONFIG_HOME="$SMOKE_TMP/xdg" # $SMOKE_TMP 必须是新建隔离目录
+export PYTHONPATH="$AMC_SMOKE/backend${PYTHONPATH:+:$PYTHONPATH}"
+export AMC_SMOKE_PYTHON="/path/to/python-with-project-dependencies" # 替换为已安装项目依赖的解释器
 unset AMC_MODEL
+"$AMC_SMOKE_PYTHON" -c 'from pathlib import Path; import app.cli; print(Path(app.cli.__file__).resolve()); print(Path(app.cli._root_dir()).resolve())'
+# 先在本机确认模块文件位于 "$AMC_SMOKE/backend/app/cli.py"、root 等于 "$AMC_SMOKE"；不要把这两行含本机路径的输出录入证据。
 python3 examples/first-review/make_demo_repo.py "$DEMO"
-amc start --port 18000 --ui-port 15173 --no-browser
+"$AMC_SMOKE_PYTHON" -m app.cli start --port 18000 --ui-port 15173 --no-browser
 ```
 
 注意：
 
-1. `amc start` 的上述参数已用本基线 help 核对；**启动本身未执行**。端口被占用时 CLI 会另选端口，以终端和日志中的实际值为准。
-2. 后端数据库 `data/amc.db` 与 `runtime` 使用相对路径（`backend/app/api/app.py:33-36`），所以必须从隔离 checkout 启动，才能用全新的数据库验证“无任务”。不要复用原工作区的数据，也不要对已有服务执行 `amc stop`。
-3. `amc start` 会将实际后端端口写入 `VITE_API_TARGET`（`backend/app/cli.py:399-417`）。若手工分别启动前后端，也要保证 `/api` 代理指向被测后端。
-4. `$DEMO` 只能由 fixture 生成，目标目录必须事先不存在。不要录入账号、密钥、cookie、请求头或私人路径；导出的 API 证据也要脱敏。
-5. 真实运行、取消和第二轮复审需要先确认模型调用权限与预算。检测出模型不代表能调用；无法满足时将相关项标为**阻塞**。
-6. 现有 `docs/screenshots/review-*.png`、`settings-*.png` 是历史素材，**不得作为本基线的通过证据**。
+1. `python -m app.cli start` 的上述参数已用本基线 help 核对；**启动本身未执行**。不要用裸 `amc`，它可能仍指向全局 editable 安装。使用已有项目依赖的 Python 解释器，并先确认 `app.cli.__file__` 与 `_root_dir()` 都属于 `$AMC_SMOKE`。后端 `18000` 与前端 `15173` 是不同端口；启动前确认未被占用。端口冲突时 CLI 会另选端口，以终端和日志中的实际值为准。
+2. 后端数据库 `data/amc.db` 与 `runtime` 使用相对路径（`backend/app/api/app.py:33-36`），所以必须从隔离 checkout 启动，才能用全新的数据库验证“无任务”。不要复用原工作区的数据，也不要停止已有服务。
+3. `python -m app.cli start` 会将实际后端端口写入 `VITE_API_TARGET`（`backend/app/cli.py:399-417`）。若手工分别启动前后端，也要保证 `/api` 代理指向被测后端。
+4. 使用与启动相同的 checkout、Python 解释器、`PYTHONPATH` 和 `XDG_CONFIG_HOME` 执行停止命令：`"$AMC_SMOKE_PYTHON" -m app.cli stop`。不要用裸 `amc stop`，也不要对无法确认归属的现有服务执行停止操作。
+5. 独立的 `XDG_CONFIG_HOME` 只隔离 AMC 配置，不保证不读取私人状态：检测器仍可能读取 `$HOME` 下的 Codex/OpenCode 缓存，后端 CLI 可能复用已有登录。真实模型调用须遵守已确认的账号授权与调用预算；不要记录或展示缓存、令牌、账号及私人路径，证据和画面须脱敏。
+6. `$DEMO` 只能由 fixture 生成，目标目录必须事先不存在。不要录入账号、密钥、cookie、请求头或私人路径；导出的 API 证据也要脱敏。
+7. 真实运行、取消和第二轮复审需要先确认模型调用权限与预算。检测出模型不代表能调用；无法满足时将相关项标为**阻塞**。
+8. 现有 `docs/screenshots/review-*.png`、`settings-*.png` 是历史素材，**不得作为本基线的通过证据**。
 
 ### UI 响应覆盖的用途与边界
 
@@ -72,8 +78,8 @@ W03–W06、W10A 可用浏览器 DevTools 的响应覆盖（例如 Network → O
 - **步骤**：
   1. 打开“模型选择”，确认标题不是“智能模型选择器”。
   2. 选择一个已检测后端，模型选“后端默认模型”，保存。
-  3. 改选其他后端，再切回；随后刷新页面并重新进入设置。
-- **预期**：默认模型对应空模型值，提示“不指定，由后端自己决定”；保存后提示“已保存。之后发起的审查会使用 …”；已保存后端显示“当前” pill，切回时恢复其已保存模型；刷新后选择仍在，未改动时“保存配置”禁用。依据：`frontend/src/Settings.tsx:97-123`、`:125-145`、`:255`、`:348-366`；API：`backend/app/api/routes_config.py:85-165`。
+  3. 仅当检测到至少两个后端时，才改选另一个后端再切回；随后刷新页面并重新进入设置。
+- **预期**：默认模型对应空模型值；若模型列表非空，选项提示“不指定，由后端自己决定”，若模型列表为空，则提示“这个后端没有提供可读取的模型列表”。保存后提示“已保存。之后发起的审查会使用 …”；已保存后端显示“当前” pill；执行了跨后端切换时，切回后恢复其已保存模型；刷新后选择仍在，未改动时“保存配置”禁用。依据：`frontend/src/Settings.tsx:97-123`、`:125-145`、`:255`、`:306-307`、`:348-366`；API：`backend/app/api/routes_config.py:85-165`。
 - **证据位**：`W02-default.png`、`W02-saved.png`、`W02-reload.png`；脱敏后的 `/api/config/current` 响应。
 - **实际结果**：（待填）
 - **执行状态**：**未执行**

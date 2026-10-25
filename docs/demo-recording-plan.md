@@ -19,24 +19,33 @@
 
 - 代码：独立、可丢弃的 checkout，变量统称为 `$AMC_DEMO_ROOT`；不要对正在使用的工作区或服务操作。
 - 数据：仅由 `examples/first-review/make_demo_repo.py` 生成 `$DEMO`。目标目录必须不存在，仓库由脚本初始化为 `main`，作者为 `Demo User <demo@example.com>`。
-- 配置：服务与 CLI 均使用独立的 `XDG_CONFIG_HOME`，不读取或展示私人配置；必要时额外设置独立的 `HOME`/工作目录。不要打印环境变量。
+- 配置与账号：独立的 `XDG_CONFIG_HOME` 只隔离 AMC 自己的配置文件，不保证隔离模型检测或后端 CLI 的私人状态。检测器仍可能读取 `$HOME` 下的 Codex/OpenCode 缓存；启动的 Agent CLI 也可能复用本机已有登录。录制前确认调用预算与账号授权；不要打印或录制环境变量、缓存内容或认证信息，所有可见输出都要检查并脱敏。
 - 画面：隐藏本机用户名、真实仓库绝对路径、账号名、邮箱、token、cookie、请求头及终端历史。任务详情会显示 `repo_path`，录屏时使用合成路径或后期遮盖。
 - 主题：主片用浅色；深色镜头必须在同一任务、同一结果状态下另拍，不能用旧截图拼接。
 - 等待：模型等待必须剪短，并在画面标注“等待已剪辑 / wait edited out”。不展示“秒级审查”“提速 N 倍”等结论。
 
 ## 3. 已核对 help 的命令
 
-本 worktree 中实际只运行了 `--help`，**没有启动服务、没有执行 review、没有调用模型**。`amc` 的 help 通过本基线的 `python -m app.cli` 入口读取，参数与 `amc` 子命令一致。
+本 worktree 中实际只运行了 `--help`，**没有启动服务、没有执行 review、没有调用模型**。录制时不要直接运行裸 `amc`：它可能仍指向全局安装的 editable 包。使用已有项目依赖的 Python 解释器，并通过 `PYTHONPATH` 指向目标 checkout 的 `backend`。启动前先只读核对模块文件和 `_root_dir()` 都落在目标 checkout；路径核对输出只在本地查看，不录屏或分享。
+
+```bash
+cd "$AMC_DEMO_ROOT"
+export PYTHONPATH="$AMC_DEMO_ROOT/backend${PYTHONPATH:+:$PYTHONPATH}"
+export AMC_DEMO_PYTHON="/path/to/python-with-project-dependencies" # 替换为已安装项目依赖的解释器
+"$AMC_DEMO_PYTHON" -c 'from pathlib import Path; import app.cli; print(Path(app.cli.__file__).resolve()); print(Path(app.cli._root_dir()).resolve())'
+# 确认第一行位于 "$AMC_DEMO_ROOT/backend/app/cli.py"，第二行等于 "$AMC_DEMO_ROOT" 后，再运行下面的命令。
+```
 
 | 用途 | 录制时命令（占位符需替换） | help 核对结果 |
 |---|---|---|
 | 创建合成仓库 | `cd "$AMC_DEMO_ROOT" && python3 examples/first-review/make_demo_repo.py "$DEMO"` | 已核对；`target` 必须不存在；脚本以相对路径调用，需在 checkout 根目录执行 |
 | 应用修复 | `python3 examples/first-review/make_demo_repo.py "$DEMO" --apply-fix` | 已核对；修复后保留非空工作区 diff（help 原文：re-review round has a genuine (non-empty) diff） |
-| 启动 Web | `cd "$AMC_DEMO_ROOT" && amc start --port 18000 --ui-port 15173 --no-browser` | 已核对 `start` 的 `--port`、`--ui-port`、`--no-browser`；高端口只是建议，被占用时 CLI 会另选端口，需记录实际值 |
-| 可选 CLI/SDK 镜头 | `amc review --repo "$DEMO" --backend <backend> --model <verified-model> --format json` | 已核对 `review` 的 `--repo`、`--backend`、`--model`、`--format {markdown,json}`；不是本轮必拍镜头 |
-| 可选完整复审 | `amc review --repo "$DEMO" --no-incremental` | 已核对；只有明确需要“替换历史结论”时才使用 |
+| 启动 Web | `cd "$AMC_DEMO_ROOT" && PYTHONPATH="$AMC_DEMO_ROOT/backend${PYTHONPATH:+:$PYTHONPATH}" "$AMC_DEMO_PYTHON" -m app.cli start --port 18000 --ui-port 15173 --no-browser` | 已核对 `start` 参数；后端 `18000` 与前端 `15173` 是独立端口。启动前确认两个端口未被占用；CLI 可能另选端口，需记录实际值 |
+| 停止 Web | 在同一 checkout、同一 Python 环境执行 `cd "$AMC_DEMO_ROOT" && PYTHONPATH="$AMC_DEMO_ROOT/backend${PYTHONPATH:+:$PYTHONPATH}" "$AMC_DEMO_PYTHON" -m app.cli stop` | 使用与启动相同的显式入口和 checkout；只停止本次隔离 checkout 的服务。若无法确认服务归属，先不要执行 stop |
+| 可选 CLI 镜头 | `cd "$AMC_DEMO_ROOT" && PYTHONPATH="$AMC_DEMO_ROOT/backend${PYTHONPATH:+:$PYTHONPATH}" "$AMC_DEMO_PYTHON" -m app.cli review --repo "$DEMO" --backend <backend> --model <verified-model> --format json` | 已核对 `review` 的 `--repo`、`--backend`、`--model`、`--format {markdown,json}`；不是本轮必拍镜头 |
+| 可选完整复审 | `cd "$AMC_DEMO_ROOT" && PYTHONPATH="$AMC_DEMO_ROOT/backend${PYTHONPATH:+:$PYTHONPATH}" "$AMC_DEMO_PYTHON" -m app.cli review --repo "$DEMO" --no-incremental` | 已核对；只有明确需要“替换历史结论”时才使用 |
 
-补充事实：`amc start` 会把实际后端端口写入前端的 `VITE_API_TARGET`（`backend/app/cli.py:399-417`）。后端数据库与 runtime 使用相对路径（`backend/app/api/app.py:33-36`），所以必须从隔离 checkout 启动；不要在原工作区运行上述命令。
+补充事实：`python -m app.cli start` 会把实际后端端口写入前端的 `VITE_API_TARGET`（`backend/app/cli.py:399-417`）。后端数据库与 runtime 使用相对路径（`backend/app/api/app.py:33-36`），所以必须从隔离 checkout 启动；不要在原工作区运行上述命令。XDG 配置隔离也不会清除已有 CLI 登录；终端输出、模型名称、账号信息和错误文本录制前都要检查脱敏。
 
 ## 4. 30 秒分镜
 
