@@ -72,14 +72,9 @@ if os.environ.get('NO_COLOR'):
 if os.environ.get('AMC_FORCE_COLOR'):
     _USE_COLOR = True
 
-if IS_WINDOWS:
-    _SYM_OK = '[OK]'
-    _SYM_WARN = '[!]'
-    _SYM_FAIL = '[x]'
-else:
-    _SYM_OK = '✅'
-    _SYM_WARN = '⚠️ '
-    _SYM_FAIL = '❌'
+_SYM_OK = '[OK]'
+_SYM_WARN = '[!]'
+_SYM_FAIL = '[x]'
 
 
 def _color(code: str, msg: str) -> str:
@@ -121,16 +116,80 @@ def _info(msg: str) -> None:
     print(_color('0;36', msg))
 
 
+def _eprint(msg: str = '') -> None:
+    print(msg, file=sys.stderr)
+
+
+def _print_json(payload: dict) -> None:
+    """Write machine-readable output as UTF-8 even when the console codepage differs."""
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + '\n'
+    stream = getattr(sys.stdout, 'buffer', None)
+    if stream is not None:
+        stream.write(text.encode('utf-8'))
+        stream.flush()
+    else:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+
+def _review_error(
+    message: str,
+    *,
+    code: str,
+    output_format: str,
+    hints: list[str] | tuple[str, ...] = (),
+    recoverable: bool = False,
+) -> None:
+    """Report a review failure on stderr and keep JSON stdout parseable."""
+    _eprint(f'{_SYM_FAIL} {message}')
+    for hint in hints:
+        _eprint(f'    {hint}')
+    if output_format == 'json':
+        summary = ' '.join([message, *hints])
+        _print_json({
+            'task_id': '',
+            'status': 'error',
+            'verdict': 'failed',
+            'passed': False,
+            'finding_count': 0,
+            'current_round_finding_count': 0,
+            'findings': [],
+            'summary': summary,
+            'rounds_executed': 0,
+            'duration_sec': 0.0,
+            'can_continue': False,
+            'error': {'code': code, 'message': summary, 'recoverable': recoverable},
+        })
+    sys.exit(2)
+
+
+def _no_changes_payload(base: str | None, message: str) -> dict:
+    return {
+        'task_id': '',
+        'status': 'no_changes',
+        'verdict': 'inconclusive',
+        'passed': True,
+        'finding_count': 0,
+        'current_round_finding_count': 0,
+        'findings': [],
+        'summary': message,
+        'rounds_executed': 0,
+        'duration_sec': 0.0,
+        'can_continue': False,
+        'base': base,
+    }
+
+
 def _ok(msg: str) -> None:
     print(_color('0;32', f'{_SYM_OK} {msg}'))
 
 
 def _warn(msg: str) -> None:
-    print(_color('0;33', f'{_SYM_WARN} {msg}'))
+    print(_color('0;33', f'{_SYM_WARN} {msg}'), file=sys.stderr)
 
 
 def _fail(msg: str) -> None:
-    print(_color('0;31', f'{_SYM_FAIL} {msg}'))
+    print(_color('0;31', f'{_SYM_FAIL} {msg}'), file=sys.stderr)
     sys.exit(1)
 
 
@@ -285,10 +344,11 @@ def cmd_start(args: argparse.Namespace) -> None:
     else:
         _warn('Node.js not found. Frontend will not be started.')
 
-    if _which('opencode'):
-        _ok('OpenCode: found')
+    detected_backends = _detect_backends()
+    if detected_backends:
+        _ok(f'Agent backends: {", ".join(detected_backends)}')
     else:
-        _warn('OpenCode not found in PATH. Reviews will fail until it is installed.')
+        _warn('No supported agent CLI found on PATH. Reviews will fail until one is installed.')
 
     gh_token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
     if not gh_token:
@@ -611,18 +671,21 @@ def cmd_init(args: argparse.Namespace) -> None:
     if is_global:
         from app.core.config import _global_config_path
         config_path = _global_config_path()
-        config_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _fail(f'Could not create config directory {config_path.parent}: {exc}')
         scope_label = 'Global'
     else:
         config_path = Path.cwd() / '.amc.yaml'
         scope_label = 'Project'
 
-    print(f'🚀 Mission Control — {scope_label} Setup')
+    print(f'Mission Control — {scope_label} Setup')
     print('=' * 42)
 
     if config_path.exists():
         try:
-            overwrite = input(f'\n⚠️  {config_path.name} already exists. Overwrite? [y/N]: ').strip().lower()
+            overwrite = input(f'\n{_SYM_WARN} {config_path.name} already exists. Overwrite? [y/N]: ').strip().lower()
         except (EOFError, KeyboardInterrupt):
             print('\nAborted.')
             return
@@ -632,25 +695,25 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     # Step 1: Detect available backends
     available = _detect_backends()
-    print(f'\n📡 Detected agent CLIs: {", ".join(available) if available else "none"}')
+    print(f'\nDetected agent CLIs: {", ".join(available) if available else "none"}')
 
     if not available:
-        print('\n⚠️  No supported agent CLI found on PATH.')
-        print('   Install one of: opencode, claude, gh (copilot), codex')
-        print('   Then re-run: amc init')
-        return
+        _eprint(f'\n{_SYM_WARN} No supported agent CLI found on PATH.')
+        _eprint('   Install one of: opencode, claude, gh (copilot), codex')
+        _eprint('   Then re-run: amc init')
+        sys.exit(1)
 
     # Step 2: Choose backend
     backend = _prompt_choice(
-        '🤖 Which agent backend for code review?',
+        'Which agent backend for code review?',
         available,
         default=available[0],
     )
 
     # Step 3: Model
-    print(f'\n📌 Model configuration:')
+    print('\nModel configuration:')
     print(f'   The model name is passed to {backend} via --model flag.')
-    print(f'   Examples: gpt-5.4, claude-sonnet-4, glm-5.1, deepseek-r1')
+    print('   Examples: gpt-5.4, claude-sonnet-4, glm-5.1, deepseek-r1')
     model = _prompt_input('   Model name (leave empty to use agent default)', '')
 
     if is_global:
@@ -663,11 +726,14 @@ backend:
   {backend}:
     model: '{model}'
 """
-        config_path.write_text(config_content, encoding='utf-8')
-        print(f'\n✅ Created {config_path}')
-        print(f'\n💡 This sets your default backend and model globally.')
-        print(f'   Per-project .amc.yaml can override these.')
-        print(f'   Run `amc init` (without --global) in a project to create project config.')
+        try:
+            config_path.write_text(config_content, encoding='utf-8')
+        except OSError as exc:
+            _fail(f'Could not write {config_path}: {exc}')
+        print(f'\n{_SYM_OK} Created {config_path}')
+        print('\nNote: this sets your default backend and model globally.')
+        print('   Per-project .amc.yaml can override these.')
+        print('   Run `amc init` (without --global) in a project to create project config.')
     else:
         # Project config: full settings
         default_branch = 'main'
@@ -680,7 +746,7 @@ backend:
                 default_branch = result.stdout.strip().split('/')[-1]
         except Exception:
             pass
-        base_branch = _prompt_input(f'\n🌿 Base branch for diff comparison', default_branch)
+        base_branch = _prompt_input('\nBase branch for diff comparison', default_branch)
 
         config_content = f"""repo:
   path: .
@@ -718,18 +784,21 @@ validation:
       required: false
       modes: ['standard', 'full']
 """
-        config_path.write_text(config_content, encoding='utf-8')
-        print(f'\n✅ Created {config_path}')
+        try:
+            config_path.write_text(config_content, encoding='utf-8')
+        except OSError as exc:
+            _fail(f'Could not write {config_path}: {exc}')
+        print(f'\n{_SYM_OK} Created {config_path}')
 
         # Show next steps
-        print(f'\n🎉 Setup complete! Next steps:')
-        print(f'   1. Make some code changes')
+        print('\nSetup complete! Next steps:')
+        print('   1. Make some code changes')
         review_cmd = 'amc review'
         if model:
             review_cmd += f' --model {model}'
         print(f'   2. Run: {review_cmd}')
-        print(f'   3. Or configure MCP for your agent:')
-        print(f'      {{"mcpServers": {{"mission-control": {{"command": "amc", "args": ["mcp"]}}}}}}')
+        print('   3. Or configure MCP for your agent:')
+        print('      {"mcpServers": {"mission-control": {"command": "amc", "args": ["mcp"]}}}')
     print()
 
 
@@ -741,44 +810,118 @@ def cmd_review(args: argparse.Namespace) -> None:
 
     # Save user's working directory BEFORE chdir
     user_cwd = os.getcwd()
-    repo_path = str(Path(args.repo or user_cwd).expanduser().resolve())
+    output_format = args.format
+    if args.rounds < 1:
+        _review_error(
+            f'--rounds must be a positive integer: got {args.rounds}.',
+            code='invalid_rounds',
+            output_format=output_format,
+            hints=['Use --rounds 1 or greater.'],
+        )
+    if args.timeout < 1:
+        _review_error(
+            f'--timeout must be a positive integer of seconds: got {args.timeout}.',
+            code='invalid_timeout',
+            output_format=output_format,
+            hints=['Use --timeout 1 or greater.'],
+        )
+    raw_repo = args.repo or user_cwd
+    repo_path_obj = Path(raw_repo).expanduser()
+    if not repo_path_obj.exists():
+        _review_error(
+            f'Repository path does not exist: {repo_path_obj}',
+            code='repo_not_found',
+            output_format=output_format,
+            hints=['Pass an existing repository with --repo PATH, or run amc review from inside one.'],
+        )
+    if not repo_path_obj.is_dir():
+        _review_error(
+            f'Repository path is not a directory: {repo_path_obj}',
+            code='repo_not_a_directory',
+            output_format=output_format,
+            hints=['--repo must point to a directory containing the repository.'],
+        )
+    repo_path = str(repo_path_obj.resolve())
     pr_url = args.pr_url if args.pr_url else None
-    from app.core.config import resolve_backend_config
-    backend_name = resolve_backend_config(repo_path, backend=args.backend)['backend']
 
-    # ── Preflight checks ──────────────────────────────────────────────
-    # Check 1: Is this a git repo?
-    if not pr_url:
-        git_check = run_text(['git', 'rev-parse', '--is-inside-work-tree'], cwd=repo_path)
-        if git_check.returncode != 0:
-            print(f'❌ Not a git repository: {repo_path}')
-            print(f'   amc review needs a git repo to compute diffs.')
-            print(f'   Run from inside a git repo, or use --repo PATH.')
-            sys.exit(1)
+    if pr_url:
+        from app.core.github_ingest import is_github_pr_url
+        if not is_github_pr_url(pr_url):
+            _review_error(
+                f'Invalid GitHub pull request URL: {pr_url}',
+                code='invalid_pr_url',
+                output_format=output_format,
+                hints=['Expected https://github.com/<owner>/<repo>/pull/<number>.'],
+            )
 
-    # Check 2: Is the backend CLI available?
-    # Source the backend -> executable mapping from the adapter registry so this
-    # preflight and ExecutionService._preflight_check cannot drift apart.
     backend_cmds = _backend_executables()
-    required_cmd = backend_cmds.get(backend_name, backend_name)
-    if not shutil.which(required_cmd):
-        print(f'❌ Backend "{backend_name}" not found: `{required_cmd}` is not on PATH.')
-        print(f'   Install it or choose a different backend with --backend.')
-        available = [name for name, cmd in backend_cmds.items() if shutil.which(cmd)]
-        if available:
-            print(f'   Available backends: {", ".join(available)}')
-        sys.exit(1)
+    supported = ', '.join(sorted(backend_cmds)) or '(none)'
+    requested_backend = args.backend
+    if requested_backend and requested_backend not in backend_cmds:
+        _review_error(
+            f'Unknown backend "{requested_backend}".',
+            code='unknown_backend',
+            output_format=output_format,
+            hints=[f'Supported backends: {supported}.'],
+        )
 
-    # Check 3: Any changes to review? (local-diff mode only)
+    from app.core.config import resolve_backend_config
+    backend_name = resolve_backend_config(repo_path, backend=requested_backend)['backend']
+    if backend_name not in backend_cmds:
+        _review_error(
+            f'Configured backend "{backend_name}" is not supported.',
+            code='unknown_backend',
+            output_format=output_format,
+            hints=[f'Supported backends: {supported}.'],
+        )
+
+    # ── Preflight checks (local-diff mode) ────────────────────────────
+    base = args.base if getattr(args, 'base', None) else None
     if not pr_url:
-        base = args.base if hasattr(args, 'base') and args.base else None
-        # Try to detect base branch
+        try:
+            git_check = run_text(['git', 'rev-parse', '--is-inside-work-tree'], cwd=repo_path)
+        except FileNotFoundError:
+            _review_error(
+                'git is not installed or is not available on PATH.',
+                code='git_unavailable',
+                output_format=output_format,
+                hints=['Install git and make sure `git` is available on PATH.'],
+            )
+        except OSError as exc:
+            _review_error(
+                f'Could not run git in {repo_path}: {exc}',
+                code='git_unavailable',
+                output_format=output_format,
+                hints=['Check that the repository path is readable and git can run.'],
+            )
+        # A bare repository answers returncode 0 with "false"; require "true".
+        if git_check.returncode != 0 or (git_check.stdout or '').strip() != 'true':
+            _review_error(
+                f'Not a git working tree: {repo_path}',
+                code='not_a_git_repo',
+                output_format=output_format,
+                hints=[
+                    'amc review needs a git repository to compute local changes.',
+                    'Run from inside a repository, or pass --repo PATH.',
+                ],
+            )
+
+        head_check = run_text(['git', 'rev-parse', '--verify', 'HEAD'], cwd=repo_path)
+        if head_check.returncode != 0:
+            _review_error(
+                f'Repository has no commits yet: {repo_path}',
+                code='no_commits',
+                output_format=output_format,
+                hints=['Create an initial commit before running amc review.'],
+            )
+
         if not base:
             for candidate in ['main', 'master', 'develop']:
                 check = run_text(['git', 'rev-parse', '--verify', candidate], cwd=repo_path)
                 if check.returncode == 0:
                     base = candidate
                     break
+
         if base:
             committed = run_text(['git', 'diff', '--quiet', f'{base}...HEAD'], cwd=repo_path)
             staged = run_text(['git', 'diff', '--cached', '--quiet'], cwd=repo_path)
@@ -786,68 +929,113 @@ def cmd_review(args: argparse.Namespace) -> None:
             untracked = run_text(['git', 'ls-files', '--others', '--exclude-standard'], cwd=repo_path)
             if committed.returncode == 0 and staged.returncode == 0 and unstaged.returncode == 0 \
                     and not (untracked.stdout or '').strip():
-                print(f'⚠️  No changes detected (base: {base})')
-                print(f'   Nothing to review — your branch is identical to {base}.')
-                print(f'   Make some commits or stage changes, then try again.')
+                message = f'No changes detected against {base}.'
+                _eprint(f'{_SYM_WARN} {message}')
+                _eprint('    Nothing to review; make a commit, stage changes, or add an untracked file, then re-run.')
+                if output_format == 'json':
+                    _print_json(_no_changes_payload(base, message))
                 sys.exit(0)
-    else:
-        base = args.base if hasattr(args, 'base') and args.base else None
 
-    # ── End preflight ─────────────────────────────────────────────────
+    # ── Backend preflight ─────────────────────────────────────────────
+    required_cmd = backend_cmds[backend_name]
+    if not shutil.which(required_cmd):
+        detected = [name for name, cmd in backend_cmds.items() if shutil.which(cmd)]
+        hints = [
+            f'Install {_BACKEND_DESC.get(backend_name, backend_name)} so `{required_cmd}` is on PATH, '
+            'or choose another backend with --backend.',
+        ]
+        if detected:
+            hints.append(f'Detected backends: {", ".join(detected)}.')
+        else:
+            hints.append('No supported agent CLI is currently detected on PATH.')
+        _review_error(
+            f'Backend "{backend_name}" is not installed: `{required_cmd}` was not found on PATH.',
+            code='backend_unavailable',
+            output_format=output_format,
+            hints=hints,
+        )
 
-    # Ensure we're in project dir for relative imports
+    # ── Run review ────────────────────────────────────────────────────
     root = _root_dir()
-    os.chdir(root)
+    try:
+        os.chdir(root)
+    except OSError as exc:
+        _review_error(
+            f'Could not switch to the project root {root}: {exc}',
+            code='chdir_failed',
+            output_format=output_format,
+        )
 
-    # Import SDK (heavy imports deferred)
-    from app.sdk import ReviewEngine, ReviewReport
+    from app.sdk import ReviewEngine
 
     max_rounds = args.rounds
     timeout = args.timeout
-    output_format = args.format
-    model = args.model if hasattr(args, 'model') and args.model else None
+    model = args.model if getattr(args, 'model', None) else None
 
-    print(f'🔍 Starting review...')
+    _eprint('Starting review...')
     if pr_url:
-        print(f'   PR: {pr_url}')
+        _eprint(f'   PR: {pr_url}')
     else:
-        print(f'   Mode: local diff (base: {base or "auto-detect"})')
-    print(f'   Repo: {repo_path}')
-    print(f'   Backend: {backend_name}')
-    print(f'   Max rounds: {max_rounds}')
+        _eprint(f'   Mode: local diff (base: {base or "auto-detect"})')
+    _eprint(f'   Repo: {repo_path}')
+    _eprint(f'   Backend: {backend_name}')
+    _eprint(f'   Max rounds: {max_rounds}')
 
-    engine = ReviewEngine(language='en', backend=backend_name, model=model)
-    if engine.model:
-        print(f'   Model: {engine.model}')
-    print()
+    try:
+        engine = ReviewEngine(language='en', backend=backend_name, model=model)
+        if engine.model:
+            _eprint(f'   Model: {engine.model}')
+        report = engine.review(
+            repo_path,
+            pr_url=pr_url,
+            base=base,
+            review_focus=args.focus or '',
+            max_rounds=max_rounds,
+            timeout_sec=timeout,
+            incremental=not getattr(args, 'no_incremental', False),
+        )
+    except KeyboardInterrupt:
+        _eprint(f'\n{_SYM_FAIL} Review interrupted.')
+        sys.exit(130)
+    except Exception as exc:
+        if os.environ.get('AMC_DEBUG'):
+            import traceback
+            traceback.print_exc()
+        _review_error(
+            f'Review could not run: {exc.__class__.__name__}: {exc}',
+            code='unexpected_error',
+            output_format=output_format,
+            hints=['Re-run with AMC_DEBUG=1 for a traceback if the problem persists.'],
+            recoverable=True,
+        )
 
-    report = engine.review(
-        repo_path,
-        pr_url=pr_url,
-        base=base,
-        review_focus=args.focus or '',
-        max_rounds=max_rounds,
-        timeout_sec=timeout,
-        incremental=not getattr(args, 'no_incremental', False),
-    )
-
-    # Output result
     if output_format == 'json':
-        output = _report_to_json(report)
-        print(json.dumps(output, indent=2, ensure_ascii=False))
+        _print_json(_report_to_json(report))
     else:
         _print_review_markdown(report)
 
-    # Exit code
-    if args.exit_code:
-        sys.exit(0 if report.passed else 1)
+    verdict = str(getattr(report.verdict, 'value', report.verdict))
+    if report.error is not None:
+        _eprint(f'{_SYM_FAIL} Review failed: {report.error.get("message", "unknown error")}')
+        sys.exit(2)
+    if verdict == 'failed':
+        _eprint(f'{_SYM_FAIL} Review failed: the backend did not produce a usable review result.')
+        sys.exit(2)
+    if args.exit_code and not report.passed:
+        sys.exit(1)
+    sys.exit(0)
 
 
 def _report_to_json(report) -> dict:
     """Convert ReviewReport to JSON-serializable dict."""
+    verdict = str(report.verdict.value) if hasattr(report.verdict, 'value') else str(report.verdict)
+    error_message = ''
+    if isinstance(report.error, dict):
+        error_message = str(report.error.get('message') or '')
     output = {
         'task_id': report.task_id,
-        'verdict': str(report.verdict.value) if hasattr(report.verdict, 'value') else str(report.verdict),
+        'status': 'failed' if report.error is not None or verdict == 'failed' else 'reviewed',
+        'verdict': verdict,
         'passed': report.passed,
         'finding_count': report.finding_count,
         'current_round_finding_count': len(report.findings),
@@ -860,7 +1048,7 @@ def _report_to_json(report) -> dict:
             }
             for f in report.findings
         ],
-        'summary': report.summary,
+        'summary': report.summary or error_message,
         'rounds_executed': report.rounds_executed,
         'duration_sec': report.duration_sec,
         'can_continue': report.can_continue,
@@ -892,16 +1080,22 @@ def _report_to_json(report) -> dict:
             ],
         }
 
-    if report.error:
+    if report.error is not None:
         output['error'] = report.error
+    elif verdict == 'failed':
+        output['error'] = {
+            'code': 'review_failed',
+            'message': report.summary or 'The backend did not produce a usable review result.',
+            'recoverable': True,
+        }
 
     return output
 
 
 def _print_review_markdown(report) -> None:
     """Pretty-print review report to terminal."""
-    icon = '✅' if report.passed else '❌'
-    print(f'{icon} Verdict: {report.verdict}')
+    marker = _SYM_OK if report.passed else _SYM_FAIL
+    print(f'{marker} Verdict: {report.verdict}')
     print(f'   Rounds: {report.rounds_executed} | Duration: {report.duration_sec:.1f}s')
 
     if report.is_incremental:
@@ -911,11 +1105,11 @@ def _print_review_markdown(report) -> None:
     print()
 
     if report.error:
-        print(f'⚠️  Error: {report.error["message"]}')
+        print(f'{_SYM_WARN} Error: {report.error["message"]}')
         print()
 
     if report.summary:
-        print(f'📋 Summary: {report.summary}')
+        print(f'Summary: {report.summary}')
         print()
 
     # Show findings with status if incremental
@@ -924,19 +1118,18 @@ def _print_review_markdown(report) -> None:
             new_count = sum(1 for fs in report.finding_statuses if fs.status == 'new')
             persistent_count = sum(1 for fs in report.finding_statuses if fs.status == 'persistent')
             unverified_count = sum(1 for fs in report.finding_statuses if fs.status == 'unverified')
-            print(f'🔎 Findings ({report.finding_count}): {new_count} new, {persistent_count} persistent, {unverified_count} unverified')
+            print(f'Findings ({report.finding_count}): {new_count} new, {persistent_count} persistent, {unverified_count} unverified')
             for fs in report.finding_statuses:
                 f = fs.finding
-                status_icon = {'new': '🆕', 'persistent': '🔄', 'unverified': '❔'}.get(fs.status, '•')
                 loc = ''
                 if f.path:
                     loc = f' ({f.path}'
                     if f.line:
                         loc += f':{f.line}'
                     loc += ')'
-                print(f'   {status_icon} [{f.severity}]{loc} {f.summary}')
+                print(f'   - [{fs.status}] [{f.severity}]{loc} {f.summary}')
         else:
-            print(f'🔎 Findings ({report.finding_count}):')
+            print(f'Findings ({report.finding_count}):')
             for f in report.findings:
                 loc = ''
                 if f.path:
@@ -949,14 +1142,14 @@ def _print_review_markdown(report) -> None:
 
     # Show resolved findings
     if report.resolved_findings:
-        print(f'✅ Resolved ({len(report.resolved_findings)}):')
+        print(f'Resolved ({len(report.resolved_findings)}):')
         for f in report.resolved_findings:
             loc = f' ({f.path}:{f.line})' if f.path else ''
-            print(f'   ✓ [{f.severity}]{loc} {f.summary}')
+            print(f'   - [fixed] [{f.severity}]{loc} {f.summary}')
         print()
 
     if report.can_continue:
-        print('💡 Can continue with more rounds to address findings.')
+        print('Note: more rounds are available to address findings.')
 
 
 # ── mcp command ───────────────────────────────────────────────────────
@@ -1016,11 +1209,15 @@ def main() -> None:
     review_p.add_argument('--base', '-b', default=None, help='Base branch for local diff (default: auto-detect)')
     review_p.add_argument('--backend', default=None, help='Backend agent (opencode, claude-code, copilot, codex)')
     review_p.add_argument('--model', '-m', default=None, help='Model override (priority: --model > $AMC_MODEL > .amc.yaml)')
-    review_p.add_argument('--rounds', type=int, default=1, help='Max review rounds (default: 1)')
-    review_p.add_argument('--format', choices=['markdown', 'json'], default='markdown', help='Output format')
+    review_p.add_argument('--rounds', type=int, default=1,
+                          help='Positive integer, max review rounds (default: 1)')
+    review_p.add_argument('--format', choices=['markdown', 'json'], default='markdown',
+                          help='Output format (json: stdout is JSON only; progress goes to stderr)')
     review_p.add_argument('--focus', '-f', default=None, help='Review focus (e.g. "security", "performance")')
-    review_p.add_argument('--timeout', type=int, default=600, help='Per-round timeout in seconds (default: 600)')
-    review_p.add_argument('--exit-code', action='store_true', help='Exit with code 1 if review has concerns')
+    review_p.add_argument('--timeout', type=int, default=600,
+                          help='Positive integer, per-round timeout in seconds (default: 600)')
+    review_p.add_argument('--exit-code', action='store_true',
+                          help='Exit 1 if review has concerns; setup/runtime errors exit 2')
     review_p.add_argument('--no-incremental', action='store_true', help='Review all current changes and replace prior findings')
 
     # mcp subcommand

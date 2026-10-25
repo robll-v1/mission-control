@@ -7,6 +7,8 @@ type Backend = {
   command: string
   model_count: number
   grouped_models?: Record<string, string[]>
+  models_source?: 'cli' | 'catalog_cache' | 'cache' | 'config' | 'unknown' | string
+  models_note?: string | null
 }
 
 type DetectResponse = {
@@ -39,6 +41,23 @@ const SEARCH_THRESHOLD = 8
 
 function displayName(name: string) {
   return DISPLAY_NAMES[name] ?? name
+}
+
+function modelSourceDescription(source: Backend['models_source'], modelCount: number) {
+  switch (source) {
+    case 'cli':
+      return '模型列表来自本机 CLI。'
+    case 'catalog_cache':
+      return '模型列表来自本机模型目录缓存。'
+    case 'cache':
+      return '模型列表来自本机缓存。'
+    case 'config':
+      return '模型列表来自本机配置。'
+    default:
+      return modelCount > 0
+        ? '模型列表来源未知。'
+        : '未能读取模型列表；仍可选择后端默认模型或保留已配置的模型。'
+  }
 }
 
 function CheckIcon() {
@@ -237,7 +256,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                     <span className="backend-check" aria-hidden="true">{active && <CheckIcon />}</span>
                   </span>
                   <span className="backend-meta">
-                    {backend.model_count ? `${backend.model_count} 个可用模型` : '使用后端默认模型'}
+                    {backend.model_count ? `已发现 ${backend.model_count} 个模型` : '使用后端默认模型'}
                   </span>
                   <span className="backend-version mono">{backend.version || '版本未知'}</span>
                 </label>
@@ -264,6 +283,10 @@ export function Settings({ onBack }: { onBack: () => void }) {
             </div>
 
             <div className="settings-card model-card">
+              <p className="model-hint">
+                {modelSourceDescription(currentBackend.models_source, currentBackend.models.length)} {currentBackend.models_note}
+                {' '}列表不代表账号调用权限，能否调用请以实际请求结果为准。
+              </p>
               {currentBackend.models.length > SEARCH_THRESHOLD && (
                 <div className="model-search">
                   <input

@@ -22,6 +22,14 @@ class BackendResponse(BaseModel):
     command: str
     model_count: int  # Total models before filtering
     grouped_models: dict[str, list[str]] | None = None  # Optional grouped view
+    # Where the model list came from ('cli' / 'catalog_cache' / 'cache' /
+    # 'config' / 'unknown') and why it is empty when it is. Additive fields:
+    # existing clients keep working and just ignore them.
+    models_source: str = 'unknown'
+    models_note: str | None = None
+    # Enumeration never proves usability: detection makes no model calls, so
+    # this stays false until a real review round has run that model.
+    models_call_verified: bool = False
 
 
 class DetectResponse(BaseModel):
@@ -60,6 +68,9 @@ def detect_backends():
                     name=b.name,
                     version=b.version,
                     models=b.models,
+                    models_source=b.models_source,
+                    models_note=b.models_note,
+                    models_call_verified=b.models_call_verified,
                     command=b.command,
                     model_count=len(b.models),
                     grouped_models=ModelFilter.group_models(b.models) if len(b.models) > 20 else None,

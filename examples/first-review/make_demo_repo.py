@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Create a tiny synthetic repo for the first-review demo.
+
+The demo repo contains one real, explainable bug: ``search()`` is rewritten
+to build its SQL with an f-string, so a caller-supplied keyword can inject
+SQL. Everything is synthetic — no credentials, no network, no private code.
+
+``--apply-fix`` restores the parameterized query and additionally escapes
+LIKE wildcards — a real improvement that stays in the working tree, so the
+re-review round has a genuine (non-empty) diff to review.
+
+Usage:
+    python3 make_demo_repo.py [TARGET_DIR]     # create repo with the bug
+    python3 make_demo_repo.py TARGET --apply-fix   # apply the fix (still uncommitted)
+
+Then, from anywhere:
+    amc review --repo TARGET --backend opencode --format json
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+SAFE_NOTES = '''"""A tiny note store backed by sqlite3."""
+import sqlite3
+import sys
+
+
+class NoteStore:
+    def __init__(self, path: str = "notes.db"):
+        self.conn = sqlite3.connect(path)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, title TEXT, body TEXT)"
+        )
+        self.conn.commit()
+
+    def add(self, title: str, body: str) -> int:
+        cursor = self.conn.execute(
+            "INSERT INTO notes (title, body) VALUES (?, ?)", (title, body)
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def search(self, keyword: str):
+        # Parameterized: the keyword is bound, never interpreted as SQL.
+        cursor = self.conn.execute(
+            "SELECT id, title, body FROM notes WHERE title LIKE ?", (f"%{keyword}%",)
+        )
+        return cursor.fetchall()
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    store = NoteStore()
+    if len(argv) < 2:
+        print("usage: notes.py add TITLE BODY | notes.py find KEYWORD")
+        return 2
+    command, arg = argv[0], argv[1]
+    if command == "add":
+        note_id = store.add(arg, argv[2] if len(argv) > 2 else "")
+        print(f"added note {note_id}")
+    elif command == "find":
+        for row in store.search(arg):
+            print(row)
+    else:
+        print(f"unknown command: {command}")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+BUGGY_NOTES = SAFE_NOTES.replace(
+    '''    def search(self, keyword: str):
+        # Parameterized: the keyword is bound, never interpreted as SQL.
+        cursor = self.conn.execute(
+            "SELECT id, title, body FROM notes WHERE title LIKE ?", (f"%{keyword}%",)
+        )
+        return cursor.fetchall()''',
+    '''    def search(self, keyword: str):
+        # Interpolating the keyword directly is shorter than binding it.
+        cursor = self.conn.execute(
+            f"SELECT id, title, body FROM notes WHERE title LIKE '%{keyword}%'"
+        )
+        return cursor.fetchall()''',
+)
+
+# The fix restores the parameterized query AND escapes LIKE wildcards — a
+# real, harmless improvement (round 1 flagged the unescaped wildcards as a
+# low finding). Leaving this change in place keeps a non-empty diff for the
+# re-review round; restoring SAFE_NOTES verbatim would make the worktree
+# byte-identical to HEAD and the second round would review an empty diff.
+FIX_NOTES = SAFE_NOTES.replace(
+    '''    def search(self, keyword: str):
+        # Parameterized: the keyword is bound, never interpreted as SQL.
+        cursor = self.conn.execute(
+            "SELECT id, title, body FROM notes WHERE title LIKE ?", (f"%{keyword}%",)
+        )
+        return cursor.fetchall()''',
+    '''    def search(self, keyword: str):
+        # Parameterized: the keyword is bound, never interpreted as SQL, and
+        # LIKE wildcards in it are escaped so % and _ match literally.
+        escaped = keyword.replace("\\\\", "\\\\\\\\").replace("%", "\\\\%").replace("_", "\\\\_")
+        cursor = self.conn.execute(
+            "SELECT id, title, body FROM notes WHERE title LIKE ? ESCAPE \'\\\\\'",
+            (f"%{escaped}%",),
+        )
+        return cursor.fetchall()''',
+)
+
+
+def git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("target", nargs="?", default="amc-demo-notes", help="directory to create (must not exist)")
+    parser.add_argument("--apply-fix", action="store_true", help="restore the parameterized query in an existing demo repo")
+    args = parser.parse_args()
+
+    repo = Path(args.target).resolve()
+
+    if args.apply_fix:
+        notes = repo / "notes.py"
+        if not notes.is_file() or notes.is_symlink():
+            print(f"error: {notes} is missing or is not a regular file", file=sys.stderr)
+            return 1
+
+        try:
+            root = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            print(f"error: could not inspect Git repo at {repo}: {exc}", file=sys.stderr)
+            return 1
+        if root.returncode != 0 or Path(root.stdout.strip()).resolve() != repo:
+            print(f"error: {repo} is not a generated first-review fixture repo", file=sys.stderr)
+            return 1
+
+        try:
+            baseline = subprocess.run(
+                ["git", "-C", str(repo), "show", "HEAD:notes.py"],
+                capture_output=True,
+                check=False,
+            )
+            identity = subprocess.run(
+                ["git", "-C", str(repo), "show", "-s", "--format=%s", "HEAD"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            print(f"error: could not inspect Git repo at {repo}: {exc}", file=sys.stderr)
+            return 1
+        if (
+            baseline.returncode != 0
+            or baseline.stdout != SAFE_NOTES.encode("utf-8")
+            or identity.returncode != 0
+            or identity.stdout.strip() != "Add note store with parameterized queries"
+        ):
+            print(f"error: {repo} does not have the expected first-review fixture baseline", file=sys.stderr)
+            return 1
+
+        try:
+            current = notes.read_bytes()
+        except OSError as exc:
+            print(f"error: could not read {notes}: {exc}", file=sys.stderr)
+            return 1
+        if current == FIX_NOTES.encode("utf-8"):
+            print(f"Fix is already applied in {repo}.")
+            return 0
+        if current != BUGGY_NOTES.encode("utf-8"):
+            print(
+                f"error: {notes} has unrecognized contents; refusing to overwrite it",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            notes.write_bytes(FIX_NOTES.encode("utf-8"))
+        except OSError as exc:
+            print(f"error: could not write {notes}: {exc}", file=sys.stderr)
+            return 1
+        print(f"Fix applied in {repo} (uncommitted, keeps a real LIKE-escaping improvement).")
+        return 0
+
+    if repo.exists():
+        print(f"error: {repo} already exists", file=sys.stderr)
+        return 1
+
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, capture_output=True)
+    git(repo, "config", "user.name", "Demo User")
+    git(repo, "config", "user.email", "demo@example.com")
+    git(repo, "config", "core.autocrlf", "false")
+    git(repo, "config", "commit.gpgsign", "false")
+    (repo / "notes.py").write_bytes(SAFE_NOTES.encode("utf-8"))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "Add note store with parameterized queries")
+    (repo / "notes.py").write_bytes(BUGGY_NOTES.encode("utf-8"))  # uncommitted change
+
+    print(f"Demo repo ready at {repo}")
+    print(f"HEAD is the safe base; the working tree adds an SQL-injection bug in notes.py:search().")
+    print(f"\nFirst review:")
+    print(f"  amc review --repo {repo} --backend opencode --format json")
+    print(f"\nAfter reviewing, apply the fix and re-review:")
+    print(f"  python3 {Path(__file__).resolve()} {repo} --apply-fix")
+    print(f"  amc review --repo {repo} --backend opencode --format json")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

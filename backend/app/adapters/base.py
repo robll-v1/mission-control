@@ -99,6 +99,16 @@ class RunnerAdapter(ABC):
         payload = {'type': event_type}
         if session_id:
             payload['session_id'] = session_id
+        # OpenCode emits stream errors (provider.quota, etc.) as
+        # {"type":"error","error":{...}}; without the nested message a quota
+        # exhaustion looks like a content-less failure.
+        error = obj.get('error')
+        if isinstance(error, dict):
+            level = 'error'
+            for key in ('type', 'message', 'status'):
+                if error.get(key) is not None:
+                    payload[f'error_{key}'] = error.get(key)
+            return [AdapterEvent(kind=f'agent.{event_type}', level=level, payload=payload)]
         return [AdapterEvent(kind=f'agent.{event_type}', payload=payload)]
 
     def parse_stderr_line(self, line: str) -> list[AdapterEvent]:
