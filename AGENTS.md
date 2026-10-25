@@ -93,7 +93,14 @@ CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.
 - Claude 运行的 Bash 沙箱**没有网络**，pip、`gh`、`git push` 需要在用户的终端里执行。GPT 那边的环境可能不同，以实际情况为准。
 - 用户的网络连 GitHub 偶尔会出现 `SSL_ERROR_SYSCALL`，通常是暂时的，重试即可。
 
-## 9. 当前状态（2026-10-24 更新）
+## 9. 当前状态（2026-10-25 更新）
+
+- Codex 本轮审核：PR #22 (`codex/launch-acceptance` / `5476de2`) 已存在；准确 head 的 CI run `40105840872`，9 个后端矩阵与 Frontend 全部成功，代码审核通过。发布门槛仍按下文区分，不将 CI 通过等同于真实模型 E2E。
+- WorkBuddy 新文档 `codex/demo-plan-workbuddy` 基于 #22；演示分镜与 Web 清单全部标注尚未执行。Codex 补正明确 checkout 入口、配置隔离范围与模型默认提示后提交审查；需先合并 #22。
+- GLM `codex/preflight-cancel-glm` / `d688729`：独立全量 `153 passed, 1 skipped`，但额外复现准备期间取消被 INGESTING 覆盖，以及最后取消检查后仍启动 worker 两处竞态，暂不就绪。
+- Qoder `codex/install-smoke-qoder` / `bf1ed4c`：独立全量 `157 passed, 1 skipped`，但发现陈旧 PID 可扩大为误杀整个无关进程组、启动失败删除诊断日志，暂不就绪。
+- 远端 `feat/mission-console-ui` / `1935782`：TypeScript 检查报 `ImportMeta.env` 缺失类型，且 Settings 切回后端未恢复已保存模型；暂不就绪。远端 `fix/review-pipeline-integrity` / `f1f0c09` 的新增部分：构建虽 exit 0 但有 CSS 语法告警，seed 结果 6 findings 被读取为计数 0，暂不就绪。
+- 原工作区由他人切回本地 `main` / `b3f3cbc`（落后远端）；Codex 未切换或快进。现有四份 stash（含原两份）与 `.workbuddy/` 保留。本轮验证使用隔离工作树/临时导出，不启动真实 Agent。
 
 - PR #17、#18、#19、#20、#21 均已合并；本轮整合基线 `main` / `7a093bd`。
 - 当前分支 `codex/launch-acceptance`：Codex 统一验收 GLM、Qoder、WorkBuddy 的独立工作，尚未合并。GLM 源提交 `0587e1f`，Qoder 源提交 `ad90dab`，WorkBuddy 源提交 `f088429`。
@@ -101,7 +108,7 @@ CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.
 - Qoder：CLI 错误可操作、JSON stdout 纯净、失败退出码非零、非正轮数/超时拒绝；清理 CLI emoji。`argparse` 语法错误仍走标准 stderr，JSON 语法错误封装不在本轮范围。
 - WorkBuddy：发布文案及快照/并发/增量设计文章。Codex 已删改夸大表述，并在设置页显示模型来源和调用权限未验证提示。
 - 最终整合工作区后端全量 `pytest -q`：`147 passed, 1 skipped`，34.04s，退出码 0；前端 `npx tsc --noEmit` 与 `npm run build` 通过。Qoder CLI focused 测试 `23 passed`，演示 fixture focused 测试 `4 passed`；独立 reviewer 接受 fixture 防覆盖修复。
-- 这些是本地验收结果；当前尚未 push，因此没有本轮 CI 结论，不能声称 CI 通过。
+- 上述本地验收对应的最终提交为 `5476de2`，已推送并开 PR #22；该准确 head 的 CI 结论见本节顶部。
 - 真实模型首轮已识别合成 SQL 注入；第二轮虽真实调用，但原示例恢复为 HEAD 导致空 diff，**有效修复 diff 复审未验收**。后补示例已离线验证，不允许额外调用或冒充 E2E 通过。
 - 发布判断：工程补强可进入 PR 审查和小范围试用；正式演示推广前，需完成非空修复 diff 的真实复审、干净环境安装与 Web 操作流程验证，再录约 30 秒剪辑演示。
 - 已知边界：150 秒 preflight 阶段不可取消；opencode 旧版本未验证；SDK 增量历史仍基于 HEAD 而非上一轮未提交快照；Web 只看最新一轮，不能宣称有 SDK 增量聚合；子模块内部未提交内容不在父仓库快照中；PATH shim 不是沙箱。
@@ -110,6 +117,8 @@ CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.
 ## 10. 交接日志
 
 每次收工追加一条，最新的放在最上面。格式：日期 · 谁 · 分支/PR · 做了什么 · 没做完或没验证的 · 下一步建议。
+
+- 2026-10-25 · Codex · 分支就绪审核 / #22 · 核对全部远端与三方新交付，独立重跑 GLM 153、Qoder 157 项测试并发现测试外阻塞；核对 #22 准确 head 的全部 CI 成功；补正 WorkBuddy 两文档的执行隔离说明 · 新 UI、取消修复与安装修复仍需补修，真实复审/Web E2E 未验收 · 仅为通过审核的内容开 PR，不合并分支。
 
 - 2026-10-24 · Codex（协调 GLM/Qoder/WorkBuddy）· `codex/launch-acceptance` · 整合模型来源、CLI 边界与发布文案；本地后端全量 `147 passed, 1 skipped`（34.04s，exit 0）、前端 tsc/build 通过；CLI focused 23 项、fixture focused 4 项通过，fixture 补修获独立 reviewer ACCEPT · 未 push，故无 CI 结论；真实非空修复 diff 复审、干净安装、Web E2E 未验收 · 先小范围试用，完成发布门槛后再录演示。
 
