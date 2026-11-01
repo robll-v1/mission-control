@@ -40,7 +40,8 @@ Reproduction (probe = `python -c "time.sleep(8)"`, script driven by latches):
   based).
 - The probe wait polls `communicate(timeout=0.25)` in a loop watching
   cancellation and the deadline; on either it terminates and reaps the probe
-  before raising (`PreflightCancelledError` / `PreflightError`).
+  before raising (`PreflightCancelledError` / `PreflightError`;
+  renamed `RoundCancelledError` in section 7).
 - `start_task`'s unwind now pops the slot only if the entry is still its own
   placeholder, and `_launch_round` refuses to create the Run/worker once
   `cancel_requested` is set — a cancelled round never writes `FAILED` (the
@@ -88,15 +89,44 @@ termination goes through the existing `_terminate_process` Windows path
 Not executed on a Windows machine here — the CI matrix covers it, so no
 Windows result is claimed.
 
-## 6. Known limitations (unchanged or accepted)
+## 6. Known limitations at this stage
+
+Superseded by section 7: the worker-start window below is now cancellable.
 
 - **Worker-start micro-window** (Run created, agent process not yet
-  registered): `abort_task` still returns `False`. The agent round then runs
-  to completion, but finalisation keeps the task ABORTED (stage guard) and
-  marks the run `aborted` — baseline behaviour, intentionally not expanded
-  here.
+  registered): `abort_task` still returns `False`.
 - **Prepare-phase cancellation is boundary-checked**: a cancel landing during
-  snapshot/worktree/compile is honoured at the next boundary (the pre-Run
-  guard), not by interrupting the current step.
+  snapshot/worktree/compile is honoured at the next boundary, not by
+  interrupting the current step. (Still true after section 7.)
 - **Direct `_preflight_check` calls without a reserved slot** (tests, manual
   probes) are uncancellable by design — there is no round to cancel.
+
+## 7. Follow-up: the two review races and the Web UI path (`fix/preflight-cancel`)
+
+Codex's review of section 2 reproduced two races. Both, plus the gaps
+below, were first reproduced by new tests failing on the code from
+section 2, then fixed.
+
+| Problem | Before | After |
+|---|---|---|
+| Abort during the snapshot refresh | the unconditional INGESTING write that followed overwrote ABORTED; task stuck at `ingesting/prepare_review`, no Run | every stage change checks the cancel flag under the db lock abort uses to publish flag + ABORTED; refreshes update fields instead of saving a stale `Task` |
+| Abort between the last check and the agent launch | refused (`False`), or rolled back by a stale save; the round then ran to completion | the handoff (check, Run, task fields, RUNNING) is one locked section; the worker checks the flag before and right after spawning |
+| Web UI during preflight | task kept its old status for up to 150s; 中止 only enabled for `running` | task shows `ingesting/preflight` once reserved; 中止 enabled for `ingesting` and `running`; the expected failure of an aborted start is not shown as an error |
+| Round 2+ while preparing | task listing repainted INGESTING (and VALIDATING) to `waiting_human` because the previous Run had finished | only RUNNING is repaired |
+| Failed or cancelled launch | slot released before cleanup; a cancelled prepare left its worktree | cleanup first, then release, so an immediate restart keeps its worktree |
+| Preflight failure | task status unchanged, reason only in the HTTP error | `failed/preflight_failed` plus an `error` event with `phase` |
+| Ctrl+C in `amc review` during preflight | probe (own session) kept running | probe is stopped on any exception |
+| Double termination | abort and the probe wait could both signal a reaped pid | `_terminate_process` skips processes already reaped |
+
+`PreflightCancelledError` was renamed `RoundCancelledError`, since it is now
+raised in every phase before the agent starts. `control.accepted` carries
+the actual phase (`preflight` / `prepare` / `running`).
+
+Verification (macOS arm64, fake probes and agents, no real model):
+12 new test cases; the 11 covering changed behaviour failed for the
+reproduced reason before the fix, the 12th pins the RUNNING repair that
+was kept; full
+suite `165 passed, 1 skipped`; the cancellation and concurrency files
+repeated 25 times with no failure; frontend `tsc --noEmit` and
+`npm run build` pass. Not yet run: the Web flow in a browser (checklist
+W09) and Windows outside CI.

@@ -145,19 +145,19 @@ W03–W06、W10A 可用浏览器 DevTools 的响应覆盖（例如 Network → O
 
 - **前置**：W07 创建成功；本次模型已确认可调用且有预算；先另跑一轮允许完成的审查，确认 Web 能收到真实结果。取消测试不得挤占未批准的调用。
 - **步骤**：开始一轮审查；等待 start 请求完成且状态进入“审查中”；点击“中止”；持续观察至 worker 收尾。
-- **预期**：运行中“开始”禁用、“中止”可用；成功取消后任务为“已中止”，运行按钮恢复可用；最终状态不能被迟到的 worker 改写成 failed/completed。取消轮不得因半截输出显示“未发现明显问题”；若展示其结果，应为“结论不明确”。依据：`frontend/src/App.tsx:526-546`、`:569-570`、`:703-721`，`backend/app/core/execution.py:224-269`。
+- **预期**：运行中“开始”禁用、“中止”可用；成功取消后任务为“已中止”，运行按钮恢复可用；最终状态不能被迟到的 worker 改写成 failed/completed。取消轮不得因半截输出显示“未发现明显问题”；若展示其结果，应为“结论不明确”。依据：`frontend/src/App.tsx` 的 `startReviewRound`、`abortTask`、`isRoundActive` 与 `.detail-bar` 按钮，`backend/app/core/execution.py` 的 `abort_task`、`_persist_round_result`。
 - **证据位**：`W08-running.png`、`W08-aborted.png`；run/task JSON；事件中含 `control.accepted`。
 - **实际结果**：（待填）
 - **执行状态**：**未执行**
 
 若本轮太快而来不及取消，记为**阻塞**，不要为了截图反复消耗额度。单元回归证据：`test_abort_survives_worker_finalisation`、`test_abort_during_result_parsing_is_not_lost`、`test_cancelled_output_cannot_certify_clear`；它们不是本次 Web 实测。
 
-### W09 preflight 边界
+### W09 preflight 期间取消
 
-- **前置**：同 W08，但只观察，不假设可以取消。
-- **步骤**：点击开始后，在 start 请求仍 pending、任务尚未进入 running 时观察按钮和任务状态；等请求返回后再记录。
-- **预期**：preflight 在创建 Run 和设置 running 之前同步执行（`backend/app/core/execution.py:115-121`、`:183-222`），所以这段时间“中止”可能仍禁用；不能把它判成“运行中取消失败”。已知 preflight 最长等待 150 秒且没有取消路径。若 preflight 抛错，API 返回 409，通常还没有新 Run；不要预设任务一定进入 failed。
-- **证据位**：`W09-preflight-timing.png`；请求起止时间、任务/轮次 JSON。
+- **前置**：同 W08。preflight 越慢越容易观察；不要为了拉长 preflight 去改动用户环境。
+- **步骤**：点击开始；在 start 请求仍 pending 时观察状态与按钮；点击“中止”；等 start 请求返回后再记录。
+- **预期**：点击开始后约 1 秒内任务显示“准备中 · 检查审查后端”，“开始”禁用、“中止”可用。中止后任务为“已中止”，没有新 Run，不出现红色错误 banner；可以立即再次开始。preflight 自身失败时任务为“失败 · 后端检查失败”，事件流里有带原因的 `error` 事件。依据：`ExecutionService._launch_round` / `abort_task` / `_finish_failed_launch`（`backend/app/core/execution.py`），`frontend/src/App.tsx` 的 `isRoundActive`、`startReviewRound`、`abortTask`。单元回归：`backend/tests/test_preflight_cancellation.py`，不是本次 Web 实测。
+- **证据位**：`W09-preflight-cancel.png`；请求起止时间、任务/轮次 JSON；事件中含 `control.accepted`（`phase: preflight`）。
 - **实际结果**：（待填）
 - **执行状态**：**未执行**
 
@@ -176,7 +176,7 @@ W03–W06、W10A 可用浏览器 DevTools 的响应覆盖（例如 Network → O
 
 - **前置**：不通过破坏用户环境来制造失败；若获批的隔离运行自然失败，保留原始输出。
 - **步骤**：记录失败发生在 preflight、准备阶段还是 worker 执行阶段，再核对 UI。
-- **预期**：准备阶段失败应为 failed / `review_prepare_failed`；worker 失败应为 failed / `review_failed`。preflight 失败遵循 W09，不强行要求相同状态。依据：`backend/app/core/execution.py:121-168`、`:247-269`，`backend/app/api/routes_control.py`。
+- **预期**：preflight 失败应为 failed / `preflight_failed`；准备阶段失败应为 failed / `review_prepare_failed`；两者都有带 `phase` 的 `error` 事件。worker 失败应为 failed / `review_failed`。依据：`ExecutionService._finish_failed_launch`、`_run_task`（`backend/app/core/execution.py`），`backend/app/api/routes_control.py`。
 - **证据位**：`W10B-failure.png`；原始事件与 run JSON。
 - **实际结果**：（待填）
 - **执行状态**：**未执行**
@@ -237,7 +237,7 @@ W03–W06、W10A 可用浏览器 DevTools 的响应覆盖（例如 Network → O
 | W06 | 配置加载失败 | 未执行 | 无 |
 | W07 | 创建本地审查 | 未执行 | 无 |
 | W08 | 真实运行与运行中取消 | 未执行 | 无 |
-| W09 | preflight 不可取消边界 | 未执行 | 无 |
+| W09 | preflight 期间取消 | 未执行 | 无 |
 | W10A/B | 启动错误与真实失败分阶段 | 未执行 | 无 |
 | W11 | finding 路径与缺失位置 | 未执行 | 无 |
 | W12 | Web 最新轮 vs SDK 增量 | 未执行；非空 diff 的第二轮真实复审未验收 | 无 |
