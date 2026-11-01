@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import shutil
@@ -24,6 +25,8 @@ from app.services.artifact_store import ArtifactStore
 from app.services.local_review_service import capture_local_snapshot
 from app.services.review_result_service import ReviewResultService
 
+logger = logging.getLogger(__name__)
+
 
 class IdleTimeoutError(RuntimeError):
     pass
@@ -33,8 +36,12 @@ class PreflightError(RuntimeError):
     pass
 
 
-class PreflightCancelledError(RuntimeError):
-    """The round was aborted while its preflight probe (or prepare) was running."""
+class RoundCancelledError(RuntimeError):
+    """The round was aborted before its review agent started.
+
+    Raised on the starting thread (preflight, prepare, handoff) and by the
+    worker when the cancel lands before it launches the agent.
+    """
 
 
 class BackendUnavailableError(RuntimeError):
@@ -55,10 +62,15 @@ class ActiveProcess:
     run_id: str | None
     process: subprocess.Popen[str] | None
     worker: threading.Thread | None
-    # Set by abort_task before any process exists to kill (preflight/prepare
-    # run synchronously on the start caller's thread). The preparing thread
-    # checks it around the probe and before creating the round.
+    # Set by abort_task, in the same db-locked section that writes ABORTED.
+    # Preflight and prepare run on the start caller's thread with no review
+    # process to kill, so that thread (and later the worker) checks the flag
+    # at every step instead.
     cancel_requested: bool = False
+    # 'preflight' -> 'prepare' -> 'running'. Written under the db lock, so
+    # abort_task reads it consistently; it labels the abort event and tells
+    # a failed launch whether there is a worktree to clean up.
+    phase: str = 'preflight'
 
 
 class ExecutionService:
@@ -107,14 +119,40 @@ class ExecutionService:
             self._active[task_id] = placeholder
         try:
             return self._launch_round(task, prompt, review_note, language, placeholder)
-        except BaseException:
-            with self._lock:
-                # Pop only our own reservation: if the entry was replaced
-                # (a started round re-registers with its real process), it
-                # belongs to that round and must survive this unwind.
-                if self._active.get(task_id) is placeholder:
-                    self._active.pop(task_id, None)
+        except BaseException as exc:
+            try:
+                # Settle the task while the slot is still held: once it is
+                # released a restart may begin, and this cleanup must not
+                # remove the restarted round's worktree or overwrite its stage.
+                self._finish_failed_launch(task_id, placeholder, exc)
+            except Exception:
+                logger.exception('failed to settle task %s after an unsuccessful launch', task_id)
+            finally:
+                with self._lock:
+                    # Pop only our own reservation: if the entry was replaced
+                    # (a started round re-registers with its real process), it
+                    # belongs to that round and must survive this unwind.
+                    if self._active.get(task_id) is placeholder:
+                        self._active.pop(task_id, None)
             raise
+
+    @staticmethod
+    def _raise_if_cancelled(placeholder: ActiveProcess) -> None:
+        if placeholder.cancel_requested:
+            raise RoundCancelledError('review round was cancelled before the review agent started')
+
+    def _advance(self, placeholder: ActiveProcess, *, stage: str, phase: str) -> Task:
+        """Enter the next prepare stage unless the round was cancelled.
+
+        abort_task sets cancel_requested and writes ABORTED in one db-locked
+        section, and this check-and-write holds the same lock. So either the
+        abort comes after this write and replaces it, or this check sees it;
+        a cancel can no longer be overwritten by the stage that follows it.
+        """
+        with self.db.locked():
+            self._raise_if_cancelled(placeholder)
+            placeholder.phase = phase
+            return self.mission.set_stage(placeholder.task_id, status=TaskStatus.INGESTING, stage=stage)
 
     def _launch_round(
         self,
@@ -124,6 +162,9 @@ class ExecutionService:
         language: str,
         placeholder: ActiveProcess,
     ) -> Run:
+        # Show the round straight away. Preflight alone may take up to 150s,
+        # and the Web UI only offers to abort a round it can see.
+        task = self._advance(placeholder, stage='preflight', phase='preflight')
         adapter = self.adapters.get(task.backend)
         if self.adapter_factory is not None:
             resolved = resolve_backend_config(task.repo_path, backend=task.backend)
@@ -132,52 +173,38 @@ class ExecutionService:
             raise BackendUnavailableError(f'backend adapter not found: {task.backend}')
         self._preflight_check(task, adapter=adapter)
 
+        task = self._advance(placeholder, stage='prepare_review', phase='prepare')
         task = self._refresh_pull_request_snapshot(task)
         if task.source_type == 'local_diff':
-            try:
-                task = self._refresh_local_snapshot(task)
-            except Exception:
-                self.worktrees.cleanup_worktree(task)
-                task.branch_name = None
-                task.worktree_path = None
-                self.db.save_task(task)
-                raise
-        task = self.mission.set_stage(task.id, status=TaskStatus.INGESTING, stage='prepare_review')
-        try:
-            branch_name, worktree_path, revision = self.worktrees.ensure_worktree(task)
-            task.branch_name = branch_name
-            task.worktree_path = worktree_path
-            compile_started_at = time.perf_counter()
-            compiled = self.contexts.compile_task(task, worktree_path=worktree_path)
-            compile_context_ms = int((time.perf_counter() - compile_started_at) * 1000)
-            prompt_build_ms = 0
-            prompt_text = prompt
-            if prompt_text is None:
-                prompt_started_at = time.perf_counter()
-                prompt_text = self.contexts.build_prompt(task, compiled, review_note=review_note, language=language)
-                prompt_build_ms = int((time.perf_counter() - prompt_started_at) * 1000)
-            prepare_metrics = {
-                'context_compile_ms': compile_context_ms,
-                'prompt_build_ms': prompt_build_ms,
-                'context_markdown_bytes': compiled.markdown_bytes,
-                'context_json_bytes': compiled.json_bytes,
-                'prompt_bytes': len(prompt_text.encode('utf-8')),
-                'changed_file_count': len(task.review_paths),
-                'patch_count': len(compiled.payload.get('review', {}).get('file_patches', []) or []),
-                'candidate_file_count': len(compiled.payload.get('candidate_files', []) or []),
-                'snippet_count': len(compiled.payload.get('related_snippets', []) or []),
-                'top_level_entry_count': len(compiled.payload.get('repo', {}).get('top_level_entries', []) or []),
-                'recent_commit_count': len(compiled.payload.get('repo', {}).get('recent_commits', []) or []),
-            }
-        except Exception:
-            try:
-                self.worktrees.cleanup_worktree(task)
-            except Exception:
-                pass
-            task.branch_name = None
-            task.worktree_path = None
-            self.mission.set_stage(task.id, status=TaskStatus.FAILED, stage='review_prepare_failed')
-            raise
+            task = self._refresh_local_snapshot(task)
+        # Not a correctness guard (the handoff below re-checks under the
+        # lock), just no point creating a worktree for a cancelled round.
+        self._raise_if_cancelled(placeholder)
+        branch_name, worktree_path, revision = self.worktrees.ensure_worktree(task)
+        task.branch_name = branch_name
+        task.worktree_path = worktree_path
+        compile_started_at = time.perf_counter()
+        compiled = self.contexts.compile_task(task, worktree_path=worktree_path)
+        compile_context_ms = int((time.perf_counter() - compile_started_at) * 1000)
+        prompt_build_ms = 0
+        prompt_text = prompt
+        if prompt_text is None:
+            prompt_started_at = time.perf_counter()
+            prompt_text = self.contexts.build_prompt(task, compiled, review_note=review_note, language=language)
+            prompt_build_ms = int((time.perf_counter() - prompt_started_at) * 1000)
+        prepare_metrics = {
+            'context_compile_ms': compile_context_ms,
+            'prompt_build_ms': prompt_build_ms,
+            'context_markdown_bytes': compiled.markdown_bytes,
+            'context_json_bytes': compiled.json_bytes,
+            'prompt_bytes': len(prompt_text.encode('utf-8')),
+            'changed_file_count': len(task.review_paths),
+            'patch_count': len(compiled.payload.get('review', {}).get('file_patches', []) or []),
+            'candidate_file_count': len(compiled.payload.get('candidate_files', []) or []),
+            'snippet_count': len(compiled.payload.get('related_snippets', []) or []),
+            'top_level_entry_count': len(compiled.payload.get('repo', {}).get('top_level_entries', []) or []),
+            'recent_commit_count': len(compiled.payload.get('repo', {}).get('recent_commits', []) or []),
+        }
         self.mission.append_event(
             task_id=task.id,
             kind='task.review_context_compiled',
@@ -193,32 +220,36 @@ class ExecutionService:
         )
 
         idle_timeout_sec = self._idle_timeout_seconds(task.repo_path)
-        # An abort accepted during prepare must not spawn a review round at
-        # all — check the flag one last time before the Run is created.
-        if placeholder.cancel_requested:
-            raise PreflightCancelledError('review round was cancelled before the round started')
-        round_index = len(self.db.list_runs(task.id)) + 1
-        run = Run(
-            task_id=task.id,
-            backend=task.backend,
-            round_index=round_index,
-            review_note=(review_note or '').strip(),
-            review_revision=revision,
-            metrics=prepare_metrics,
-            started_at=time.time(),
-            status='running',
-        )
-        self.db.save_run(run)
-        task.last_run_id = run.id
-        task.updated_at = time.time()
-        self.db.save_task(task)
-        self.mission.set_stage(task.id, status=TaskStatus.RUNNING, stage='review_in_progress')
-        self.mission.append_event(
-            task_id=task.id,
-            run_id=run.id,
-            kind='review.metrics_collected',
-            payload={'stage': 'prepare', **prepare_metrics},
-        )
+        # Handoff: the last cancel check, the Run, the task fields and RUNNING
+        # form one db-locked section, so an abort lands either before it
+        # (and no Run is created) or after it, when the Run is visible to
+        # abort_task and the worker honours the flag before launching.
+        with self.db.locked():
+            self._raise_if_cancelled(placeholder)
+            round_index = len(self.db.list_runs(task.id)) + 1
+            run = Run(
+                task_id=task.id,
+                backend=task.backend,
+                round_index=round_index,
+                review_note=(review_note or '').strip(),
+                review_revision=revision,
+                metrics=prepare_metrics,
+                started_at=time.time(),
+                status='running',
+            )
+            self.db.save_run(run)
+            placeholder.run_id = run.id
+            placeholder.phase = 'running'
+            self.mission.update_task(
+                task.id, branch_name=branch_name, worktree_path=worktree_path, last_run_id=run.id,
+            )
+            self.mission.set_stage(task.id, status=TaskStatus.RUNNING, stage='review_in_progress')
+            self.mission.append_event(
+                task_id=task.id,
+                run_id=run.id,
+                kind='review.metrics_collected',
+                payload={'stage': 'prepare', **prepare_metrics},
+            )
         worker = threading.Thread(
             target=self._run_task,
             args=(
@@ -232,71 +263,90 @@ class ExecutionService:
             ),
             daemon=True,
         )
-        placeholder.run_id = run.id
-        placeholder.worker = worker
+        with self._lock:
+            placeholder.worker = worker
         worker.start()
         return run
 
+    def _finish_failed_launch(self, task_id: str, placeholder: ActiveProcess, exc: BaseException) -> None:
+        """Leave a round that never reached its worker in a final state.
+
+        A cancelled round keeps the ABORTED that abort_task wrote (set_stage
+        will not leave it); anything else becomes FAILED with an error event
+        naming the phase, because the task was already showing as INGESTING.
+        """
+        cancelled = placeholder.cancel_requested
+        if placeholder.run_id is not None:
+            # Only reachable if the handoff broke after creating the Run (a
+            # database or thread-start error); never leave it 'running'.
+            run = next((r for r in self.db.list_runs(task_id) if r.id == placeholder.run_id), None)
+            if run is not None and run.status == 'running':
+                run.status = 'aborted' if cancelled else 'failed'
+                run.ended_at = time.time()
+                self.db.save_run(run)
+        if placeholder.phase != 'preflight':
+            # Prepare may have refreshed or created this task's worktree.
+            task = self.db.get_task(task_id)
+            if task is not None:
+                try:
+                    self.worktrees.cleanup_worktree(task)
+                except Exception:
+                    logger.exception('failed to clean up the worktree of task %s', task_id)
+                self.mission.update_task(task_id, branch_name=None, worktree_path=None)
+        if not cancelled:
+            self.mission.append_event(
+                task_id=task_id,
+                run_id=placeholder.run_id,
+                kind='error',
+                level=EventLevel.ERROR,
+                payload={
+                    'message': str(exc) or exc.__class__.__name__,
+                    'type': exc.__class__.__name__,
+                    'phase': placeholder.phase,
+                },
+            )
+        self.mission.set_stage(
+            task_id,
+            status=TaskStatus.FAILED,
+            stage='preflight_failed' if placeholder.phase == 'preflight' else 'review_prepare_failed',
+        )
+
     def abort_task(self, task_id: str) -> bool:
+        """Cancel the task's current round, wherever it is.
+
+        Returns False only when there is nothing left to cancel: no round, a
+        round whose cancel was already accepted, or a round that finished.
+        """
         with self._lock:
             active = self._active.get(task_id)
             if active is None:
                 return False
-            # Publish the intent first: the preparing thread checks this flag
-            # around the preflight probe and before creating the round.
-            first_cancel_request = not active.cancel_requested
-            active.cancel_requested = True
-            if active.run_id is None:
-                if not first_cancel_request:
-                    # This pre-run round was already cancelled; nothing new
-                    # to abort (mirrors the live path's repeat-abort refusal).
-                    return False
-                # Pre-run cancellation: preflight/prepare run synchronously on
-                # the start caller's thread and no Run exists yet. A fresh
-                # round is cancellable even when the task already carries
-                # ABORTED from an earlier cancelled round. Publish under the
-                # db lock (same ordering as the live path below); the
-                # preparing thread unwinds and releases the slot.
-                with self.db.locked():
-                    task = self.db.get_task(task_id)
-                    if task is None:
-                        return False
-                    self.mission.set_stage(task_id, status=TaskStatus.ABORTED, stage='aborted')
-                    self.mission.append_event(
-                        task_id=task_id,
-                        run_id=None,
-                        kind='control.accepted',
-                        payload={
-                            'action': 'abort',
-                            'phase': 'preflight' if active.process is not None else 'prepare',
-                        },
-                    )
-                # The registered process at this point can only be the
-                # preflight probe — no review agent exists before the Run.
-                if active.process is not None:
-                    self._terminate_process(active.process)
-                return True
-            if active.process is None:
-                # A started round whose agent process is not registered yet:
-                # nothing to terminate, and claiming success would be a lie.
-                # The flag stays set for the pre-spawn checks.
-                return False
             with self.db.locked():
-                run = next((r for r in self.db.list_runs(task_id) if r.id == active.run_id), None)
-                task = self.db.get_task(task_id)
-                if run is None or run.status != 'running' or task is None or task.status == TaskStatus.ABORTED:
+                if active.cancel_requested or self.db.get_task(task_id) is None:
                     return False
-                # Publish cancellation before termination can wake the worker.
-                # Finalisation uses the same lock, so a completed round cannot
-                # accept a late abort while its worktree is being cleaned up.
+                if active.run_id is not None:
+                    run = next((r for r in self.db.list_runs(task_id) if r.id == active.run_id), None)
+                    if run is None or run.status != 'running':
+                        # Finalisation takes this lock too, so a round that
+                        # already completed cannot accept a late abort while
+                        # its worktree is being cleaned up.
+                        return False
+                # The flag and ABORTED are published together. Every stage
+                # change on the starting thread checks the flag under this
+                # lock, and the worker checks it before launching the agent.
+                active.cancel_requested = True
                 self.mission.set_stage(task_id, status=TaskStatus.ABORTED, stage='aborted')
                 self.mission.append_event(
                     task_id=task_id,
                     run_id=active.run_id,
                     kind='control.accepted',
-                    payload={'action': 'abort'},
+                    payload={'action': 'abort', 'phase': active.phase},
                 )
-        self._terminate_process(active.process)
+            # The preflight probe or the review agent. With neither running
+            # yet, whichever thread is about to spawn one sees the flag first.
+            process = active.process
+        if process is not None:
+            self._terminate_process(process)
         return True
 
     def _persist_round_result(self, task_id: str, run: Run, language: str) -> bool:
@@ -356,6 +406,12 @@ class ExecutionService:
 
         proc: subprocess.Popen[str] | None = None
         try:
+            # An abort accepted during the handoff found no process to kill;
+            # it is honoured here, before any agent exists.
+            with self._lock:
+                slot = self._active.get(task.id)
+                if slot is not None:
+                    self._raise_if_cancelled(slot)
             adapter = adapter or self.adapters[task.backend]
             cmd = adapter.make_command(task=task, prompt=prompt)
             llm_started_at = time.perf_counter()
@@ -389,7 +445,19 @@ class ExecutionService:
                 env=prepare_static_review_env(self.worktrees.runtime_root),
             )
             with self._lock:
-                self._active[task.id] = ActiveProcess(task_id=task.id, run_id=run.id, process=proc, worker=threading.current_thread())
+                slot = self._active.get(task.id)
+                if slot is None:
+                    slot = ActiveProcess(task_id=task.id, run_id=run.id, process=None, worker=None, phase='running')
+                    self._active[task.id] = slot
+                # Register on the same slot so a cancel accepted while the
+                # agent was spawning is not lost with a replaced entry.
+                slot.process = proc
+                slot.worker = threading.current_thread()
+                cancelled_while_spawning = slot.cancel_requested
+            if cancelled_while_spawning:
+                # abort_task had no process to kill. Stopping it here lets the
+                # normal exit path below finalise the round as aborted.
+                self._terminate_process(proc)
 
             line_queue: queue.Queue[tuple[str, str]] = queue.Queue()
             last_activity_at = time.time()
@@ -520,13 +588,16 @@ class ExecutionService:
                 'round_duration_ms': int((run.ended_at - run.started_at) * 1000),
             })
             was_aborted = self._persist_round_result(task.id, run, language)
-            self.mission.append_event(
-                task_id=task.id,
-                run_id=run.id,
-                kind='error',
-                level=EventLevel.ERROR,
-                payload={'message': str(exc), 'type': exc.__class__.__name__, 'round_index': round_index},
-            )
+            if not was_aborted:
+                # A cancelled round is reported by control.accepted and the
+                # 'aborted' round_finished below; it is not an error.
+                self.mission.append_event(
+                    task_id=task.id,
+                    run_id=run.id,
+                    kind='error',
+                    level=EventLevel.ERROR,
+                    payload={'message': str(exc), 'type': exc.__class__.__name__, 'round_index': round_index},
+                )
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
@@ -562,6 +633,11 @@ class ExecutionService:
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen[str]) -> None:
+        if proc.returncode is not None:
+            # Already reaped (abort and the probe wait can both stop the
+            # probe). Its pid, and so its process group id, may now belong
+            # to an unrelated process.
+            return
         if sys.platform == 'win32':
             # Windows: no process groups via os.killpg
             try:
@@ -636,8 +712,8 @@ class ExecutionService:
 
         probe = adapter.probe_command()
         if probe is not None:
-            if active is not None and active.cancel_requested:
-                raise PreflightCancelledError('review round was cancelled before the preflight probe started')
+            if active is not None:
+                self._raise_if_cancelled(active)
             try:
                 # Popen (not subprocess.run) so the probe is visible in the
                 # active slot and an abort during the up-to-150s wait can
@@ -662,7 +738,7 @@ class ExecutionService:
                         # Abort landed while we were spawning: kill the probe
                         # ourselves; abort_task saw process=None.
                         self._terminate_process(probe_proc)
-                        raise PreflightCancelledError('review round was cancelled before the preflight probe started')
+                        raise RoundCancelledError('review round was cancelled before the preflight probe started')
                     active.process = probe_proc
             try:
                 stdout_text, stderr_text = self._await_probe(
@@ -671,11 +747,17 @@ class ExecutionService:
                     probe_timeout_sec=probe_timeout_sec,
                     executable=executable,
                 )
+            except BaseException:
+                # Covers Ctrl+C in `amc review`: the probe runs in its own
+                # session, so the terminal's SIGINT never reached it.
+                self._terminate_process(probe_proc)
+                raise
             finally:
-                if active is not None and active.process is probe_proc:
-                    active.process = None
+                with self._lock:
+                    if active is not None and active.process is probe_proc:
+                        active.process = None
             if active is not None and active.cancel_requested:
-                raise PreflightCancelledError('review round was cancelled while the preflight probe was finishing')
+                raise RoundCancelledError('review round was cancelled while the preflight probe was finishing')
             if probe_proc.returncode != 0:
                 stderr_preview = (stderr_text or '').strip()[:300]
                 raise PreflightError(
@@ -717,7 +799,7 @@ class ExecutionService:
                     except subprocess.TimeoutExpired:
                         pass
                     if cancelled:
-                        raise PreflightCancelledError(
+                        raise RoundCancelledError(
                             'review round was cancelled while the preflight probe was running'
                         ) from None
                     raise PreflightError(
@@ -793,17 +875,20 @@ class ExecutionService:
             raise PullRequestRefreshError(f'failed to refresh latest PR snapshot: {exc}') from exc
 
         raw_pr = pull_request.raw_pr
-        task.title = pull_request.task_title
-        task.description = pull_request.to_description(review_focus=task.review_focus)
-        task.pr_owner = pull_request.owner
-        task.pr_repo = pull_request.repo
-        task.pr_number = pull_request.pr_number
-        task.pr_head_ref = str(raw_pr.get('head', {}).get('ref') or '') or None
-        task.pr_head_sha = str(raw_pr.get('head', {}).get('sha') or '') or None
-        task.pr_base_ref = str(raw_pr.get('base', {}).get('ref') or '') or None
-        task.review_paths = pull_request.changed_files
-        task.updated_at = time.time()
-        self.db.save_task(task)
+        # Field update, not save_task(task): `task` was read before the
+        # network call, and saving it would roll back an abort made meanwhile.
+        task = self.mission.update_task(
+            task.id,
+            title=pull_request.task_title,
+            description=pull_request.to_description(review_focus=task.review_focus),
+            pr_owner=pull_request.owner,
+            pr_repo=pull_request.repo,
+            pr_number=pull_request.pr_number,
+            pr_head_ref=str(raw_pr.get('head', {}).get('ref') or '') or None,
+            pr_head_sha=str(raw_pr.get('head', {}).get('sha') or '') or None,
+            pr_base_ref=str(raw_pr.get('base', {}).get('ref') or '') or None,
+            review_paths=pull_request.changed_files,
+        )
 
         pr_json_path = self.artifacts.write_text(task.id, 'context/pull_request.json', pull_request.to_json())
         pr_md_path = self.artifacts.write_text(
@@ -851,12 +936,15 @@ class ExecutionService:
         head_sha, snapshot_sha, base, changed_files, patch = capture_local_snapshot(
             str(repo), task.pr_base_ref, generated_paths=generated_paths,
         )
-        task.local_head_sha = head_sha
-        task.local_snapshot_sha = snapshot_sha
-        task.pr_base_ref = base
-        task.review_paths = changed_files
-        task.updated_at = time.time()
-        self.db.save_task(task)
+        # Field update, not save_task(task): saving the object read before
+        # the snapshot would roll back an abort accepted while it was taken.
+        task = self.mission.update_task(
+            task.id,
+            local_head_sha=head_sha,
+            local_snapshot_sha=snapshot_sha,
+            pr_base_ref=base,
+            review_paths=changed_files,
+        )
         patch_path = self.artifacts.write_text(task.id, 'context/local_diff.patch', patch)
         self.mission.append_event(
             task_id=task.id,

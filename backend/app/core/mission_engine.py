@@ -85,6 +85,26 @@ class MissionEngine:
             )
             return task
 
+    def update_task(self, task_id: str, **changes) -> Task:
+        """Change fields on the freshest copy of the task and save it.
+
+        Saving a Task object read earlier also writes back its stale status,
+        which rolls back anything that changed meanwhile, such as an abort.
+        Status and stage go through set_stage, which owns the ABORTED rule.
+        """
+        if {'status', 'current_stage'} & changes.keys():
+            raise ValueError('use set_stage() to change status or stage')
+        unknown = changes.keys() - Task.model_fields.keys()
+        if unknown:
+            raise ValueError(f'unknown task fields: {sorted(unknown)}')
+        with self.db.locked():
+            task = self.db.get_task(task_id)
+            if task is None:
+                raise KeyError(f'task not found: {task_id}')
+            task = task.model_copy(update={**changes, 'updated_at': time.time()})
+            self.db.save_task(task)
+            return task
+
     def append_event(
         self,
         *,
