@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Settings } from './Settings'
+import { StartTracker } from './startTracker'
 
 type TaskStatus =
   | 'created'
@@ -406,11 +407,10 @@ export function App() {
   const [showModal, setShowModal] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
-  // The start request stays pending through preflight and prepare.
-  const [startingTaskId, setStartingTaskId] = useState<string | null>(null)
-  // Set when the user aborts, so the pending start request failing with
-  // "cancelled" is not reported back to them as an error.
-  const abortRequestedRef = useRef<string | null>(null)
+  // Start requests stay pending through preflight and prepare; one record
+  // per task, so actions on another task cannot affect this one.
+  const startTrackerRef = useRef(new StartTracker())
+  const [startingTaskIds, setStartingTaskIds] = useState<string[]>([])
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'light'
     const stored = window.localStorage.getItem(THEME_KEY)
@@ -539,36 +539,42 @@ export function App() {
   }
 
   const startReviewRound = async (taskId: string) => {
-    abortRequestedRef.current = null
-    setStartingTaskId(taskId)
+    const tracker = startTrackerRef.current
+    const request = tracker.begin(taskId)
+    setStartingTaskIds(tracker.pendingTaskIds())
     try {
       await api(`/api/tasks/${taskId}/start`, { method: 'POST', body: JSON.stringify({}) })
       setNotice(null)
       await loadTask(taskId)
       await refreshTasks()
     } catch (err) {
-      if (abortRequestedRef.current !== taskId) {
+      // Decided per request: waits for any abort of this start to answer,
+      // so it holds whichever response arrives first.
+      if (!(await tracker.wasAborted(request))) {
         setNotice({ tone: 'error', text: err instanceof Error ? err.message : '启动审查失败' })
       }
       // Failed or aborted, the task has moved on; show where it ended up.
       void loadTask(taskId, { silent: true })
       void refreshTasks({ silent: true })
     } finally {
-      setStartingTaskId((current) => (current === taskId ? null : current))
+      tracker.end(request)
+      setStartingTaskIds(tracker.pendingTaskIds())
     }
   }
 
   const abortTask = async (taskId: string) => {
-    // Mark before sending: the start request can fail with "cancelled"
+    // Attach before sending: the start request can fail with "cancelled"
     // before this abort's own response arrives.
-    abortRequestedRef.current = taskId
+    let settle: (accepted: boolean) => void = () => {}
+    startTrackerRef.current.noteAbort(taskId, new Promise<boolean>((resolve) => { settle = resolve }))
     try {
       await api(`/api/tasks/${taskId}/abort`, { method: 'POST' })
+      settle(true)
       setNotice(null)
       await loadTask(taskId)
       await refreshTasks()
     } catch (err) {
-      abortRequestedRef.current = null
+      settle(false)
       setNotice({ tone: 'error', text: err instanceof Error ? err.message : '中止审查失败' })
     }
   }
@@ -595,7 +601,7 @@ export function App() {
   }
 
   const roundActive = isRoundActive(selectedTask?.status)
-  const isStarting = selectedTask !== null && startingTaskId === selectedTask.id
+  const isStarting = selectedTask !== null && startingTaskIds.includes(selectedTask.id)
   const startLabel = latestRound ? '发起下一轮审查' : '开始首轮审查'
 
   return (
