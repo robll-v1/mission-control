@@ -122,6 +122,62 @@ def test_set_stage_cannot_leave_aborted_except_new_round(tmp_path):
     db.close()
 
 
+def test_field_updates_never_roll_back_an_accepted_abort(tmp_path):
+    """Saving a Task read before an abort used to put the old status back."""
+    db = Database(str(tmp_path / 'db.sqlite'))
+    mission = MissionEngine(db)
+    task = mission.create_task(title='t', repo_path=str(tmp_path))
+    read_before_abort = db.get_task(task.id)
+    mission.set_stage(task.id, status=TaskStatus.ABORTED, stage='aborted')
+
+    updated = mission.update_task(read_before_abort.id, review_paths=['a.txt'])
+
+    stored = db.get_task(task.id)
+    assert updated.status == stored.status == TaskStatus.ABORTED
+    assert stored.review_paths == ['a.txt']
+    with pytest.raises(ValueError):
+        mission.update_task(task.id, status=TaskStatus.RUNNING)
+    db.close()
+
+
+@pytest.mark.parametrize('live_status', [TaskStatus.INGESTING, TaskStatus.VALIDATING])
+def test_listing_does_not_repaint_a_task_that_is_still_working(tmp_path, live_status):
+    """The next round's preflight/prepare (and validation) sit on a finished Run.
+
+    The task list refresh used to read that as a stale round and repaint the
+    task as waiting_human, which also disabled its abort button in the UI.
+    """
+    from app.core.models import Run
+    from app.services.review_result_service import ReviewResultService
+
+    db = Database(str(tmp_path / 'db.sqlite'))
+    mission = MissionEngine(db)
+    task = mission.create_task(title='t', repo_path=str(tmp_path))
+    db.save_run(Run(task_id=task.id, backend='opencode', started_at=1.0, status='completed'))
+    mission.set_stage(task.id, status=live_status, stage='preflight')
+
+    refreshed = ReviewResultService.backfill_task(db=db, task=db.get_task(task.id))
+
+    assert refreshed.status == db.get_task(task.id).status == live_status
+    db.close()
+
+
+def test_listing_still_repairs_a_running_task_whose_round_finished(tmp_path):
+    from app.core.models import Run
+    from app.services.review_result_service import ReviewResultService
+
+    db = Database(str(tmp_path / 'db.sqlite'))
+    mission = MissionEngine(db)
+    task = mission.create_task(title='t', repo_path=str(tmp_path))
+    db.save_run(Run(task_id=task.id, backend='opencode', started_at=1.0, status='completed'))
+    mission.set_stage(task.id, status=TaskStatus.RUNNING, stage='review_in_progress')
+
+    refreshed = ReviewResultService.backfill_task(db=db, task=db.get_task(task.id))
+
+    assert refreshed.status == TaskStatus.WAITING_HUMAN
+    db.close()
+
+
 def test_abort_during_result_parsing_is_not_lost(git_repo, tmp_path, isolated_config, monkeypatch):
     """Cancellation after the worker reads its state must survive result parsing."""
     import threading

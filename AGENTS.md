@@ -17,7 +17,7 @@ Mission Control（命令 `amc`）：本地优先的 AI 代码审查控制台。
 
 1. **一个任务一个分支一个 agent。** 两个 agent 不同时修改同一批文件。开新分支前先看「当前状态」，确认没有别人正在改的分支。
 2. **不直接推 `main`。** 一律走 PR，由用户合并。commit 末尾写各自的 `Co-Authored-By`。
-3. **提交前必须本地验证：** 后端跑 `pytest -q`，改了前端还要跑 `npx tsc --noEmit` 和 `npm run build`。
+3. **提交前必须本地验证：** 后端跑 `pytest -q`，改了前端还要跑 `npx tsc --noEmit`、`npm test`（需 Node ≥ 22.18）和 `npm run build`。
 4. **commit 要自洽。** 不能出现「import 了一个还没提交的函数」这种情况（CI 曾因此 9 个 job 全部失败）。拆分 commit 后，在干净 checkout 上跑一遍测试。
 5. **不要 `git stash` 用户的改动，也不要 reset 或丢弃不是你自己产生的改动。** 需要切分支时先 `git status` 看一眼，有疑问就问用户。
 6. **草稿或演示文件不进 commit。** 现在仓库里的 `BUGFIX_REPORT.md`、`model-selector-demo.html`、`backend/requirements.txt` 都是未跟踪的草稿；其中 `requirements.txt` 的版本约束和 `pyproject.toml` 冲突，以 `pyproject.toml` 为准。
@@ -57,12 +57,12 @@ docs/                    设计历程、架构图、screenshots/
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
 pytest -q                                  # 后端测试；数量以当前提交的 CI 为准
-cd frontend && npm ci && npx tsc --noEmit && npm run build
+cd frontend && npm ci && npx tsc --noEmit && npm test && npm run build
 amc start            # 启动后端 + 前端并打开浏览器；amc stop / amc status
 amc review           # 审查当前仓库的本地改动
 ```
 
-CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.11–3.13 上运行，包括 pytest、导入检查、CLI 帮助和健康检查（非 Windows）；前端运行 tsc 和 build。**Windows 也在矩阵里**，涉及路径、编码、进程的改动要注意。
+CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.11–3.13 上运行，包括 pytest、导入检查、CLI 帮助和健康检查（非 Windows）；前端（Node 22）运行 tsc、`npm test` 和 build。**Windows 也在矩阵里**，涉及路径、编码、进程的改动要注意。
 
 ## 6. 不明显但重要的设计
 
@@ -93,7 +93,16 @@ CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.
 - Claude 运行的 Bash 沙箱**没有网络**，pip、`gh`、`git push` 需要在用户的终端里执行。GPT 那边的环境可能不同，以实际情况为准。
 - 用户的网络连 GitHub 偶尔会出现 `SSL_ERROR_SYSCALL`，通常是暂时的，重试即可。
 
-## 9. 当前状态（2026-10-25 更新）
+## 9. 当前状态（2026-11-02 更新）
+
+- Kiro 补修 Codex 的 P2（PR #24）：前端取消状态改为按任务、按启动请求记录（`frontend/src/startTracker.ts`），并等这次启动对应的中止请求返回后再判断是否报错。顺带修复了中止被拒（409）时，真实的启动失败被吞掉的问题。新增 `frontend/tests/startTracker.test.ts`，共 7 个用例，`npm test` 运行；CI 前端改为 Node 22 并加上这一步。套用 `a7f2dd4` 旧语义时有 2 个用例失败。浏览器内 W09 仍未实测。子进程残留（父进程退出、子进程忽略 SIGTERM）按 Codex 建议另项处理，本次未改。
+
+- Codex 复核 `fix/preflight-cancel` / `a7f2dd4`（基线 `ee7fa4e`）：独立全量 `165 passed, 1 skipped`（34.53s），前端 tsc/build 通过；两处取消竞态与清理期间的执行槽保留修复成立。发现待补 P2：中止 A 后，在 A 的 start 请求返回前启动 B，会清空共享取消标记，A 的正常取消被误报为红色错误；已用当前前端函数及受控 Promise 顺序复现，未做浏览器实测。另用假探针复现父进程退出、子进程忽略 SIGTERM 时取消后仍有子进程残留（5.26s 返回取消异常）；这是原有进程树清理边界，不算本轮新增回归，测试进程已清理。本次未验证远端 CI、Windows 或真实模型；未改业务代码、提交或推送。
+
+- Kiro `fix/preflight-cancel`：基于 GLM `codex/preflight-cancel-glm` 的两个提交（rebase 到 `main` / `ee7fa4e`），修复 Codex 复现的两处取消竞态，并补上 Web 端在 preflight 期间的中止入口。全量 `165 passed, 1 skipped`，前端 tsc/build 通过；浏览器内 W09 未实测。细节见 `docs/preflight-cancellation-qa.md` 第 7 节。GLM 工作树 `~/code/amc-preflight-glm` 中的未提交改动未动、未采用。
+- 原工作区已快进到 `origin/main` / `ee7fa4e`。
+
+以下为 2026-10-25 的记录：
 
 - Codex 本轮审核：PR #22 (`codex/launch-acceptance` / `5476de2`) 已存在；准确 head 的 CI run `40105840872`，9 个后端矩阵与 Frontend 全部成功，代码审核通过。发布门槛仍按下文区分，不将 CI 通过等同于真实模型 E2E。
 - WorkBuddy 新文档 `codex/demo-plan-workbuddy` 基于 #22；演示分镜与 Web 清单全部标注尚未执行。Codex 补正明确 checkout 入口、配置隔离范围与模型默认提示后提交审查；需先合并 #22。
@@ -111,12 +120,18 @@ CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.
 - 上述本地验收对应的最终提交为 `5476de2`，已推送并开 PR #22；该准确 head 的 CI 结论见本节顶部。
 - 真实模型首轮已识别合成 SQL 注入；第二轮虽真实调用，但原示例恢复为 HEAD 导致空 diff，**有效修复 diff 复审未验收**。后补示例已离线验证，不允许额外调用或冒充 E2E 通过。
 - 发布判断：工程补强可进入 PR 审查和小范围试用；正式演示推广前，需完成非空修复 diff 的真实复审、干净环境安装与 Web 操作流程验证，再录约 30 秒剪辑演示。
-- 已知边界：150 秒 preflight 阶段不可取消；opencode 旧版本未验证；SDK 增量历史仍基于 HEAD 而非上一轮未提交快照；Web 只看最新一轮，不能宣称有 SDK 增量聚合；子模块内部未提交内容不在父仓库快照中；PATH shim 不是沙箱。
+- 已知边界：150 秒 preflight 阶段不可取消（`fix/preflight-cancel` 合并后解除）；opencode 旧版本未验证；SDK 增量历史仍基于 HEAD 而非上一轮未提交快照；Web 只看最新一轮，不能宣称有 SDK 增量聚合；子模块内部未提交内容不在父仓库快照中；PATH shim 不是沙箱。
 - 原工作区未由 Codex 切换或修改；他人继续工作后的 HEAD 为 `5055c69`（含截图与 `seed_demo_simple.py` 提交），另有 `frontend/src/styles.css` 未提交改动，均未纳入本轮验收。两份原 stash 的 hash 保持不变；原未跟踪文档/草稿及其他代理 worktree 保留供追溯。
 
 ## 10. 交接日志
 
 每次收工追加一条，最新的放在最上面。格式：日期 · 谁 · 分支/PR · 做了什么 · 没做完或没验证的 · 下一步建议。
+
+- 2026-11-02 · Kiro · `fix/preflight-cancel` / #24 · 补修跨任务取消提示串扰：取消状态按任务、按启动请求记录，并等中止结果返回后再决定是否报错；新增前端单测（7 个用例，`npm test`），CI 前端升级到 Node 22 · 浏览器 W09 未实测；子进程残留未处理 · 合并后做 W08/W09 实测；另开分支处理进程树清理。
+
+- 2026-11-02 · Codex · `fix/preflight-cancel` / `a7f2dd4` · 复核四个提交，独立后端全量 165 passed/1 skipped、前端 tsc/build 通过；确认原竞态修复，复现跨任务取消提示串扰与原有进程树残留边界 · 浏览器 W09、Windows、准确 head 的远端 CI 未核验 · 按任务及启动请求隔离前端取消标记并补回归；进程树清理另项处理，再完成 W09 实测。
+
+- 2026-11-01 · Kiro · `fix/preflight-cancel` · 修复准备期间取消被 INGESTING 覆盖、最后检查后仍启动 worker 两处竞态；preflight 期间任务即显示 `ingesting/preflight`，Web 端可中止；任务列表不再把准备中/验证中的任务改成 waiting_human；失败或取消的启动先清理 worktree 再释放；preflight 失败记为 `preflight_failed` 并有 error 事件。12 个新测试中 11 个在修复前失败 · 浏览器内 W09 与 Windows 本机未实测 · 合并后按 W08/W09 做一次 Web 实测。
 
 - 2026-10-25 · Codex · 分支就绪审核 / #22 · 核对全部远端与三方新交付，独立重跑 GLM 153、Qoder 157 项测试并发现测试外阻塞；核对 #22 准确 head 的全部 CI 成功；补正 WorkBuddy 两文档的执行隔离说明 · 新 UI、取消修复与安装修复仍需补修，真实复审/Web E2E 未验收 · 仅为通过审核的内容开 PR，不合并分支。
 

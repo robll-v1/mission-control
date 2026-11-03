@@ -72,7 +72,11 @@ class ReviewResultService:
                     db.save_run(run)
                     updated = True
             latest_round = rounds[-1] if rounds else None
-            if latest_round is not None and task.status in {TaskStatus.RUNNING, TaskStatus.INGESTING, TaskStatus.VALIDATING}:
+            # Only RUNNING can be stale here: the latest Run of a RUNNING task
+            # is the round in flight. INGESTING (the next round's preflight and
+            # prepare) and VALIDATING legitimately sit on a finished Run, and
+            # repainting them hid a live round together with its abort button.
+            if latest_round is not None and task.status == TaskStatus.RUNNING:
                 if latest_round.status == 'completed':
                     task.status = TaskStatus.WAITING_HUMAN
                     task.current_stage = 'awaiting_next_round'

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Settings } from './Settings'
+import { StartTracker } from './startTracker'
 
 type TaskStatus =
   | 'created'
@@ -176,6 +177,10 @@ const durationText = (start?: number, end?: number | null) => {
 
 const shortSha = (value?: string | null) => (value ? value.slice(0, 10) : '—')
 
+// A round is in flight from backend preflight through the agent run. Both
+// phases can be aborted, so both count as active.
+const isRoundActive = (status?: TaskStatus | null) => status === 'ingesting' || status === 'running'
+
 const stringifyPayload = (payload: Record<string, unknown>) => {
   if (typeof payload.text === 'string') return payload.text
   if (typeof payload.message === 'string') return payload.message
@@ -246,8 +251,14 @@ const stageLabel = (stage: string) => {
       return '已创建'
     case 'review_ready':
       return '待审查'
+    case 'preflight':
+      return '检查审查后端'
+    case 'preflight_failed':
+      return '后端检查失败'
     case 'prepare_review':
       return '准备上下文'
+    case 'review_prepare_failed':
+      return '准备失败'
     case 'review_in_progress':
       return '审查进行中'
     case 'awaiting_next_round':
@@ -396,6 +407,10 @@ export function App() {
   const [showModal, setShowModal] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  // Start requests stay pending through preflight and prepare; one record
+  // per task, so actions on another task cannot affect this one.
+  const startTrackerRef = useRef(new StartTracker())
+  const [startingTaskIds, setStartingTaskIds] = useState<string[]>([])
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'light'
     const stored = window.localStorage.getItem(THEME_KEY)
@@ -524,23 +539,42 @@ export function App() {
   }
 
   const startReviewRound = async (taskId: string) => {
+    const tracker = startTrackerRef.current
+    const request = tracker.begin(taskId)
+    setStartingTaskIds(tracker.pendingTaskIds())
     try {
       await api(`/api/tasks/${taskId}/start`, { method: 'POST', body: JSON.stringify({}) })
       setNotice(null)
       await loadTask(taskId)
       await refreshTasks()
     } catch (err) {
-      setNotice({ tone: 'error', text: err instanceof Error ? err.message : '启动审查失败' })
+      // Decided per request: waits for any abort of this start to answer,
+      // so it holds whichever response arrives first.
+      if (!(await tracker.wasAborted(request))) {
+        setNotice({ tone: 'error', text: err instanceof Error ? err.message : '启动审查失败' })
+      }
+      // Failed or aborted, the task has moved on; show where it ended up.
+      void loadTask(taskId, { silent: true })
+      void refreshTasks({ silent: true })
+    } finally {
+      tracker.end(request)
+      setStartingTaskIds(tracker.pendingTaskIds())
     }
   }
 
   const abortTask = async (taskId: string) => {
+    // Attach before sending: the start request can fail with "cancelled"
+    // before this abort's own response arrives.
+    let settle: (accepted: boolean) => void = () => {}
+    startTrackerRef.current.noteAbort(taskId, new Promise<boolean>((resolve) => { settle = resolve }))
     try {
       await api(`/api/tasks/${taskId}/abort`, { method: 'POST' })
+      settle(true)
       setNotice(null)
       await loadTask(taskId)
       await refreshTasks()
     } catch (err) {
+      settle(false)
       setNotice({ tone: 'error', text: err instanceof Error ? err.message : '中止审查失败' })
     }
   }
@@ -566,7 +600,8 @@ export function App() {
     artifacts: detail?.artifacts.length ?? 0,
   }
 
-  const isRunning = selectedTask?.status === 'running'
+  const roundActive = isRoundActive(selectedTask?.status)
+  const isStarting = selectedTask !== null && startingTaskIds.includes(selectedTask.id)
   const startLabel = latestRound ? '发起下一轮审查' : '开始首轮审查'
 
   return (
@@ -638,7 +673,7 @@ export function App() {
                 aria-current={task.id === selectedTaskId}
               >
                 <div className={`tile-status tone-${statusTone(task.status)}`}>
-                  <span className={`dot ${task.status === 'running' ? 'pulsing' : ''}`} />
+                  <span className={`dot ${isRoundActive(task.status) ? 'pulsing' : ''}`} />
                   {statusLabel(task.status)}
                 </div>
                 <div className="tile-title">{task.title}</div>
@@ -679,7 +714,7 @@ export function App() {
                   <div className="detail-eyebrow">
                     <span className={`tone-${statusTone(selectedTask.status)}`}
                       style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                      <span className={`dot ${isRunning ? 'pulsing' : ''}`} />
+                      <span className={`dot ${roundActive ? 'pulsing' : ''}`} />
                       {statusLabel(selectedTask.status)}
                     </span>
                     <span>·</span>
@@ -704,7 +739,7 @@ export function App() {
                     <button
                       className="btn btn-primary"
                       onClick={() => startReviewRound(selectedTask.id)}
-                      disabled={isRunning}
+                      disabled={roundActive || isStarting}
                     >
                       {startLabel}
                     </button>
@@ -714,7 +749,7 @@ export function App() {
                     <button
                       className="btn btn-danger"
                       onClick={() => abortTask(selectedTask.id)}
-                      disabled={!isRunning}
+                      disabled={!roundActive}
                     >
                       中止
                     </button>
