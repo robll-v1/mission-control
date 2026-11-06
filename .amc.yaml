@@ -4,9 +4,8 @@ repo:
 
 backend:
   default: opencode
-  opencode:
-    model: ''
-    variant: ''
+  # No model here: the one from ~/.config/amc/config.yaml (or the agent's own
+  # default) applies. Set backend.opencode.model only to pin one for this repo.
 
 context:
   adaptive_budget: true

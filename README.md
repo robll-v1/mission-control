@@ -293,9 +293,11 @@ repo:
 
 backend:
   default: opencode
-  opencode:
-    model: ''
-    variant: ''
+  # Optional. Leave out to use your global model (or the agent's default);
+  # an empty value is treated the same as leaving it out.
+  # opencode:
+  #   model: provider/model
+  #   variant: high
 
 context:
   adaptive_budget: true
@@ -624,9 +626,10 @@ repo:
 
 backend:
   default: opencode              # Agent 后端
-  opencode:
-    model: ''                    # 模型覆盖
-    variant: ''                  # 变体覆盖
+  # 可选。不写则使用全局配置的模型（或 agent 自己的默认模型）；写空值等同于不写。
+  # opencode:
+  #   model: provider/model      # 仅在需要为本仓库固定模型时填写
+  #   variant: high              # 变体
 
 context:
   adaptive_budget: true         # 根据 patch 大小动态裁剪上下文

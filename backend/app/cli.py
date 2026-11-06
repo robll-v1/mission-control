@@ -714,18 +714,20 @@ def cmd_init(args: argparse.Namespace) -> None:
     print('\nModel configuration:')
     print(f'   The model name is passed to {backend} via --model flag.')
     print('   Examples: gpt-5.4, claude-sonnet-4, glm-5.1, deepseek-r1')
-    model = _prompt_input('   Model name (leave empty to use agent default)', '')
+    model = _prompt_input('   Model name (leave empty to use agent default)', '').strip()
+    # Leave the model out when none was given, rather than writing model: ''.
+    # A project file then inherits the global model instead of looking as if
+    # it pinned "no model".
+    backend_block = f'backend:\n  default: {backend}\n'
+    if model:
+        backend_block += f"  {backend}:\n    model: '{model}'\n"
 
     if is_global:
         # Global config: only backend + model preferences
         config_content = f"""# Mission Control global config
 # Project-level .amc.yaml overrides these settings
 
-backend:
-  default: {backend}
-  {backend}:
-    model: '{model}'
-"""
+{backend_block}"""
         try:
             config_path.write_text(config_content, encoding='utf-8')
         except OSError as exc:
@@ -752,11 +754,7 @@ backend:
   path: .
   base_branch: {base_branch}
 
-backend:
-  default: {backend}
-  {backend}:
-    model: '{model}'
-
+{backend_block}
 context:
   adaptive_budget: true
   hunk_snippets_enabled: true

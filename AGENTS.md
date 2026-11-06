@@ -93,7 +93,11 @@ CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.
 - Claude 运行的 Bash 沙箱**没有网络**，pip、`gh`、`git push` 需要在用户的终端里执行。GPT 那边的环境可能不同，以实际情况为准。
 - 用户的网络连 GitHub 偶尔会出现 `SSL_ERROR_SYSCALL`，通常是暂时的，重试即可。
 
-## 9. 当前状态（2026-11-02 更新）
+## 9. 当前状态（2026-11-03 更新）
+
+- Kiro `fix/config-empty-override`（未推送）：修复仓库 `.amc.yaml` 里的 `model: ''` 覆盖全局模型、导致 Web「模型选择」在该仓库不生效的问题。根因在 `60bd465` 的合并语义，`935a507` 起 Web 端暴露。现在 `backend` 段里的空值视为「未设置」，其他段的空值（如 `validation.checks.*.command: ''`）仍按覆盖处理；`DEFAULT_CONFIG`、本仓库 `.amc.yaml`、README 示例去掉了 `model: ''`；`amc init` 未填模型时不再写 `model` 键。新增 `test_config_layers.py` 共 16 个用例，在未修复代码上有 11 个失败；全量 `181 passed, 1 skipped`。取舍：项目里不能再用 `model: ''` 把全局模型「清空」成 agent 默认。另外，本仓库 `.amc.yaml` 的 `backend.default: opencode` 仍会覆盖全局的 `default: codex`，这是现有的分层语义，本次未改。
+
+- Codex 复核 PR #24 / `0935588`：此前跨任务取消提示 P2 已修复，独立 reviewer 接受，未发现新的阻塞问题。独立本地后端 `165 passed, 1 skipped`（34.55s），前端 `npm test` 7 passed、tsc/build 通过（本机 Node 26.9.0）；额外执行当前 App 的实际处理函数，受控验证中止先返回、启动先失败、中止被拒三种顺序均通过。远端 head 已核对；对应 CI run `41570720545` 的 10 个 job 全部成功，Frontend 日志确认 Node 22.23.4 与 `# pass 7 / # fail 0`（checkout 为该 head 与 main 的测试合并提交 `66f0d5a`）。结论：可以合并，由用户操作；W08/W09 浏览器实测仍待完成，原有进程树残留另项处理。本次未改业务代码或远端状态。
 
 - Kiro 补修 Codex 的 P2（PR #24）：前端取消状态改为按任务、按启动请求记录（`frontend/src/startTracker.ts`），并等这次启动对应的中止请求返回后再判断是否报错。顺带修复了中止被拒（409）时，真实的启动失败被吞掉的问题。新增 `frontend/tests/startTracker.test.ts`，共 7 个用例，`npm test` 运行；CI 前端改为 Node 22 并加上这一步。套用 `a7f2dd4` 旧语义时有 2 个用例失败。浏览器内 W09 仍未实测。子进程残留（父进程退出、子进程忽略 SIGTERM）按 Codex 建议另项处理，本次未改。
 
@@ -126,6 +130,10 @@ CI（`.github/workflows/ci.yml`）：后端在 ubuntu/macos/windows × Python 3.
 ## 10. 交接日志
 
 每次收工追加一条，最新的放在最上面。格式：日期 · 谁 · 分支/PR · 做了什么 · 没做完或没验证的 · 下一步建议。
+
+- 2026-11-03 · Kiro · `fix/config-empty-override` · 追溯并修复 `model: ''` 覆盖全局模型（根因 `60bd465`，`935a507` 起 Web 暴露）；backend 段空值视为未设置，三处 `model: ''` 来源与 `amc init` 一并修正；16 个新用例，11 个在旧代码上失败 · 未推送、未开 PR；正在运行的 `amc start` 仍是旧代码，需重启才生效；未用真实模型重跑 PR #24 审查 · 合并后重启服务，用所选模型重审 PR #24，并考虑在审查事件里记录实际使用的模型。
+
+- 2026-11-03 · Codex · PR #24 / `0935588` · 接受前端取消状态补修；独立全量 165 passed/1 skipped，前端 7 项、tsc/build 通过，实际 App 函数三种请求顺序验证通过；核对准确 head 对应 CI 10/10 及前端测试日志 · 未做浏览器 W08/W09 或真实模型调用，未合并 · 用户合并后完成浏览器验收，再独立修进程树清理。
 
 - 2026-11-02 · Kiro · `fix/preflight-cancel` / #24 · 补修跨任务取消提示串扰：取消状态按任务、按启动请求记录，并等中止结果返回后再决定是否报错；新增前端单测（7 个用例，`npm test`），CI 前端升级到 Node 22 · 浏览器 W09 未实测；子进程残留未处理 · 合并后做 W08/W09 实测；另开分支处理进程树清理。
 

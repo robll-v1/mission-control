@@ -18,7 +18,6 @@ class ConfigError(RuntimeError):
 DEFAULT_CONFIG: dict[str, Any] = {
     'backend': {
         'default': 'opencode',
-        'opencode': {'model': '', 'variant': ''},
     },
     'context': {
         'adaptive_budget': True,
@@ -78,6 +77,36 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _drop_unset_values(mapping: dict) -> dict:
+    """Copy ``mapping`` without blank strings or nulls, at any depth."""
+    cleaned: dict = {}
+    for key, value in mapping.items():
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        cleaned[key] = _drop_unset_values(value) if isinstance(value, dict) else value
+    return cleaned
+
+
+def _without_unset_backend_values(layer: dict[str, Any]) -> dict[str, Any]:
+    """Treat blank values under ``backend`` as "not set" for this layer.
+
+    ``model: ''`` and ``variant: ''`` mean "let the agent decide", exactly
+    like leaving the key out, and a blank ``default`` means no preference.
+    Merged as plain values they used to override the layer below, so a
+    project ``.amc.yaml`` written with ``model: ''`` (this repo's own, the
+    README example, ``amc init`` with no model) silently discarded the model
+    saved in the global config or on the Web model selection page.
+
+    Only ``backend`` is treated this way: elsewhere a blank can be a real
+    override, e.g. ``validation.checks.build.command: ''`` in a project turns
+    off a check the global config enables.
+    """
+    backend = layer.get('backend')
+    if not isinstance(backend, dict):
+        return layer
+    return {**layer, 'backend': _drop_unset_values(backend)}
+
+
 def _load_yaml_file(path: Path, *, strict: bool = False) -> dict[str, Any]:
     """Read a YAML config file as UTF-8.
 
@@ -128,14 +157,14 @@ def load_repo_config(repo_path: str) -> dict[str, Any]:
     # Layer 2: global user config
     global_cfg = load_global_config()
     if global_cfg:
-        merged = _deep_merge(merged, global_cfg)
+        merged = _deep_merge(merged, _without_unset_backend_values(global_cfg))
 
     # Layer 3: project-level .amc.yaml
     config_path = Path(repo_path) / '.amc.yaml'
     if config_path.exists():
         project_cfg = _load_yaml_file(config_path)
         if project_cfg:
-            merged = _deep_merge(merged, project_cfg)
+            merged = _deep_merge(merged, _without_unset_backend_values(project_cfg))
 
     return merged
 
