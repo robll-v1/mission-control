@@ -2,10 +2,10 @@ repo:
   path: .
   base_branch: main
 
-backend:
-  default: opencode
-  # No model here: the one from ~/.config/amc/config.yaml (or the agent's own
-  # default) applies. Set backend.opencode.model only to pin one for this repo.
+# No backend section: the backend and model chosen on the model selection page
+# (~/.config/amc/config.yaml) apply here, or opencode with its own default model
+# when nothing is chosen. Add backend.default / backend.<name>.model only to pin
+# them for this repo.
 
 context:
   adaptive_budget: true
