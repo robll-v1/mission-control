@@ -5,6 +5,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
 from app.core.execution import ExecutionService
@@ -120,6 +122,36 @@ def test_concurrent_starts_launch_exactly_one_round(git_repo, tmp_path, isolated
         time.sleep(0.05)
     assert not execution.is_active(task.id), 'slot was not released after the round'
     worktrees.cleanup_worktree(task)
+    db.close()
+
+
+@pytest.mark.parametrize('model', ['gpt-x', None])
+def test_round_started_records_the_model_the_agent_was_given(git_repo, tmp_path, isolated_config, model):
+    """The model travels config -> adapter_factory -> payload, as in the Web app and SDK."""
+    if model:
+        config = isolated_config / 'amc' / 'config.yaml'
+        config.parent.mkdir(parents=True)
+        config.write_text(f'backend:\n  opencode:\n    model: {model}\n', encoding='utf-8')
+    (git_repo / 'a.txt').write_text('review me\n', encoding='utf-8')
+    db, mission, artifacts, worktrees, contexts, execution = _build(tmp_path, git_repo)
+
+    def factory(name, *, model=None, variant=None):
+        # As in app.py: the registry adapter has no model, each round builds its own.
+        adapter = FakeAdapter()
+        adapter.model, adapter.variant = model, variant
+        return adapter
+
+    execution.adapter_factory = factory
+    task = _make_local_task(git_repo, mission, artifacts)
+
+    execution.start_task(task.id)
+    deadline = time.time() + 30
+    while execution.is_active(task.id) and time.time() < deadline:
+        time.sleep(0.05)
+
+    [started] = [e for e in db.list_events(task.id) if e.kind == 'review.round_started']
+    assert (started.payload['backend'], started.payload['model']) == ('opencode', model)
+    worktrees.cleanup_worktree(db.get_task(task.id))
     db.close()
 
 

@@ -108,6 +108,20 @@ def test_this_repos_own_config_keeps_the_global_model(tmp_path, isolated_config)
     assert resolve_backend_config(str(repo))['model'] == 'global-model'
 
 
+def test_this_repos_own_config_follows_the_selected_backend(tmp_path, isolated_config):
+    """It pinned backend.default: opencode, hiding a codex choice made in the UI."""
+    _write_global(isolated_config, 'backend:\n  default: codex\n  codex:\n    model: gpt-x\n')
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    shutil.copy(REPO_ROOT / '.amc.yaml', repo / '.amc.yaml')
+
+    assert resolve_backend_config(str(repo)) == {'backend': 'codex', 'model': 'gpt-x', 'variant': None}
+    cfg = load_repo_config(str(repo))
+    # Values that only the file supplies (the defaults have neither) still apply.
+    assert cfg['repo']['base_branch'] == 'main'
+    assert 'build' in cfg['validation']['checks']
+
+
 @pytest.mark.parametrize('scope', ['project', 'global'])
 def test_init_without_a_model_writes_no_model_key(tmp_path, isolated_config, monkeypatch, scope):
     monkeypatch.chdir(tmp_path)
