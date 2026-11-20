@@ -116,7 +116,10 @@ def test_this_repos_own_config_follows_the_selected_backend(tmp_path, isolated_c
     shutil.copy(REPO_ROOT / '.amc.yaml', repo / '.amc.yaml')
 
     assert resolve_backend_config(str(repo)) == {'backend': 'codex', 'model': 'gpt-x', 'variant': None}
-    assert load_repo_config(str(repo))['context']['candidate_files_limit'] == 12  # rest of the file still applies
+    cfg = load_repo_config(str(repo))
+    # Values that only the file supplies (the defaults have neither) still apply.
+    assert cfg['repo']['base_branch'] == 'main'
+    assert 'build' in cfg['validation']['checks']
 
 
 @pytest.mark.parametrize('scope', ['project', 'global'])

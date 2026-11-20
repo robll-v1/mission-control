@@ -424,11 +424,11 @@ class ExecutionService:
                 payload={
                     'entrypoint': cmd[:4],
                     'backend': task.backend,
-                    # What the agent was actually told to use; None means its
-                    # own default. Recorded so a config that silently drops
-                    # the selected model is visible in the event stream.
+                    # The model handed to the agent CLI (every adapter passes
+                    # it on); None means the CLI's own default. Recorded so a
+                    # config that silently drops the selected model shows up
+                    # in the event stream. No variant: most CLIs never get it.
                     'model': getattr(adapter, 'model', None),
-                    'variant': getattr(adapter, 'variant', None),
                     'worktree_path': task.worktree_path,
                     'idle_timeout_sec': idle_timeout_sec,
                     'round_index': round_index,
