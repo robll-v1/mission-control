@@ -1,11 +1,13 @@
-"""OpenAI Codex CLI adapter — uses `codex exec --json --full-auto`."""
+"""OpenAI Codex CLI adapter — runs `codex exec --json` in a read-only sandbox."""
 
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable
 from app.core.models import Task
+from app.core.review_policy import BLOCKED_MARKER, forbidden_command_reason
 
 
 class CodexAdapter(RunnerAdapter):
@@ -21,10 +23,19 @@ class CodexAdapter(RunnerAdapter):
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         work_dir = task.worktree_path or task.repo_path
-        cmd = [resolve_executable('codex'), 'exec', '--json', '--full-auto']
+        # codex-cli 0.169 rejects --full-auto (deprecated since 0.128) and
+        # --cwd (the working-root flag is -C/--cd), exiting 2 before the
+        # review starts. A review only reads, so the model's shell commands
+        # run in the read-only sandbox. That is also exec's default; it is
+        # set here so a user config cannot widen it.
+        cmd = [
+            resolve_executable('codex'), 'exec', '--json',
+            '--sandbox', 'read-only',
+            '--cd', work_dir,
+        ]
         if self.model:
-            cmd.extend(['-c', f'model="{self.model}"'])
-        cmd.extend(['--cwd', work_dir, prompt])
+            cmd.extend(['--model', self.model])
+        cmd.append(prompt)
         return cmd
 
     def parse_stdout_line(self, line: str) -> list[AdapterEvent]:
@@ -35,46 +46,87 @@ class CodexAdapter(RunnerAdapter):
             obj = json.loads(stripped)
         except json.JSONDecodeError:
             return [AdapterEvent(kind='agent.text', payload={'text': stripped})]
+        if not isinstance(obj, dict):
+            return []
 
         msg_type = obj.get('type', '')
 
         if msg_type == 'thread.started':
-            return [AdapterEvent(kind='agent.step_start', payload={
-                'type': 'thread_start',
-                'thread_id': obj.get('thread_id'),
-            })]
+            payload: dict[str, Any] = {'type': 'thread_start'}
+            thread_id = str(obj.get('thread_id') or '').strip()
+            if thread_id:
+                # Kept as the run's backend session (`codex exec resume <id>`).
+                payload['session_id'] = thread_id
+            return [AdapterEvent(kind='agent.step_start', payload=payload)]
 
         if msg_type == 'turn.started':
             return [AdapterEvent(kind='agent.step_start', payload={'type': 'turn_start'})]
 
         if msg_type == 'item.completed':
-            item = obj.get('item', {})
+            item = obj.get('item') if isinstance(obj.get('item'), dict) else {}
             item_type = item.get('type', '')
             if item_type == 'agent_message':
-                text = item.get('text', '').strip()
-                if text:
-                    return [AdapterEvent(kind='agent.text', payload={'text': text})]
-            elif item_type == 'tool_call':
-                return [AdapterEvent(kind='agent.tool_use', payload={
-                    'tool': item.get('name', ''),
-                    'status': 'completed',
-                    'title': item.get('name', ''),
-                    'output_preview': str(item.get('output', ''))[:360],
-                })]
-            elif item_type == 'tool_output':
-                return [AdapterEvent(kind='agent.tool_use', payload={
-                    'tool': 'output',
-                    'status': 'completed',
-                    'output_preview': str(item.get('output', ''))[:360],
-                })]
+                text = str(item.get('text') or '').strip()
+                return [AdapterEvent(kind='agent.text', payload={'text': text})] if text else []
+            if item_type == 'command_execution':
+                return [self._command_event(item)]
+            if item_type == 'error':
+                message = str(item.get('message') or '').strip()
+                if message:
+                    return [AdapterEvent(kind='agent.error', level='warning',
+                                         payload={'error_type': 'item', 'error_message': message})]
+            # reasoning, file_change, mcp_tool_call, web_search, todo_list are
+            # not needed to follow or judge a review.
             return []
 
         if msg_type == 'turn.completed':
-            usage = obj.get('usage', {})
+            usage = obj.get('usage') if isinstance(obj.get('usage'), dict) else {}
             return [AdapterEvent(kind='agent.step_finish', payload={
                 'reason': 'turn_completed',
-                'token_total': usage.get('input_tokens', 0) + usage.get('output_tokens', 0),
+                'token_total': (usage.get('input_tokens') or 0) + (usage.get('output_tokens') or 0),
                 'token_output': usage.get('output_tokens'),
+                'token_reasoning': usage.get('reasoning_output_tokens'),
+            })]
+
+        if msg_type == 'turn.failed':
+            # Without this a failed turn (bad model name, auth, quota) left a
+            # failed round with no reason anywhere in the events.
+            error = obj.get('error') if isinstance(obj.get('error'), dict) else {}
+            return [AdapterEvent(kind='agent.error', level='error', payload={
+                'error_type': 'turn.failed',
+                'error_message': str(error.get('message') or 'turn failed'),
+            })]
+
+        if msg_type == 'error':
+            # Also used for transient "Reconnecting... 1/5" notices; a fatal
+            # error is followed by turn.failed or a non-zero exit.
+            return [AdapterEvent(kind='agent.error', level='warning', payload={
+                'error_type': 'stream',
+                'error_message': str(obj.get('message') or ''),
             })]
 
         return []
+
+    def _command_event(self, item: dict[str, Any]) -> AdapterEvent:
+        command = str(item.get('command') or '').strip()
+        output = str(item.get('aggregated_output') or '').strip()
+        exit_code = item.get('exit_code')
+        payload: dict[str, Any] = {
+            'tool': 'bash',
+            'status': item.get('status'),
+            'title': 'command',
+            'command_preview': self._truncate(command, 220),
+            'exit_code': exit_code,
+        }
+        if output:
+            payload['output_preview'] = self._truncate(output, 360)
+        level = 'info'
+        reason = forbidden_command_reason(command)
+        if reason or BLOCKED_MARKER in output:
+            payload['policy_violation'] = True
+            payload['warning_reason'] = reason or 'command was blocked by static review policy'
+            level = 'error'
+        elif isinstance(exit_code, int) and exit_code != 0:
+            payload['warning_reason'] = 'command exited non-zero'
+            level = 'warning'
+        return AdapterEvent(kind='agent.tool_use', level=level, payload=payload)

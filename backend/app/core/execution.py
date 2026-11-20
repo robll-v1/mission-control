@@ -439,6 +439,10 @@ class ExecutionService:
             proc = subprocess.Popen(
                 cmd,
                 cwd=task.worktree_path or task.repo_path,
+                # The prompt is an argument. An inherited stdin that is a pipe
+                # is read as extra input by codex exec (appended as <stdin>),
+                # and blocks the round if the pipe never closes.
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -726,6 +730,7 @@ class ExecutionService:
                 # treatment as the review agent itself.
                 probe_proc = subprocess.Popen(
                     probe,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
