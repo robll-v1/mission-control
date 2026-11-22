@@ -3,11 +3,30 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
 from typing import Any
 
 from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable
 from app.core.models import Task
 from app.core.review_policy import BLOCKED_MARKER, forbidden_command_reason
+
+_SHELLS = {'bash', 'zsh', 'sh', 'dash'}
+
+
+def _shell_script(command: str) -> str:
+    """The script inside codex's `<shell> -lc '<script>'` wrapper, else the command.
+
+    The policy pattern needs whitespace before a tool name, so in the wrapped
+    form `npm test` follows a quote and would never match.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    if len(argv) >= 3 and os.path.basename(argv[0]) in _SHELLS and argv[1] in ('-c', '-lc', '-cl'):
+        return argv[2]
+    return command
 
 
 class CodexAdapter(RunnerAdapter):
@@ -18,25 +37,31 @@ class CodexAdapter(RunnerAdapter):
         self.model = model
         self.variant = variant
 
-    def probe_command(self) -> list[str] | None:
-        return [resolve_executable('codex'), '--version']
-
-    def make_command(self, *, task: Task, prompt: str) -> list[str]:
-        work_dir = task.worktree_path or task.repo_path
-        # codex-cli 0.169 rejects --full-auto (deprecated since 0.128) and
-        # --cwd (the working-root flag is -C/--cd), exiting 2 before the
-        # review starts. A review only reads, so the model's shell commands
-        # run in the read-only sandbox. That is also exec's default; it is
-        # set here so a user config cannot widen it.
-        cmd = [
+    def _exec_args(self, work_dir: str) -> list[str]:
+        # codex-cli 0.169 rejects --full-auto (deprecated in 0.128, since
+        # removed) and --cwd (the flag is -C/--cd), exiting 2 before a review
+        # starts. A review only reads: model shell commands run in the
+        # read-only sandbox, which is also exec's default and is set here so
+        # a user config cannot widen it. On macOS codex runs those commands
+        # in a login shell, which can put /usr/bin ahead of the PATH shims,
+        # so for codex the sandbox (no writes, no network) is the guard and
+        # the static policy check only flags commands.
+        args = [
             resolve_executable('codex'), 'exec', '--json',
             '--sandbox', 'read-only',
             '--cd', work_dir,
         ]
         if self.model:
-            cmd.extend(['--model', self.model])
-        cmd.append(prompt)
-        return cmd
+            args.extend(['--model', self.model])
+        return args
+
+    def probe_command(self) -> list[str] | None:
+        # Parses the same flags as a round without starting a session, so a
+        # CLI update that drops one fails preflight instead of the round.
+        return [*self._exec_args('.'), '--version']
+
+    def make_command(self, *, task: Task, prompt: str) -> list[str]:
+        return [*self._exec_args(task.worktree_path or task.repo_path), prompt]
 
     def parse_stdout_line(self, line: str) -> list[AdapterEvent]:
         stripped = line.strip()
@@ -64,20 +89,7 @@ class CodexAdapter(RunnerAdapter):
 
         if msg_type == 'item.completed':
             item = obj.get('item') if isinstance(obj.get('item'), dict) else {}
-            item_type = item.get('type', '')
-            if item_type == 'agent_message':
-                text = str(item.get('text') or '').strip()
-                return [AdapterEvent(kind='agent.text', payload={'text': text})] if text else []
-            if item_type == 'command_execution':
-                return [self._command_event(item)]
-            if item_type == 'error':
-                message = str(item.get('message') or '').strip()
-                if message:
-                    return [AdapterEvent(kind='agent.error', level='warning',
-                                         payload={'error_type': 'item', 'error_message': message})]
-            # reasoning, file_change, mcp_tool_call, web_search, todo_list are
-            # not needed to follow or judge a review.
-            return []
+            return self._item_events(item)
 
         if msg_type == 'turn.completed':
             usage = obj.get('usage') if isinstance(obj.get('usage'), dict) else {}
@@ -107,6 +119,58 @@ class CodexAdapter(RunnerAdapter):
 
         return []
 
+    def _item_events(self, item: dict[str, Any]) -> list[AdapterEvent]:
+        item_type = item.get('type', '')
+        if item_type == 'agent_message':
+            text = str(item.get('text') or '').strip()
+            if not text:
+                return []
+            payload: dict[str, Any] = {'text': text}
+            phase = item.get('phase')
+            if isinstance(phase, str) and phase:
+                # 'commentary' marks interim progress text; the result
+                # service never takes it as the review conclusion.
+                payload['phase'] = phase
+            return [AdapterEvent(kind='agent.text', payload=payload)]
+        if item_type == 'command_execution':
+            return [self._command_event(item)]
+        if item_type == 'mcp_tool_call':
+            error = item.get('error') if isinstance(item.get('error'), dict) else {}
+            payload = {
+                'tool': f"mcp:{item.get('server') or '?'}/{item.get('tool') or '?'}",
+                'status': item.get('status'),
+                'title': 'MCP tool call',
+                'warning_reason': 'MCP tools run outside the codex read-only sandbox',
+            }
+            if error.get('message'):
+                payload['output_preview'] = self._truncate(str(error['message']), 260)
+            return [AdapterEvent(kind='agent.tool_use', level='warning', payload=payload)]
+        if item_type == 'web_search':
+            return [AdapterEvent(kind='agent.tool_use', level='warning', payload={
+                'tool': 'web_search',
+                'status': 'completed',
+                'title': 'web search',
+                'query': str(item.get('query') or ''),
+                'warning_reason': 'web search during a static review',
+            })]
+        if item_type == 'file_change':
+            changes = item.get('changes') if isinstance(item.get('changes'), list) else []
+            paths = [str(c['path']) for c in changes if isinstance(c, dict) and c.get('path')]
+            return [AdapterEvent(kind='agent.tool_use', level='warning', payload={
+                'tool': 'file_change',
+                'status': item.get('status'),
+                'title': 'file change',
+                'paths': paths[:20],
+                'warning_reason': 'a review should not edit files',
+            })]
+        if item_type == 'error':
+            message = str(item.get('message') or '').strip()
+            if message:
+                return [AdapterEvent(kind='agent.error', level='warning',
+                                     payload={'error_type': 'item', 'error_message': message})]
+        # reasoning and todo_list are not needed to follow or judge a review.
+        return []
+
     def _command_event(self, item: dict[str, Any]) -> AdapterEvent:
         command = str(item.get('command') or '').strip()
         output = str(item.get('aggregated_output') or '').strip()
@@ -121,7 +185,7 @@ class CodexAdapter(RunnerAdapter):
         if output:
             payload['output_preview'] = self._truncate(output, 360)
         level = 'info'
-        reason = forbidden_command_reason(command)
+        reason = forbidden_command_reason(_shell_script(command))
         if reason or BLOCKED_MARKER in output:
             payload['policy_violation'] = True
             payload['warning_reason'] = reason or 'command was blocked by static review policy'

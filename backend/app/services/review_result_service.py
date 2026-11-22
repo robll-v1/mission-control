@@ -158,6 +158,9 @@ class ReviewResultService:
             event for event in events
             if (text := ReviewResultService._event_text(event)).strip()
             and not text.strip().startswith(NOISE_TEXT_PREFIXES)
+            # Codex labels interim progress text as commentary. A round that
+            # stops after one ("I'll read the patch first") has no result.
+            and event.payload.get('phase') != 'commentary'
         ]
         return meaningful[-1] if meaningful else None
 

@@ -439,9 +439,10 @@ class ExecutionService:
             proc = subprocess.Popen(
                 cmd,
                 cwd=task.worktree_path or task.repo_path,
-                # The prompt is an argument. An inherited stdin that is a pipe
-                # is read as extra input by codex exec (appended as <stdin>),
-                # and blocks the round if the pipe never closes.
+                # The prompt is an argument, but every CLI also reads a
+                # non-TTY stdin: codex exec appends it to the prompt, opencode
+                # reads it to EOF first, claude waits 3s for it. An inherited
+                # pipe that never closes would block or stall the round.
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

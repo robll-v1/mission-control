@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.adapters import get_adapter
-from app.core.models import Task
+from app.core.models import Event, Run, Task
+from app.services.review_result_service import ReviewResultService
 
 
 def _task(tmp_path):
@@ -50,15 +53,34 @@ def test_agent_message_is_review_text():
     assert (event.kind, event.payload['text']) == ('agent.text', '## Review Summary\n\nLooks fine.')
 
 
-def test_blocked_command_is_flagged_as_a_policy_violation():
+def test_probe_parses_the_round_flags_without_a_session():
+    probe = get_adapter('codex', model='gpt-x').probe_command()
+    assert probe[1:] == ['exec', '--json', '--sandbox', 'read-only', '--cd', '.', '--model', 'gpt-x', '--version']
+
+
+@pytest.mark.parametrize('command', [
+    "/bin/zsh -lc 'npm test'",
+    "/bin/bash -lc 'cd backend && pytest -q'",
+    'bash -c "python -m http.server"',
+])
+def test_blocked_command_inside_the_shell_wrapper_is_flagged(command):
+    """No marker in the output: on macOS codex's login shell can bypass the PATH shims."""
     [event] = _parse({'type': 'item.completed', 'item': {
-        'id': 'item_1', 'type': 'command_execution', 'command': "bash -lc 'npm test'",
-        'aggregated_output': 'PR Review Control policy blocked command during static review.',
-        'exit_code': 97, 'status': 'failed',
+        'id': 'item_1', 'type': 'command_execution', 'command': command,
+        'aggregated_output': '', 'exit_code': 0, 'status': 'completed',
     }})
     assert (event.kind, event.level) == ('agent.tool_use', 'error')
     assert event.payload['policy_violation'] is True
-    assert event.payload['command_preview'] == "bash -lc 'npm test'"
+    assert event.payload['command_preview'] == command
+
+
+def test_shim_marker_in_the_output_is_flagged():
+    [event] = _parse({'type': 'item.completed', 'item': {
+        'id': 'item_1', 'type': 'command_execution', 'command': '/usr/bin/true',
+        'aggregated_output': 'PR Review Control policy blocked command during static review.',
+        'exit_code': 97, 'status': 'failed',
+    }})
+    assert event.payload['policy_violation'] is True
 
 
 def test_read_command_is_informational():
@@ -89,7 +111,58 @@ def test_turn_completed_reports_tokens():
     assert (event.payload['token_total'], event.payload['token_output'], event.payload['token_reasoning']) == (120, 20, 5)
 
 
+@pytest.mark.parametrize('item', [
+    {'id': 'i', 'type': 'mcp_tool_call', 'server': 'node_repl', 'tool': 'run', 'status': 'completed'},
+    {'id': 'i', 'type': 'web_search', 'query': 'cve'},
+    {'id': 'i', 'type': 'file_change', 'changes': [{'path': 'a.py', 'kind': 'update'}], 'status': 'completed'},
+])
+def test_actions_the_sandbox_does_not_cover_are_surfaced_as_warnings(item):
+    [event] = _parse({'type': 'item.completed', 'item': item})
+    assert (event.kind, event.level) == ('agent.tool_use', 'warning')
+    assert event.payload['warning_reason']
+
+
 def test_items_a_review_does_not_need_are_skipped():
     assert _parse({'type': 'item.completed', 'item': {'id': 'i', 'type': 'reasoning', 'text': 'thinking'}}) == []
     assert _parse({'type': 'item.started', 'item': {'id': 'i', 'type': 'command_execution'}}) == []
     assert _parse({'type': 'item.completed', 'item': {'id': 'i', 'type': 'agent_message', 'text': '  '}}) == []
+
+
+def _round_result(stream, status):
+    """Feed codex JSONL through the adapter and the result service, as a round does."""
+    run = Run(task_id='t', backend='codex', status=status, started_at=0.0)
+    adapter = get_adapter('codex')
+    events = [
+        Event(task_id='t', run_id=run.id, seq=seq, ts=0.0, kind=event.kind, payload=event.payload)
+        for seq, event in enumerate((e for obj in stream for e in _parse(obj, adapter)), start=1)
+    ]
+    return ReviewResultService.extract_result(events=events, run=run)
+
+
+def _message(text, phase=None):
+    item = {'id': 'm', 'type': 'agent_message', 'text': text}
+    if phase:
+        item['phase'] = phase
+    return {'type': 'item.completed', 'item': item}
+
+
+FINAL = '## Review Summary\n\nOne bug.\n\n## Findings\n\n- high: `a.py:3` — off by one'
+
+
+def test_completed_round_uses_the_final_answer():
+    result = _round_result([_message("I'll read the patch first.", 'commentary'), _message(FINAL, 'final_answer'),
+                            {'type': 'turn.completed', 'usage': {}}], 'completed')
+    assert (result.verdict, result.finding_count, result.summary) == ('concerns', 1, 'One bug.')
+
+
+def test_interim_commentary_is_never_taken_as_the_result():
+    result = _round_result([_message("I'll read the patch first.", 'commentary'),
+                            {'type': 'turn.failed', 'error': {'message': 'quota exceeded'}}], 'failed')
+    assert result.verdict == 'failed'
+    assert 'read the patch' not in result.summary
+
+
+def test_messages_without_a_phase_still_count():
+    """Older codex versions send no phase."""
+    result = _round_result([_message(FINAL)], 'completed')
+    assert result.finding_count == 1
