@@ -439,6 +439,11 @@ class ExecutionService:
             proc = subprocess.Popen(
                 cmd,
                 cwd=task.worktree_path or task.repo_path,
+                # The prompt is an argument, but every CLI also reads a
+                # non-TTY stdin: codex exec appends it to the prompt, opencode
+                # reads it to EOF first, claude waits 3s for it. An inherited
+                # pipe that never closes would block or stall the round.
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -726,6 +731,7 @@ class ExecutionService:
                 # treatment as the review agent itself.
                 probe_proc = subprocess.Popen(
                     probe,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,

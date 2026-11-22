@@ -155,6 +155,42 @@ def test_round_started_records_the_model_the_agent_was_given(git_repo, tmp_path,
     db.close()
 
 
+def test_probe_and_agent_start_with_stdin_closed(git_repo, tmp_path, isolated_config, monkeypatch):
+    """Every agent CLI reads a non-TTY stdin; an inherited open pipe would block the round."""
+    import subprocess
+
+    import app.core.execution as execution_module
+
+    class ProbingAdapter(FakeAdapter):
+        def probe_command(self):
+            return [sys.executable, '-c', '']
+
+    (git_repo / 'a.txt').write_text('review me\n', encoding='utf-8')
+    db, mission, artifacts, worktrees, contexts, execution = _build(tmp_path, git_repo)
+    execution.adapters['opencode'] = ProbingAdapter()
+    task = _make_local_task(git_repo, mission, artifacts)
+    calls = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(args, *rest, **kwargs):
+        calls.append((args, kwargs.get('stdin')))
+        return real_popen(args, *rest, **kwargs)
+
+    monkeypatch.setattr(execution_module.subprocess, 'Popen', recording_popen)
+    execution.start_task(task.id)
+    deadline = time.time() + 30
+    while execution.is_active(task.id) and time.time() < deadline:
+        time.sleep(0.05)
+    monkeypatch.undo()
+
+    # git helpers spawn too; the probe and the agent are the python commands.
+    stdins = [stdin for args, stdin in calls if isinstance(args, list) and args[:1] == [sys.executable]]
+    assert stdins == [subprocess.DEVNULL, subprocess.DEVNULL]
+    assert db.list_runs(task.id)[0].status == 'completed'
+    worktrees.cleanup_worktree(db.get_task(task.id))
+    db.close()
+
+
 def test_prepare_failure_releases_the_slot_for_retry(git_repo, tmp_path, isolated_config, monkeypatch):
     (git_repo / 'a.txt').write_text('review me too\n', encoding='utf-8')
     db, mission, artifacts, worktrees, contexts, execution = _build(tmp_path, git_repo)
