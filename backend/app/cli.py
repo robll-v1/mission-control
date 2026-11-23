@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -24,6 +25,8 @@ RUN_DIR_NAME = '.run'
 BACKEND_DEFAULT_PORT = 8000
 FRONTEND_DEFAULT_PORT = 5173
 HEALTH_TIMEOUT = 30
+STATE_SCHEMA = 2
+SERVICE_NAMES = ('backend', 'frontend')
 
 IS_WINDOWS = sys.platform == 'win32'
 
@@ -84,7 +87,13 @@ def _color(code: str, msg: str) -> str:
 
 
 def _root_dir() -> Path:
-    """Resolve project root (directory containing pyproject.toml)."""
+    """Resolve the source checkout used for .venv, frontend and .run."""
+    override = os.environ.get('AMC_ROOT', '').strip()
+    if override:
+        root = Path(override).expanduser().resolve()
+        if not (root / 'pyproject.toml').exists():
+            _fail(f'AMC_ROOT does not point to a Mission Control source checkout: {root}')
+        return root
     here = Path(__file__).resolve().parent
     for ancestor in [here, here.parent, here.parent.parent]:
         if (ancestor / 'pyproject.toml').exists():
@@ -113,11 +122,11 @@ def _venv_bin(name: str) -> Path:
 # ── helpers ───────────────────────────────────────────────────────────
 
 def _info(msg: str) -> None:
-    print(_color('0;36', msg))
+    print(_color('0;36', msg), flush=True)
 
 
 def _eprint(msg: str = '') -> None:
-    print(msg, file=sys.stderr)
+    print(msg, file=sys.stderr, flush=True)
 
 
 def _print_json(payload: dict) -> None:
@@ -181,15 +190,15 @@ def _no_changes_payload(base: str | None, message: str) -> dict:
 
 
 def _ok(msg: str) -> None:
-    print(_color('0;32', f'{_SYM_OK} {msg}'))
+    print(_color('0;32', f'{_SYM_OK} {msg}'), flush=True)
 
 
 def _warn(msg: str) -> None:
-    print(_color('0;33', f'{_SYM_WARN} {msg}'), file=sys.stderr)
+    print(_color('0;33', f'{_SYM_WARN} {msg}'), file=sys.stderr, flush=True)
 
 
 def _fail(msg: str) -> None:
-    print(_color('0;31', f'{_SYM_FAIL} {msg}'), file=sys.stderr)
+    print(_color('0;31', f'{_SYM_FAIL} {msg}'), file=sys.stderr, flush=True)
     sys.exit(1)
 
 
@@ -224,9 +233,388 @@ def _read_pid(name: str) -> int | None:
     if pidfile.exists():
         try:
             return int(pidfile.read_text().strip())
-        except ValueError:
+        except (OSError, ValueError):
             return None
     return None
+
+
+def _state_path(name: str) -> Path:
+    return _run_dir() / f'{name}.json'
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    try:
+        temp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+        try:
+            os.chmod(temp, 0o600)
+        except OSError:
+            pass
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _warn(f'Could not remove {path}: {exc}')
+
+
+def _read_json_file(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _process_identity(pid: int) -> dict | None:
+    if pid <= 0:
+        return None
+    if IS_WINDOWS:
+        return _windows_process_identity(pid)
+    env = os.environ.copy()
+    env['LC_ALL'] = 'C'
+    try:
+        result = run_text(
+            ['ps', '-p', str(pid), '-o', 'lstart=', '-o', 'command='],
+            env=env,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.match(r'^(.{24})\s+(.*)$', (result.stdout or '').rstrip('\n'))
+    if not match or not match.group(2).strip():
+        return None
+    start_time, command = match.groups()
+    try:
+        session_id = os.getsid(pid)
+        pgid = os.getpgid(pid)
+    except (OSError, ProcessLookupError):
+        return None
+    return {
+        'pid': pid,
+        'start_time': start_time,
+        'command': command,
+        'session_id': session_id,
+        'pgid': pgid,
+        'source': 'ps',
+    }
+
+
+def _windows_process_identity(pid: int) -> dict | None:
+    import shutil
+    executable = shutil.which('powershell') or shutil.which('pwsh')
+    if not executable:
+        return None
+    script = (
+        '[Console]::OutputEncoding=[Text.Encoding]::UTF8; '
+        f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; "
+        'if ($p) { [pscustomobject]@{CreationDate=$p.CreationDate.ToString("o");'
+        'CommandLine=$p.CommandLine;ParentProcessId=$p.ParentProcessId} | ConvertTo-Json -Compress }'
+    )
+    try:
+        result = run_text([executable, '-NoProfile', '-NonInteractive', '-Command', script], timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not (result.stdout or '').strip():
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        'pid': pid,
+        'start_time': str(data.get('CreationDate') or ''),
+        'command': str(data.get('CommandLine') or ''),
+        'session_id': None,
+        'pgid': None,
+        'source': 'cim',
+        'parent_pid': data.get('ParentProcessId'),
+    }
+
+
+def _save_service_state(name: str, state: dict) -> None:
+    _atomic_write_json(_state_path(name), state)
+    _save_pid(name, int(state['pid']))
+
+
+def _load_service_state(name: str) -> tuple[dict | None, str]:
+    path = _state_path(name)
+    if not path.exists():
+        return None, 'missing'
+    data = _read_json_file(path)
+    if data is None or type(data.get('schema')) is not int or data.get('schema') != STATE_SCHEMA:
+        return None, 'corrupt'
+    pid = data.get('pid')
+    signature = data.get('signature')
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(data.get('root'), str)
+        or not data['root'].strip()
+        or data.get('name') != name
+        or not isinstance(data.get('start_time'), str)
+        or not data['start_time']
+        or not isinstance(data.get('command'), str)
+        or not data['command'].strip()
+        or not isinstance(data.get('port'), int)
+        or isinstance(data.get('port'), bool)
+        or not 1 <= data['port'] <= 65535
+        or not isinstance(signature, list)
+        or not signature
+        or not all(isinstance(item, str) and item for item in signature)
+        or (not IS_WINDOWS and (type(data.get('session_id')) is not int or type(data.get('pgid')) is not int))
+        or (IS_WINDOWS and (type(data.get('parent_pid')) is not int or data['parent_pid'] <= 0))
+    ):
+        return None, 'corrupt'
+    return data, ''
+
+
+def _remove_service_artifacts(name: str) -> None:
+    for path in (_state_path(name), _run_dir() / f'{name}.pid'):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _warn(f'Could not remove {path}: {exc}')
+
+
+def _remove_ports_file() -> None:
+    try:
+        (_run_dir() / 'ports.json').unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _warn(f'Could not remove {_run_dir() / "ports.json"}: {exc}')
+
+
+def _ports_file_matches_services(items: list[dict]) -> bool:
+    ports = _read_json_file(_run_dir() / 'ports.json')
+    if ports is None:
+        return False
+    by_name = {item['name']: item for item in items}
+    matched = False
+    for name, port in ports.items():
+        if name not in SERVICE_NAMES:
+            return False
+        if port is None:
+            continue
+        item = by_name.get(name)
+        if not item or not isinstance(item.get('state'), dict) or item['state'].get('port') != port:
+            return False
+        matched = True
+    return matched
+
+
+def _service_signature(kind: str, root: Path, port: int) -> list[str]:
+    if kind == 'backend':
+        return ['app.api.app:app', '--app-dir', str(root / 'backend'), '--port', str(port)]
+    return [str(root / 'frontend' / 'node_modules' / 'vite' / 'bin' / 'vite.js'), '--port', str(port)]
+
+
+def _command_fingerprint(command: str, signature: list[str]) -> str | None:
+    """Ignore a launcher prefix while keeping the service entrypoint and argv tail exact."""
+    if not isinstance(command, str) or not signature:
+        return None
+    marker = signature[0]
+    index = command.find(marker)
+    return command[index:] if index >= 0 else None
+
+
+def _register_process(name: str, proc: subprocess.Popen, kind: str, root: Path, port: int) -> dict:
+    """Persist a verifiable process fingerprint; a PID alone is never ownership proof."""
+    identity = None
+    for _ in range(20):
+        identity = _process_identity(proc.pid)
+        if identity is not None:
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    if identity is None:
+        raise RuntimeError(f'Cannot verify {name} process identity (PID {proc.pid}); refusing to manage it by PID alone.')
+    signature = _service_signature(kind, root.resolve(), port)
+    fingerprint = _command_fingerprint(identity.get('command'), signature)
+    if fingerprint is None or any(token not in fingerprint for token in signature):
+        raise RuntimeError(f'Cannot verify {name} command line (PID {proc.pid}); refusing to manage it by PID alone.')
+    if not identity.get('start_time'):
+        raise RuntimeError(f'Cannot verify {name} start time (PID {proc.pid}); refusing to manage it by PID alone.')
+    if not IS_WINDOWS and (
+        identity.get('session_id') != proc.pid or identity.get('pgid') != proc.pid
+    ):
+        raise RuntimeError(f'Cannot verify isolated {name} process group (PID {proc.pid}); refusing group signals.')
+    if IS_WINDOWS and (type(identity.get('parent_pid')) is not int or identity['parent_pid'] <= 0):
+        raise RuntimeError(f'Cannot verify {name} parent process (PID {proc.pid}); refusing to manage it by PID alone.')
+    state = {
+        'schema': STATE_SCHEMA,
+        'name': name,
+        'pid': proc.pid,
+        'root': str(root.resolve()),
+        'port': port,
+        'signature': signature,
+        'start_time': identity.get('start_time'),
+        'command': identity.get('command'),
+        'session_id': identity.get('session_id'),
+        'pgid': identity.get('pgid'),
+        'parent_pid': identity.get('parent_pid'),
+    }
+    if not state['start_time'] or not state['command']:
+        raise RuntimeError(f'Cannot verify {name} process identity (PID {proc.pid}); refusing to manage it by PID alone.')
+    _save_service_state(name, state)
+    return state
+
+
+def _verify_service_state(state: dict) -> tuple[bool, dict | None, str]:
+    try:
+        state_root = Path(str(state.get('root') or '')).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False, None, 'invalid root in state'
+    if state_root != _root_dir().resolve():
+        return False, None, 'state root does not match this checkout'
+    name = state.get('name')
+    port = state.get('port')
+    if name not in SERVICE_NAMES or not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return False, None, 'invalid service name or port in state'
+    if state.get('signature') != _service_signature(name, state_root, port):
+        return False, None, 'service signature does not match this checkout and port'
+    pid = state.get('pid')
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False, None, 'invalid pid in state'
+    identity = _process_identity(pid)
+    if identity is None:
+        return False, None, 'process identity is unavailable'
+    if state.get('start_time') != identity.get('start_time'):
+        return False, identity, 'start time mismatch (PID may have been reused)'
+    signature = state.get('signature')
+    stored_fingerprint = _command_fingerprint(state.get('command'), signature)
+    current_fingerprint = _command_fingerprint(identity.get('command'), signature)
+    if stored_fingerprint is None or current_fingerprint != stored_fingerprint:
+        return False, identity, 'service command changed since startup'
+    if not IS_WINDOWS:
+        if state.get('session_id') != identity.get('session_id'):
+            return False, identity, 'session id mismatch'
+        if state.get('pgid') != identity.get('pgid'):
+            return False, identity, 'process group mismatch'
+    elif state.get('parent_pid') is not None and state.get('parent_pid') != identity.get('parent_pid'):
+        return False, identity, 'parent process mismatch'
+    command = current_fingerprint or ''
+    missing = [token for token in state.get('signature') or [] if token not in command]
+    if missing:
+        return False, identity, f'command does not match expected service (missing {missing[0]!r})'
+    return True, identity, ''
+
+
+def _inspect_services() -> list[dict]:
+    run_dir = _run_dir()
+    if not run_dir.exists():
+        return []
+    items: list[dict] = []
+    for name in SERVICE_NAMES:
+        state, error = _load_service_state(name)
+        pid_path = run_dir / f'{name}.pid'
+        if state is None:
+            if error == 'corrupt':
+                items.append({
+                    'name': name,
+                    'status': 'corrupt',
+                    'state': None,
+                    'pid': None,
+                    'identity': None,
+                    'reason': 'state file is corrupt or unreadable',
+                })
+            elif pid_path.exists():
+                pid = _read_pid(name)
+                if pid is None:
+                    items.append({
+                        'name': name,
+                        'status': 'corrupt',
+                        'state': None,
+                        'pid': None,
+                        'identity': None,
+                        'reason': 'pid file is unreadable',
+                    })
+                elif _pid_alive(pid):
+                    items.append({
+                        'name': name,
+                        'status': 'legacy',
+                        'state': None,
+                        'pid': pid,
+                        'identity': None,
+                        'reason': 'pid file has no ownership state',
+                    })
+                else:
+                    items.append({
+                        'name': name,
+                        'status': 'stale',
+                        'state': None,
+                        'pid': pid,
+                        'identity': None,
+                        'reason': 'recorded pid is not running',
+                    })
+            continue
+        ok, identity, reason = _verify_service_state(state)
+        pid = state['pid']
+        if ok:
+            items.append({
+                'name': name,
+                'status': 'verified',
+                'state': state,
+                'pid': pid,
+                'identity': identity,
+                'reason': '',
+            })
+        elif identity is None and reason == 'process identity is unavailable' and not _pid_alive(pid):
+            group_alive = _process_group_alive(state['pgid']) if not IS_WINDOWS else False
+            if group_alive is True or group_alive is None:
+                items.append({
+                    'name': name,
+                    'status': 'unverified',
+                    'state': state,
+                    'pid': pid,
+                    'identity': None,
+                    'reason': 'recorded leader exited but process group is still present or cannot be checked',
+                })
+            elif _port_is_free(state['port']):
+                items.append({
+                    'name': name,
+                    'status': 'stale',
+                    'state': state,
+                    'pid': pid,
+                    'identity': None,
+                    'reason': 'recorded process is not running and its port is free',
+                })
+            else:
+                items.append({
+                    'name': name,
+                    'status': 'unverified',
+                    'state': state,
+                    'pid': pid,
+                    'identity': None,
+                    'reason': 'recorded process exited but its port still has a listener; ownership is unknown',
+                })
+        else:
+            items.append({
+                'name': name,
+                'status': 'unverified',
+                'state': state,
+                'pid': pid,
+                'identity': identity,
+                'reason': reason,
+            })
+    return items
+
+
+def _issue_text(item: dict) -> str:
+    suffix = f' (PID {item["pid"]})' if item.get('pid') else ''
+    return f'{item["name"]}{suffix}: {item["reason"]}'
 
 
 def _pid_alive(pid: int) -> bool:
@@ -237,29 +625,171 @@ def _pid_alive(pid: int) -> bool:
         else:
             os.kill(pid, 0)
             return True
-    except (OSError, ProcessLookupError):
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def _service_is_still_same(state: dict) -> bool | None:
+    """True means same process; False means PID is gone; None means identity changed or is unknown."""
+    identity = _process_identity(state['pid'])
+    if identity is not None:
+        signature = state.get('signature') or []
+        same = (
+            identity.get('start_time') == state.get('start_time')
+            and _command_fingerprint(identity.get('command'), signature)
+            == _command_fingerprint(state.get('command'), signature)
+            and _command_fingerprint(state.get('command'), signature) is not None
+        )
+        return True if same else None
+    return None if _pid_alive(state['pid']) else False
+
+
+def _process_group_alive(pgid: int) -> bool | None:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
+def _service_stopped(state: dict) -> bool:
+    if _service_is_still_same(state) is not False:
+        return False
+    if not IS_WINDOWS and _process_group_alive(state.get('pgid')) is not False:
+        return False
+    try:
+        return _port_is_free(state['port'])
+    except OSError:
         return False
 
 
-def _kill_pid(pid: int) -> bool:
+def _port_owner_pid(port: int) -> int | None:
+    """Return the confirmed local TCP listener PID, or None when unavailable."""
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return None
     try:
         if IS_WINDOWS:
-            subprocess.run(
-                ['taskkill', '/F', '/T', '/PID', str(pid)],
-                capture_output=True,
+            import shutil
+            executable = shutil.which('powershell') or shutil.which('pwsh')
+            if not executable:
+                return None
+            script = (
+                f"$c=Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction Stop; "
+                "if ($c) { ($c | Select-Object -First 1 -ExpandProperty OwningProcess) }"
             )
+            result = run_text([executable, '-NoProfile', '-NonInteractive', '-Command', script], timeout=5)
+            if result.returncode != 0:
+                return None
+            value = (result.stdout or '').strip()
+            return int(value) if value.isdigit() else None
         else:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(10):
-                time.sleep(0.5)
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    return True
-            os.kill(pid, signal.SIGKILL)
+            import shutil
+            executable = shutil.which('lsof')
+            if not executable:
+                return None
+            result = run_text(
+                [executable, '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-t'], timeout=5
+            )
+            if result.returncode not in (0, 1):
+                return None
+            pids = [line.strip() for line in (result.stdout or '').splitlines() if line.strip().isdigit()]
+            return int(pids[0]) if len(pids) == 1 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _terminate_service(item: dict) -> bool:
+    """Signal only a service whose persisted identity still matches at each step."""
+    if item.get('status') != 'verified' or not isinstance(item.get('state'), dict):
+        _warn(f'{_issue_text(item)}; refusing to signal it. Inspect the process manually.')
+        return False
+    state = item['state']
+    pid = state['pid']
+    valid, identity, reason = _verify_service_state(state)
+    if not valid or identity is None:
+        _warn(f'{item["name"]} (PID {pid}): {reason}; refusing to signal it. Inspect the process manually.')
+        return False
+    if IS_WINDOWS:
+        try:
+            result = run_text(['taskkill', '/F', '/T', '/PID', str(pid)], timeout=10)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _warn(f'Could not verify/stop {item["name"]} (PID {pid}) on Windows: {exc}; state kept.')
+            return False
+        if result.returncode != 0:
+            _warn(f'Windows taskkill could not stop {item["name"]} (PID {pid}); state kept. Inspect it manually.')
+            return False
         return True
-    except (OSError, ProcessLookupError):
-        return True
+
+    session_id, pgid = state.get('session_id'), state.get('pgid')
+    if session_id != pid or pgid != pid or identity.get('session_id') != pid or identity.get('pgid') != pid:
+        _warn(f'{item["name"]} (PID {pid}): process group is not an isolated AMC session; refusing to signal it.')
+        return False
+    group_alive = _process_group_alive(pgid)
+    if group_alive is False:
+        return _service_stopped(state)
+    if group_alive is None:
+        _warn(f'Could not verify {item["name"]} process group (PID {pid}); state kept.')
+        return False
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return _service_stopped(state)
+    except OSError as exc:
+        _warn(f'Could not stop {item["name"]} (PID {pid}): {exc}')
+        return False
+
+    for _ in range(10):
+        time.sleep(0.5)
+        group_alive = _process_group_alive(pgid)
+        if group_alive is False:
+            if _port_is_free(state['port']):
+                return True
+            continue
+        if group_alive is None:
+            _warn(f'Could not verify {item["name"]} process group after SIGTERM; state kept.')
+            return False
+        still_same = _service_is_still_same(state)
+        if still_same is False:
+            if group_alive is True:
+                continue
+            if not _port_is_free(state['port']):
+                continue
+            return True
+        if still_same is None:
+            # A TERM-exited child can briefly be a zombie until its parent
+            # reaps it. Wait without sending another signal; escalation below
+            # still requires a fresh, complete identity match.
+            continue
+
+    # Re-read the complete fingerprint immediately before the destructive signal.
+    valid, current, reason = _verify_service_state(state)
+    if not valid or current is None:
+        _warn(f'{item["name"]} (PID {pid}): identity no longer verified ({reason}); refusing SIGKILL.')
+        return False
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return _service_stopped(state)
+    except OSError as exc:
+        _warn(f'Could not force-stop {item["name"]} (PID {pid}): {exc}')
+        return False
+    for _ in range(10):
+        time.sleep(0.5)
+        group_alive = _process_group_alive(pgid)
+        if group_alive is False and _port_is_free(state['port']):
+            return True
+        if group_alive is None:
+            break
+    _warn(f'{item["name"]} process group remains or cannot be checked after SIGKILL; state kept.')
+    return False
 
 
 def _health_ok(port: int) -> bool:
@@ -277,15 +807,32 @@ def _ensure_venv() -> None:
     root = _root_dir()
     venv_dir = root / '.venv'
     if venv_dir.exists():
+        if not _venv_bin('uvicorn').exists():
+            _fail(
+                f'Existing virtual environment is incomplete (uvicorn missing): {venv_dir}. '
+                'Remove it and re-run amc start, or install the project into it with pip install -e .'
+            )
         _ok('Using existing virtual environment')
         return
 
     _info('First run — setting up virtual environment...')
     python = sys.executable
-    subprocess.run([python, '-m', 'venv', str(venv_dir)], check=True)
-    vpy = str(_venv_python())
-    subprocess.run([vpy, '-m', 'pip', 'install', '--quiet', '--upgrade', 'pip'], check=True)
-    subprocess.run([vpy, '-m', 'pip', 'install', '--quiet', '-e', str(root)], check=True)
+    try:
+        subprocess.run([python, '-m', 'venv', str(venv_dir)], check=True)
+        vpy = str(_venv_python())
+        subprocess.run([vpy, '-m', 'pip', 'install', '--quiet', '--upgrade', 'pip'], check=True)
+        subprocess.run([vpy, '-m', 'pip', 'install', '--quiet', '-e', str(root)], check=True)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        import shutil
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        _fail(
+            f'Failed to install Python dependencies in {venv_dir}: {exc}. '
+            'Check network/PyPI access, then re-run amc start.'
+        )
+    if not _venv_bin('uvicorn').exists():
+        import shutil
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        _fail(f'Python environment is incomplete after installation (uvicorn missing): {venv_dir}')
     _ok('Python environment ready')
 
 
@@ -298,11 +845,19 @@ def _ensure_frontend_deps() -> None:
     if not npm_bin:
         return
     _info('Installing frontend dependencies...')
-    subprocess.run(
-        [npm_bin, 'install', '--silent'],
-        cwd=str(root / 'frontend'),
-        check=True,
-    )
+    try:
+        subprocess.run(
+            [npm_bin, 'install', '--silent'],
+            cwd=str(root / 'frontend'),
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        import shutil
+        shutil.rmtree(node_modules, ignore_errors=True)
+        _fail(
+            f'Failed to install frontend dependencies in {root / "frontend"}: {exc}. '
+            'Check npm/network access, or run amc start --no-ui.'
+        )
     _ok('Frontend dependencies ready')
 
 
@@ -328,6 +883,21 @@ def _resolve_npm() -> str | None:
 
 def cmd_start(args: argparse.Namespace) -> None:
     root = _root_dir()
+    existing = _inspect_services()
+    blockers = [item for item in existing if item['status'] in {'verified', 'unverified', 'legacy', 'corrupt'}]
+    if blockers:
+        details = '; '.join(_issue_text(item) for item in blockers)
+        _fail(f'Cannot safely start Mission Control: {details}. Run `amc status` and inspect the process/state manually.')
+    ports_path = _run_dir() / 'ports.json'
+    stale = [item for item in existing if item['status'] == 'stale']
+    if ports_path.exists() and stale and not _ports_file_matches_services(existing):
+        _fail(f'Found {ports_path} that does not match the recorded stale services. It was preserved; inspect it manually before starting.')
+    if ports_path.exists() and not stale:
+        _fail(f'Found pre-existing {ports_path} with no registered service. It was preserved; inspect/remove it manually before starting.')
+    for item in stale:
+        _remove_service_artifacts(item['name'])
+    if stale and _ports_file_matches_services(existing):
+        _remove_ports_file()
 
     # prerequisites
     _info('Checking prerequisites...')
@@ -337,12 +907,16 @@ def cmd_start(args: argparse.Namespace) -> None:
         _fail(f'Python 3.11+ required, found {python_ver}')
     _ok(f'Python: {python_ver}')
 
-    has_node = bool(_which('node'))
+    node_bin = _which('node')
+    has_node = bool(node_bin)
     if has_node:
-        node_ver = (run_text(['node', '--version']).stdout or '').strip()
+        node_ver = (run_text([node_bin, '--version']).stdout or '').strip()
         _ok(f'Node.js: {node_ver}')
     else:
         _warn('Node.js not found. Frontend will not be started.')
+    has_npm = bool(_resolve_npm()) if has_node else False
+    if has_node and not has_npm:
+        _warn('npm not found. Frontend will not be started.')
 
     detected_backends = _detect_backends()
     if detected_backends:
@@ -356,7 +930,7 @@ def cmd_start(args: argparse.Namespace) -> None:
 
     # bootstrap
     _ensure_venv()
-    skip_ui = args.no_ui or not has_node
+    skip_ui = args.no_ui or not has_node or not has_npm
     if not skip_ui:
         _ensure_frontend_deps()
 
@@ -371,74 +945,106 @@ def cmd_start(args: argparse.Namespace) -> None:
         if frontend_port != args.ui_port:
             _info(f'Port {args.ui_port} in use, using {frontend_port} for frontend')
 
-    # start backend
-    _info(f'Starting backend on port {backend_port}...')
-    uvicorn_bin = str(_venv_bin('uvicorn'))
-    backend_log = _run_dir() / 'backend.log'
-    _run_dir().mkdir(parents=True, exist_ok=True)
-
-    backend_cmd = [
-        uvicorn_bin, 'app.api.app:app',
-        '--app-dir', str(root / 'backend'),
-        '--host', '127.0.0.1',
-        '--port', str(backend_port),
-    ]
-    # --reload spawns a separate reloader+worker pair, which makes process
-    # cleanup unreliable (especially on Windows). Allow opt-in for dev only.
-    if os.environ.get('AMC_DEV_RELOAD'):
-        backend_cmd.append('--reload')
-    with open(backend_log, 'w', encoding='utf-8', errors='replace', newline='') as log:
-        backend_proc = subprocess.Popen(
-            backend_cmd,
-            stdout=log, stderr=log,
-            start_new_session=not IS_WINDOWS,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0,
-        )
-    _save_pid('backend', backend_proc.pid)
-
-    # start frontend
+    started: list[dict] = []
     frontend_proc = None
-    if not skip_ui and frontend_port is not None:
-        _info(f'Starting frontend on port {frontend_port}...')
-        frontend_log = _run_dir() / 'frontend.log'
-        env = os.environ.copy()
-        env['VITE_API_TARGET'] = f'http://127.0.0.1:{backend_port}'
-        npm_bin = _resolve_npm()
-        if not npm_bin:
-            _fail('npm not found in PATH')
-        frontend_cmd = [
-            npm_bin, 'run', 'dev', '--',
+    try:
+        # start backend
+        _info(f'Starting backend on port {backend_port}...')
+        uvicorn_bin = str(_venv_bin('uvicorn'))
+        backend_log = _run_dir() / 'backend.log'
+        _run_dir().mkdir(parents=True, exist_ok=True)
+
+        backend_cmd = [
+            uvicorn_bin, 'app.api.app:app',
+            '--app-dir', str(root / 'backend'),
             '--host', '127.0.0.1',
-            '--port', str(frontend_port),
+            '--port', str(backend_port),
         ]
-        with open(frontend_log, 'w', encoding='utf-8', errors='replace', newline='') as log:
-            frontend_proc = subprocess.Popen(
-                frontend_cmd,
-                cwd=str(root / 'frontend'),
-                stdout=log, stderr=log,
-                env=env,
-                start_new_session=not IS_WINDOWS,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0,
-            )
-        _save_pid('frontend', frontend_proc.pid)
+        # --reload spawns a separate reloader+worker pair, which makes process
+        # cleanup unreliable (especially on Windows). Allow opt-in for dev only.
+        if os.environ.get('AMC_DEV_RELOAD'):
+            backend_cmd.append('--reload')
+        try:
+            with open(backend_log, 'a', encoding='utf-8', errors='replace', newline='') as log:
+                backend_proc = subprocess.Popen(
+                    backend_cmd,
+                    stdout=log, stderr=log,
+                    start_new_session=not IS_WINDOWS,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0,
+                )
+        except OSError as exc:
+            _fail(f'Failed to start backend: {exc}. Check {backend_log}.')
+        backend_started = {'name': 'backend', 'pid': backend_proc.pid, 'proc': backend_proc, 'state': None}
+        started.append(backend_started)
+        try:
+            backend_started['state'] = _register_process('backend', backend_proc, 'backend', root, backend_port)
+        except RuntimeError as exc:
+            _fail(f'{exc} Check {backend_log}; if it remains active, inspect PID {backend_proc.pid} manually.')
 
-    # health check
-    _info('Waiting for backend to be ready...')
-    ready = False
-    for _ in range(HEALTH_TIMEOUT):
-        if _health_ok(backend_port):
-            ready = True
-            break
-        if not _pid_alive(backend_proc.pid):
-            _fail(f'Backend exited unexpectedly. Check {backend_log}')
-        time.sleep(1)
+        # start frontend
+        if not skip_ui and frontend_port is not None:
+            _info(f'Starting frontend on port {frontend_port}...')
+            frontend_log = _run_dir() / 'frontend.log'
+            env = os.environ.copy()
+            env['VITE_API_TARGET'] = f'http://127.0.0.1:{backend_port}'
+            vite_entry = root / 'frontend' / 'node_modules' / 'vite' / 'bin' / 'vite.js'
+            if not vite_entry.is_file():
+                _fail(f'Vite entry point is missing: {vite_entry}. Run npm install in frontend/.')
+            frontend_cmd = [node_bin, str(vite_entry), '--host', '127.0.0.1', '--port', str(frontend_port)]
+            try:
+                with open(frontend_log, 'a', encoding='utf-8', errors='replace', newline='') as log:
+                    frontend_proc = subprocess.Popen(
+                        frontend_cmd,
+                        cwd=str(root / 'frontend'),
+                        stdout=log, stderr=log,
+                        env=env,
+                        start_new_session=not IS_WINDOWS,
+                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0,
+                    )
+            except OSError as exc:
+                _fail(f'Failed to start frontend: {exc}. Check {frontend_log}.')
+            frontend_started = {'name': 'frontend', 'pid': frontend_proc.pid, 'proc': frontend_proc, 'state': None}
+            started.append(frontend_started)
+            try:
+                frontend_started['state'] = _register_process('frontend', frontend_proc, 'frontend', root, frontend_port)
+            except RuntimeError as exc:
+                _fail(f'{exc} Check {frontend_log}; if it remains active, inspect PID {frontend_proc.pid} manually.')
 
-    if not ready:
-        _fail(f'Backend did not become healthy within {HEALTH_TIMEOUT}s. Check {backend_log}')
+        # health check
+        _info('Waiting for backend to be ready...')
+        ready = False
+        for _ in range(HEALTH_TIMEOUT):
+            if _health_ok(backend_port):
+                ready = True
+                break
+            if backend_proc.poll() is not None:
+                _fail(f'Backend exited with code {backend_proc.returncode}. Check {backend_log}')
+            time.sleep(1)
 
-    # save port info
-    ports_info = {'backend': backend_port, 'frontend': frontend_port}
-    (_run_dir() / 'ports.json').write_text(json.dumps(ports_info))
+        if not ready:
+            _fail(f'Backend did not become healthy within {HEALTH_TIMEOUT}s. Check {backend_log}')
+
+        # save port info
+        ports_info = {'backend': backend_port, 'frontend': frontend_port}
+        _atomic_write_json(ports_path, ports_info)
+    except BaseException:
+        for item in reversed(started):
+            state = item.get('state')
+            if isinstance(state, dict):
+                _terminate_service({**item, 'status': 'verified', 'identity': None, 'reason': ''})
+                if _service_stopped(state):
+                    _remove_service_artifacts(item['name'])
+            else:
+                # This Popen is the immediate child created in this start call;
+                # use its handle only for this one cleanup, never as stored ownership.
+                proc = item['proc']
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        _warn(f'Could not terminate unverified child PID {item["pid"]}; inspect it manually.')
+        raise
 
     # summary
     print()
@@ -463,28 +1069,61 @@ def cmd_start(args: argparse.Namespace) -> None:
             pass
 
     # foreground wait with Ctrl+C
-    pids = [backend_proc.pid]
+    procs = [backend_proc]
     if frontend_proc:
-        pids.append(frontend_proc.pid)
+        procs.append(frontend_proc)
 
     def _shutdown(signum=None, frame=None):
         print()
         _info('Shutting down...')
-        _graceful_shutdown_backend()
-        time.sleep(1)
-        for pid in pids:
-            _kill_pid(pid)
-        import shutil
-        shutil.rmtree(str(_run_dir()), ignore_errors=True)
-        _ok('All services stopped.')
-        sys.exit(0)
+        items = _inspect_services()
+        backend_item = next((item for item in items if item['name'] == 'backend'), None)
+        if backend_item and backend_item['status'] == 'verified':
+            if _graceful_shutdown_backend(backend_item):
+                time.sleep(1)
+        proc_by_pid = {proc.pid: proc for proc in procs}
+        stopped = 0
+        uncertain = False
+        for item in reversed(items):
+            if item['status'] == 'stale':
+                _remove_service_artifacts(item['name'])
+                stopped += 1
+                continue
+            if item['status'] != 'verified':
+                _warn(f'{_issue_text(item)}; state kept. Inspect it manually.')
+                uncertain = True
+                continue
+            proc = proc_by_pid.get(item['pid'])
+            if proc is not None:
+                proc.poll()  # Reap our direct child before checking its PID again.
+            same = _service_is_still_same(item['state'])
+            if same is True:
+                _terminate_service(item)
+                if proc is not None:
+                    proc.poll()
+                same = _service_is_still_same(item['state'])
+            if _service_stopped(item['state']):
+                _remove_service_artifacts(item['name'])
+                stopped += 1
+            else:
+                _warn(f'{item["name"]} (PID {item["pid"]}) could not be confirmed stopped; state kept.')
+                uncertain = True
+        if not uncertain and stopped and _ports_file_matches_services(items):
+            _remove_ports_file()
+        if uncertain:
+            _warn('Some service state was preserved for manual inspection.')
+        elif stopped:
+            _ok('All services stopped.')
+        else:
+            _info('No verified services needed stopping.')
+        sys.exit(1 if uncertain else 0)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
     try:
         while True:
-            all_dead = all(not _pid_alive(p) for p in pids)
+            all_dead = _all_processes_exited(procs)
             if all_dead:
                 _info('All processes have exited.')
                 break
@@ -493,15 +1132,28 @@ def cmd_start(args: argparse.Namespace) -> None:
         _shutdown()
 
 
-def _graceful_shutdown_backend() -> bool:
-    """Ask backend to gracefully abort active tasks and shut down. Returns True on success."""
+def _all_processes_exited(procs: list[subprocess.Popen]) -> bool:
+    return all(code is not None for code in [proc.poll() for proc in procs])
+
+
+def _graceful_shutdown_backend(item: dict | None = None) -> bool:
+    """Ask only the verified AMC backend listener to shut down."""
+    if item is None or item.get('status') != 'verified' or not isinstance(item.get('state'), dict):
+        return False
+    state = item['state']
+    valid, _identity, _reason = _verify_service_state(state)
+    if not valid:
+        return False
+    backend_port = state.get('port')
+    if _port_owner_pid(backend_port) != state.get('pid'):
+        _warn(f'Cannot confirm backend port {backend_port} belongs to PID {state.get("pid")}; skipping HTTP shutdown.')
+        return False
     ports_file = _run_dir() / 'ports.json'
     if not ports_file.exists():
         return False
     try:
         ports = json.loads(ports_file.read_text())
-        backend_port = ports.get('backend')
-        if not backend_port:
+        if ports.get('backend') != backend_port:
             return False
         import urllib.request
         req = urllib.request.Request(
@@ -527,37 +1179,68 @@ def cmd_stop(_args: argparse.Namespace) -> None:
         _ok('No services running.')
         return
 
-    # Try graceful shutdown first (aborts active reviews)
-    backend_pid = _read_pid('backend')
-    if backend_pid and _pid_alive(backend_pid):
+    items = _inspect_services()
+    by_name = {item['name']: item for item in items}
+    backend = by_name.get('backend')
+    stopped_gracefully = False
+    if backend and backend['status'] == 'verified':
         _info('Requesting graceful shutdown...')
-        if _graceful_shutdown_backend():
-            # Wait a bit for backend to finish aborting tasks
+        stopped_gracefully = _graceful_shutdown_backend(backend)
+        if stopped_gracefully:
             for _ in range(8):
-                if not _pid_alive(backend_pid):
+                if _service_stopped(backend['state']):
                     break
                 time.sleep(0.5)
 
     stopped = 0
-    for pidfile in sorted(run_dir.glob('*.pid')):
-        name = pidfile.stem
-        pid = _read_pid(name)
-        if pid is None:
-            continue
-        if _pid_alive(pid):
-            _kill_pid(pid)
-            _info(f'Stopped {name} (PID {pid})')
+    uncertain = False
+    for item in items:
+        name, pid, status = item['name'], item.get('pid'), item['status']
+        if status == 'stale':
+            _remove_service_artifacts(name)
+            _info(f'{name} recorded process has exited; removed stale state')
             stopped += 1
+            continue
+        if status != 'verified':
+            _warn(f'{_issue_text(item)}; state kept. Inspect it manually before removing files.')
+            uncertain = True
+            continue
+        still_same = _service_is_still_same(item['state'])
+        if _service_stopped(item['state']):
+            if name == 'backend' and stopped_gracefully:
+                _info(f'{name} (PID {pid}) exited after graceful shutdown')
+            else:
+                _info(f'{name} (PID {pid}) was already stopped')
+            _remove_service_artifacts(name)
+            stopped += 1
+            continue
+        if _terminate_service(item):
+            for _ in range(8):
+                still_same = _service_is_still_same(item['state'])
+                if _service_stopped(item['state']):
+                    break
+                if still_same is None:
+                    break
+                time.sleep(0.25)
+            if _service_stopped(item['state']):
+                _info(f'Stopped {name} (PID {pid})')
+                _remove_service_artifacts(name)
+                stopped += 1
+            else:
+                _warn(f'{name} (PID {pid}) is still present; state kept for a safe retry.')
+                uncertain = True
         else:
-            _info(f'{name} (PID {pid}) was already stopped')
+            uncertain = True
 
-    import shutil
-    shutil.rmtree(str(run_dir), ignore_errors=True)
-
+    if not uncertain and stopped and _ports_file_matches_services(items):
+        _remove_ports_file()
+    if uncertain:
+        _warn('Some service state was preserved for manual inspection.')
+        raise SystemExit(1)
     if stopped > 0:
         _ok('All services stopped.')
     else:
-        _ok('No running services found.')
+        _warn('No services were stopped; any unverified state was preserved for manual inspection.')
 
 
 def cmd_status(_args: argparse.Namespace) -> None:
@@ -567,36 +1250,37 @@ def cmd_status(_args: argparse.Namespace) -> None:
         return
 
     print()
-    for pidfile in sorted(run_dir.glob('*.pid')):
-        name = pidfile.stem
-        pid = _read_pid(name)
-        if pid is None:
-            continue
-        if _pid_alive(pid):
-            _ok(f'{name} is running (PID {pid})')
+    items = _inspect_services()
+    by_name = {item['name']: item for item in items}
+    for name in SERVICE_NAMES:
+        item = by_name.get(name)
+        if item is None:
+            _info(f'{name}: no registered service')
+        elif item['status'] == 'verified':
+            _ok(f'{name} is running and identity verified (PID {item["pid"]})')
+        elif item['status'] == 'stale':
+            _warn(f'{name} is NOT running (PID {item["pid"]} exited)')
         else:
-            _warn(f'{name} is NOT running (PID {pid} exited)')
+            _warn(f'{_issue_text(item)}; process status is unverified')
 
-    # check endpoints
-    ports_file = run_dir / 'ports.json'
-    if ports_file.exists():
-        try:
-            ports = json.loads(ports_file.read_text())
-        except Exception:
-            ports = {}
-        print()
-        backend_port = ports.get('backend')
-        if backend_port and _health_ok(backend_port):
-            _ok(f'Backend responding at http://127.0.0.1:{backend_port}')
-        elif backend_port:
-            _warn(f'Backend not responding at http://127.0.0.1:{backend_port}')
-
-        frontend_port = ports.get('frontend')
-        if frontend_port:
-            if _port_is_free(frontend_port):
-                _warn(f'Frontend not responding at http://127.0.0.1:{frontend_port}')
-            else:
-                _ok(f'Frontend responding at http://127.0.0.1:{frontend_port}')
+    ports = _read_json_file(run_dir / 'ports.json') or {}
+    for name, service in (('backend', 'backend'), ('frontend', 'frontend')):
+        port = ports.get(name)
+        item = by_name.get(service)
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            continue
+        if not item or item['status'] != 'verified' or item['state'].get('port') != port:
+            _warn(f'{name} port {port} is not linked to a verified AMC process')
+            continue
+        owner = _port_owner_pid(port)
+        if owner != item['pid']:
+            _warn(f'{name} port {port} listener ownership could not be confirmed')
+        elif name == 'backend' and _health_ok(port):
+            _ok(f'Backend responding at http://127.0.0.1:{port}')
+        elif name == 'frontend':
+            _ok(f'Frontend listener belongs to AMC at http://127.0.0.1:{port}')
+        else:
+            _warn(f'Backend not responding at http://127.0.0.1:{port}')
     print()
 
 
