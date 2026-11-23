@@ -391,6 +391,8 @@ code, .mono { font-family: var(--font-mono); }
   transition: background 0.14s ease, color 0.14s ease;
 }
 .icon-btn:hover { background: var(--surface-hover); color: var(--text); }
+/* Language switch: the icon-button footprint, with a short text label. */
+.icon-btn.lang-btn { font-size: 13px; font-weight: 500; }
 
 /* ── Main column ────────────────────────────────────────── */
 
@@ -1021,6 +1023,7 @@ code, .mono { font-family: var(--font-mono); }
 
 .sidebar-toggle { display: none; }
 .scrim { display: none; }
+.new-review-btn svg { display: none; }
 
 @media (max-width: 900px) {
   :root { --sidebar-w: 280px; }
@@ -1054,12 +1057,22 @@ code, .mono { font-family: var(--font-mono); }
   .main-inner { padding-top: 20px; gap: 16px; }
   .detail-title { font-size: 23px; }
   .brand-sub { display: none; }
+  /* If the top bar still runs out of room, the brand truncates instead of
+     running under the buttons. */
+  .brand-mark { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .sidebar-toggle { flex-shrink: 0; }
   .meta-val { max-width: 26ch; }
   .verdict { padding: 17px 18px; }
 }
 
 @media (max-width: 560px) {
-  .topbar { padding: 0 14px; gap: 8px; }
+  .topbar { padding: 0 12px; gap: 6px; }
+  /* Four square controls next to the brand fit from 360px up. */
+  .brand-mark { font-size: 18px; }
+  .topbar-actions { gap: 4px; }
+  .new-review-btn { width: 34px; height: 34px; padding: 0; }
+  .new-review-btn svg { display: block; }
+  .new-review-label { display: none; }
   .detail-bar .btn { flex: 1 1 auto; }
   .kv-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
   .artifact { flex-direction: column; align-items: flex-start; gap: 3px; }

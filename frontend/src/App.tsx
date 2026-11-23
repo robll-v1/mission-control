@@ -1,6 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Settings } from './Settings'
 import { StartTracker } from './startTracker'
+import {
+  DEFAULT_REVIEW_LANGUAGE,
+  errorMessage,
+  labelFor,
+  messages,
+  otherLanguage,
+  readStoredLanguage,
+  storeLanguage,
+  type Language,
+  type Localized,
+  type Messages,
+} from './i18n'
 
 type TaskStatus =
   | 'created'
@@ -111,7 +123,10 @@ type TaskDetail = {
 }
 
 type DetailTab = 'results' | 'timeline' | 'rounds' | 'artifacts'
-type Notice = { tone: 'error' | 'info'; text: string }
+// Resolved when rendered, so a notice on screen follows a language switch.
+// It stays inside an object: React calls a bare function passed to a state
+// setter as an updater.
+type Notice = { tone: 'error' | 'info'; text: Localized }
 type Theme = 'light' | 'dark'
 
 const EVENT_LIMIT = 40
@@ -157,15 +172,15 @@ const normalizeTaskDetail = (payload: TaskDetailResponse): TaskDetail => {
 
 const timeText = (ts?: number | null) => (ts ? new Date(ts * 1000).toLocaleString() : '—')
 
-const relativeTimeText = (ts?: number) => {
+const relativeTimeText = (t: Messages, ts?: number) => {
   if (!ts) return '—'
   const diffSec = Math.max(0, Math.floor(Date.now() / 1000 - ts))
-  if (diffSec < 60) return `${diffSec} 秒前`
+  if (diffSec < 60) return t.time.secondsAgo(diffSec)
   const diffMin = Math.floor(diffSec / 60)
-  if (diffMin < 60) return `${diffMin} 分钟前`
+  if (diffMin < 60) return t.time.minutesAgo(diffMin)
   const diffHour = Math.floor(diffMin / 60)
-  if (diffHour < 24) return `${diffHour} 小时前`
-  return `${Math.floor(diffHour / 24)} 天前`
+  if (diffHour < 24) return t.time.hoursAgo(diffHour)
+  return t.time.daysAgo(Math.floor(diffHour / 24))
 }
 
 const durationText = (start?: number, end?: number | null) => {
@@ -220,112 +235,22 @@ const verdictTone = (verdict?: ReviewVerdict | null) => {
   }
 }
 
-const statusLabel = (status: TaskStatus) => {
-  switch (status) {
-    case 'created':
-      return '已创建'
-    case 'context_ready':
-      return '待审查'
-    case 'ingesting':
-      return '准备中'
-    case 'running':
-      return '审查中'
-    case 'waiting_human':
-      return '待处理'
-    case 'validating':
-      return '验证中'
-    case 'completed':
-      return '已完成'
-    case 'failed':
-      return '失败'
-    case 'aborted':
-      return '已中止'
-    default:
-      return status
-  }
-}
+// Status and stage names come from the backend, which can add new ones;
+// an unknown name is shown as is.
+const statusLabel = (t: Messages, status: TaskStatus) => labelFor(t.status, status)
 
-const stageLabel = (stage: string) => {
-  switch (stage) {
-    case 'created':
-      return '已创建'
-    case 'review_ready':
-      return '待审查'
-    case 'preflight':
-      return '检查审查后端'
-    case 'preflight_failed':
-      return '后端检查失败'
-    case 'prepare_review':
-      return '准备上下文'
-    case 'review_prepare_failed':
-      return '准备失败'
-    case 'review_in_progress':
-      return '审查进行中'
-    case 'awaiting_next_round':
-      return '等待下一轮'
-    case 'review_failed':
-      return '审查失败'
-    case 'review_done':
-      return '审查完成'
-    case 'interrupted':
-      return '被中断'
-    case 'aborted':
-      return '已中止'
-    case 'validate':
-      return '验证中'
-    case 'handoff':
-      return '待交接'
-    default:
-      return stage
-  }
-}
+const stageLabel = (t: Messages, stage: string) => labelFor(t.stage, stage)
 
-const verdictLabel = (verdict?: ReviewVerdict | null) => {
-  switch (verdict) {
-    case 'clear':
-      return '未发现明显问题'
-    case 'concerns':
-      return '需要关注'
-    case 'failed':
-      return '审查失败'
-    case 'inconclusive':
-      return '结论不明确'
-    default:
-      return '暂无结果'
-  }
-}
+const verdictLabel = (t: Messages, verdict?: ReviewVerdict | null) =>
+  verdict && Object.prototype.hasOwnProperty.call(t.verdict, verdict) ? t.verdict[verdict] : t.result.none
 
-const severityLabel = (severity: string) => {
-  switch (severity) {
-    case 'critical':
-      return '严重'
-    case 'high':
-      return '高'
-    case 'medium':
-      return '中'
-    case 'low':
-      return '低'
-    default:
-      return severity
-  }
-}
+const severityLabel = (t: Messages, severity: string) => labelFor(t.severity, severity)
 
-const tabLabel = (tab: DetailTab) => {
-  switch (tab) {
-    case 'results':
-      return '审查结果'
-    case 'timeline':
-      return '事件流'
-    case 'rounds':
-      return '审查轮次'
-    default:
-      return '产物'
-  }
-}
+const tabLabel = (t: Messages, tab: DetailTab) => t.tabs[tab]
 
-const prShortLabel = (task: Task) => {
+const prShortLabel = (t: Messages, task: Task) => {
   if (task.source_type === 'local_diff') {
-    return `本地变更 · ${task.pr_base_ref || '自动基准'}`
+    return t.source.localChanges(task.pr_base_ref || null)
   }
   if (task.pr_owner && task.pr_repo && task.pr_number) {
     return `${task.pr_owner}/${task.pr_repo} #${task.pr_number}`
@@ -364,9 +289,16 @@ const MenuIcon = () => (
   </svg>
 )
 
+const PlusIcon = () => (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+    strokeLinecap="round" aria-hidden="true">
+    <path d="M12 5v14M5 12h14" />
+  </svg>
+)
+
 /* ── Event row ──────────────────────────────────────────── */
 
-function EventRow({ event }: { event: EventRecord }) {
+function EventRow({ event, t }: { event: EventRecord; t: Messages }) {
   const fullText = stringifyPayload(event.payload)
   const shortText = previewText(fullText)
   const truncated = shortText !== fullText
@@ -381,7 +313,7 @@ function EventRow({ event }: { event: EventRecord }) {
       {shortText && <div className="event-text">{shortText}</div>}
       {truncated && (
         <details>
-          <summary>查看完整输出</summary>
+          <summary>{t.timeline.fullOutput}</summary>
           <pre>{fullText}</pre>
         </details>
       )}
@@ -418,11 +350,26 @@ export function App() {
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
   })
   const eventSourceRef = useRef<EventSource | null>(null)
+  // English unless the user picked another language before.
+  const [language, setLanguage] = useState<Language>(() => readStoredLanguage())
+  const t = messages[language]
+  const languageOffer = otherLanguage(language)
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
     window.localStorage.setItem(THEME_KEY, theme)
   }, [theme])
+
+  // Screen readers and CJK font fallback both read the page's lang.
+  useEffect(() => {
+    document.documentElement.lang = language
+  }, [language])
+
+  // Only an explicit choice is stored, so the default can still change later.
+  const chooseLanguage = (next: Language) => {
+    setLanguage(next)
+    storeLanguage(next)
+  }
 
   const selectedTask = useMemo(
     () => tasks.find((task) => task.id === selectedTaskId) ?? detail?.task ?? null,
@@ -450,7 +397,7 @@ export function App() {
       setTasks(data.sort((a, b) => b.updated_at - a.updated_at))
     } catch (err) {
       if (!options?.silent) {
-        setNotice({ tone: 'error', text: err instanceof Error ? err.message : '任务列表加载失败' })
+        setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.loadReviews) })
       }
     }
   }, [])
@@ -461,7 +408,7 @@ export function App() {
       setDetail(data)
     } catch (err) {
       if (!options?.silent) {
-        setNotice({ tone: 'error', text: err instanceof Error ? err.message : '任务详情加载失败' })
+        setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.loadReview) })
       }
     }
   }, [])
@@ -506,7 +453,7 @@ export function App() {
     if (!repoPath.trim() || (reviewSource === 'pull_request' && !prUrl.trim())) {
       setNotice({
         tone: 'error',
-        text: reviewSource === 'pull_request' ? '请填写仓库路径和 GitHub PR 链接。' : '请填写仓库路径。',
+        text: reviewSource === 'pull_request' ? (t) => t.errors.missingRepoAndPr : (t) => t.errors.missingRepo,
       })
       return
     }
@@ -532,7 +479,7 @@ export function App() {
       await refreshTasks()
       setSelectedTaskId(task.id)
     } catch (err) {
-      setNotice({ tone: 'error', text: err instanceof Error ? err.message : '创建审查任务失败' })
+      setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.createReview) })
     } finally {
       setIsCreating(false)
     }
@@ -543,7 +490,13 @@ export function App() {
     const request = tracker.begin(taskId)
     setStartingTaskIds(tracker.pendingTaskIds())
     try {
-      await api(`/api/tasks/${taskId}/start`, { method: 'POST', body: JSON.stringify({}) })
+      // The review output language is its own setting, not the interface
+      // language. The current backend ignores the field (pydantic drops
+      // unknown keys) and keeps its own default until it reads it.
+      await api(`/api/tasks/${taskId}/start`, {
+        method: 'POST',
+        body: JSON.stringify({ language: DEFAULT_REVIEW_LANGUAGE }),
+      })
       setNotice(null)
       await loadTask(taskId)
       await refreshTasks()
@@ -551,7 +504,7 @@ export function App() {
       // Decided per request: waits for any abort of this start to answer,
       // so it holds whichever response arrives first.
       if (!(await tracker.wasAborted(request))) {
-        setNotice({ tone: 'error', text: err instanceof Error ? err.message : '启动审查失败' })
+        setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.startRound) })
       }
       // Failed or aborted, the task has moved on; show where it ended up.
       void loadTask(taskId, { silent: true })
@@ -575,16 +528,16 @@ export function App() {
       await refreshTasks()
     } catch (err) {
       settle(false)
-      setNotice({ tone: 'error', text: err instanceof Error ? err.message : '中止审查失败' })
+      setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.cancelRound) })
     }
   }
 
   const exportSummary = async (taskId: string) => {
     try {
       const result = await api<{ path: string }>(`/api/tasks/${taskId}/export-summary`, { method: 'POST' })
-      setNotice({ tone: 'info', text: `摘要已导出到 ${result.path}` })
+      setNotice({ tone: 'info', text: (t) => t.notices.exported(result.path) })
     } catch (err) {
-      setNotice({ tone: 'error', text: err instanceof Error ? err.message : '导出摘要失败' })
+      setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.exportSummary) })
     }
   }
 
@@ -602,7 +555,7 @@ export function App() {
 
   const roundActive = isRoundActive(selectedTask?.status)
   const isStarting = selectedTask !== null && startingTaskIds.includes(selectedTask.id)
-  const startLabel = latestRound ? '发起下一轮审查' : '开始首轮审查'
+  const startLabel = latestRound ? t.detail.runNextRound : t.detail.runFirstRound
 
   return (
     <div className="layout">
@@ -610,56 +563,69 @@ export function App() {
         <button
           className={`icon-btn sidebar-toggle ${showSettings ? 'is-hidden' : ''}`}
           onClick={() => setNavOpen((v) => !v)}
-          aria-label="切换任务列表"
+          aria-label={t.topbar.toggleReviewList}
           aria-expanded={navOpen}
         >
           <MenuIcon />
         </button>
         <div className="brand">
           <span className="brand-mark">Mission Control</span>
-          <span className="brand-sub">AI 代码审查控制台</span>
+          <span className="brand-sub">{t.topbar.tagline}</span>
         </div>
         <div className="topbar-actions">
           <button
             className={`icon-btn ${showSettings ? 'is-active' : ''}`}
             onClick={() => setShowSettings((v) => !v)}
-            aria-label="模型选择"
+            aria-label={t.topbar.modelSelection}
             aria-pressed={showSettings}
-            title="模型选择"
+            title={t.topbar.modelSelection}
           >
             <SlidersIcon />
+          </button>
+          {/* Shows the language it switches to, in that language, so a reader
+              of either one can find it. */}
+          <button
+            className="icon-btn lang-btn"
+            onClick={() => chooseLanguage(languageOffer.code)}
+            lang={languageOffer.code}
+            title={messages[languageOffer.code].topbar.switchToThisLanguage}
+          >
+            {languageOffer.label}
           </button>
           <button
             className="icon-btn"
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-            aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
-            title={theme === 'dark' ? '浅色主题' : '深色主题'}
+            aria-label={theme === 'dark' ? t.topbar.switchToLight : t.topbar.switchToDark}
+            title={theme === 'dark' ? t.topbar.lightTheme : t.topbar.darkTheme}
           >
             {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
           </button>
+          {/* Collapses to the plus icon on narrow screens; aria-label keeps its name. */}
           <button
-            className="btn btn-primary"
+            className="btn btn-primary new-review-btn"
+            aria-label={t.topbar.newReview}
             onClick={() => {
               setShowSettings(false)
               setShowModal(true)
             }}
           >
-            新建审查
+            <PlusIcon />
+            <span className="new-review-label">{t.topbar.newReview}</span>
           </button>
         </div>
       </header>
 
       {showSettings ? (
         <div className="body settings-body">
-          <Settings onBack={() => setShowSettings(false)} />
+          <Settings t={t} onBack={() => setShowSettings(false)} />
         </div>
       ) : (
       <div className="body">
         {navOpen && <div className="scrim" onClick={() => setNavOpen(false)} />}
 
-        <nav className={`sidebar ${navOpen ? 'open' : ''}`} aria-label="审查任务">
+        <nav className={`sidebar ${navOpen ? 'open' : ''}`} aria-label={t.sidebar.heading}>
           <div className="sidebar-heading">
-            <span>审查任务</span>
+            <span>{t.sidebar.heading}</span>
             <span className="sidebar-count">{tasks.length}</span>
           </div>
           {tasks.map((task) => {
@@ -674,37 +640,37 @@ export function App() {
               >
                 <div className={`tile-status tone-${statusTone(task.status)}`}>
                   <span className={`dot ${isRoundActive(task.status) ? 'pulsing' : ''}`} />
-                  {statusLabel(task.status)}
+                  {statusLabel(t, task.status)}
                 </div>
                 <div className="tile-title">{task.title}</div>
                 <div className="tile-foot">
                   {verdict ? (
-                    <span className={`pill tone-${verdictTone(verdict)}`}>{verdictLabel(verdict)}</span>
+                    <span className={`pill tone-${verdictTone(verdict)}`}>{verdictLabel(t, verdict)}</span>
                   ) : (
-                    <span className="pill">未运行</span>
+                    <span className="pill">{t.sidebar.notRun}</span>
                   )}
-                  {count > 0 && <span>{count} 条</span>}
-                  <span className="spacer">{relativeTimeText(task.updated_at)}</span>
+                  {count > 0 && <span>{t.counts.findingsCompact(count)}</span>}
+                  <span className="spacer">{relativeTimeText(t, task.updated_at)}</span>
                 </div>
               </button>
             )
           })}
-          {!tasks.length && <div className="empty-note">还没有审查任务</div>}
+          {!tasks.length && <div className="empty-note">{t.sidebar.empty}</div>}
         </nav>
 
         <main className="main">
           <div className="main-inner">
             {notice && (
               <div className={`banner ${notice.tone === 'error' ? 'is-error' : 'is-info'}`} role="status">
-                <span>{notice.text}</span>
-                <button onClick={() => setNotice(null)} aria-label="关闭提示">✕</button>
+                <span>{notice.text(t)}</span>
+                <button onClick={() => setNotice(null)} aria-label={t.common.dismiss}>✕</button>
               </div>
             )}
 
             {!selectedTask && (
               <div className="empty-state">
-                <h2>选择一个审查任务</h2>
-                <p>从左侧列表挑一个任务查看结论与问题列表，或新建一次 PR 审查。</p>
+                <h2>{t.empty.title}</h2>
+                <p>{t.empty.body}</p>
               </div>
             )}
 
@@ -715,19 +681,19 @@ export function App() {
                     <span className={`tone-${statusTone(selectedTask.status)}`}
                       style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                       <span className={`dot ${roundActive ? 'pulsing' : ''}`} />
-                      {statusLabel(selectedTask.status)}
+                      {statusLabel(t, selectedTask.status)}
                     </span>
                     <span>·</span>
-                    <span>{stageLabel(selectedTask.current_stage)}</span>
-                    {prShortLabel(selectedTask) && (
+                    <span>{stageLabel(t, selectedTask.current_stage)}</span>
+                    {prShortLabel(t, selectedTask) && (
                       <>
                         <span>·</span>
                         {selectedTask.source_url ? (
                           <a href={selectedTask.source_url} target="_blank" rel="noreferrer">
-                            {prShortLabel(selectedTask)}
+                            {prShortLabel(t, selectedTask)}
                           </a>
                         ) : (
-                          <span>{prShortLabel(selectedTask)}</span>
+                          <span>{prShortLabel(t, selectedTask)}</span>
                         )}
                       </>
                     )}
@@ -744,57 +710,57 @@ export function App() {
                       {startLabel}
                     </button>
                     <button className="btn btn-ghost" onClick={() => exportSummary(selectedTask.id)}>
-                      导出摘要
+                      {t.detail.exportSummary}
                     </button>
                     <button
                       className="btn btn-danger"
                       onClick={() => abortTask(selectedTask.id)}
                       disabled={!roundActive}
                     >
-                      中止
+                      {t.detail.cancelRound}
                     </button>
                   </div>
 
                   <div className="meta-row">
                     <span className="meta-item">
-                      <span className="meta-key">仓库</span>
+                      <span className="meta-key">{t.detail.repository}</span>
                       <span className="meta-val mono" title={selectedTask.repo_path}>{selectedTask.repo_path}</span>
                     </span>
                     <span className="meta-item">
-                      <span className="meta-key">后端</span>
+                      <span className="meta-key">{t.detail.agent}</span>
                       <span className="meta-val">{selectedTask.backend}</span>
                     </span>
                     <span className="meta-item">
-                      <span className="meta-key">轮次</span>
+                      <span className="meta-key">{t.detail.rounds}</span>
                       <span className="meta-val">{orderedRounds.length}</span>
                     </span>
                     <span className="meta-item">
-                      <span className="meta-key">Commit</span>
+                      <span className="meta-key">{t.detail.commit}</span>
                       <span className="meta-val mono">
                         {shortSha(latestRound?.review_revision ?? selectedTask.pr_head_sha)}
                       </span>
                     </span>
                     <span className="meta-item">
-                      <span className="meta-key">更新</span>
-                      <span className="meta-val">{relativeTimeText(selectedTask.updated_at)}</span>
+                      <span className="meta-key">{t.detail.updated}</span>
+                      <span className="meta-val">{relativeTimeText(t, selectedTask.updated_at)}</span>
                     </span>
                   </div>
                 </section>
 
                 <section className={`verdict is-${verdictTone(latestResult?.verdict)}`}>
                   <div className="verdict-top">
-                    <span className="verdict-word">{verdictLabel(latestResult?.verdict)}</span>
+                    <span className="verdict-word">{verdictLabel(t, latestResult?.verdict)}</span>
                     {latestResult && (
                       <span className="verdict-count">
-                        {latestResult.finding_count} 条问题
+                        {t.counts.findings(latestResult.finding_count)}
                         {latestResult.supersedes_round_index
-                          ? ` · 第 ${latestResult.supersedes_round_index} 轮`
+                          ? ` · ${t.rounds.title(latestResult.supersedes_round_index)}`
                           : ''}
                       </span>
                     )}
                   </div>
                   <p className="verdict-summary">
-                    {latestResult?.summary || '这个任务还没有产出结构化的审查结论。'}
+                    {latestResult?.summary || t.result.noSummary}
                   </p>
                   {latestResult && latestResult.finding_count > 0 && (
                     <div className="sev-chips">
@@ -802,7 +768,7 @@ export function App() {
                         const n = latestResult.severity_counts?.[severity] ?? 0
                         return (
                           <span key={severity} className={`sev-chip ${n > 0 ? `on-${severity}` : ''}`}>
-                            {severityLabel(severity)}
+                            {severityLabel(t, severity)}
                             <span className="n">{n}</span>
                           </span>
                         )
@@ -813,7 +779,7 @@ export function App() {
 
                 {selectedTask.description && (
                   <details className="description">
-                    <summary>任务背景</summary>
+                    <summary>{t.detail.background}</summary>
                     <pre>{selectedTask.description}</pre>
                   </details>
                 )}
@@ -827,7 +793,7 @@ export function App() {
                       className={`tab ${detailTab === tab ? 'active' : ''}`}
                       onClick={() => setDetailTab(tab)}
                     >
-                      {tabLabel(tab)}
+                      {tabLabel(t, tab)}
                       <span className="tab-badge">{tabCounts[tab]}</span>
                     </button>
                   ))}
@@ -838,8 +804,8 @@ export function App() {
                     {latestResult && latestResult.findings.length > 0 ? (
                       <>
                         <div className="section-label">
-                          <span>问题列表</span>
-                          <span className="count">{latestResult.finding_count} 条</span>
+                          <span>{t.findings.heading}</span>
+                          <span className="count">{t.counts.findingsCompact(latestResult.finding_count)}</span>
                         </div>
                         <div className="findings">
                           {latestResult.findings.map((finding, index) => (
@@ -848,11 +814,11 @@ export function App() {
                               key={`${finding.severity}-${finding.path ?? 'na'}-${index}`}
                             >
                               <div className="finding-top">
-                                <span className="sev-tag">{severityLabel(finding.severity)}</span>
+                                <span className="sev-tag">{severityLabel(t, finding.severity)}</span>
                                 <span className="finding-loc">
                                   {finding.path
                                     ? `${finding.path}${finding.line ? `:${finding.line}` : ''}`
-                                    : '未指明位置'}
+                                    : t.findings.noLocation}
                                 </span>
                               </div>
                               <div className="finding-title">{finding.summary}</div>
@@ -865,7 +831,7 @@ export function App() {
                       </>
                     ) : (
                       <div className="empty-note">
-                        {latestResult ? '这一轮没有产出结构化问题。' : '还没有审查结果，先跑一轮吧。'}
+                        {latestResult ? t.findings.noneThisRound : t.findings.noResultYet}
                       </div>
                     )}
                   </>
@@ -876,21 +842,21 @@ export function App() {
                     <div className="timeline-bar">
                       <span>
                         {showAllEvents
-                          ? `全部 ${detail.eventStats.all_count} 条事件`
-                          : `${detail.eventStats.important_count} 条重要事件`}
+                          ? t.timeline.allEvents(detail.eventStats.all_count)
+                          : t.timeline.importantEvents(detail.eventStats.important_count)}
                       </span>
                       {detail.eventStats.hidden_count > 0 && (
                         <button className="btn btn-ghost" onClick={() => setShowAllEvents((v) => !v)}>
-                          {showAllEvents ? '仅看重要事件' : `显示全部 ${detail.eventStats.all_count} 条`}
+                          {showAllEvents ? t.timeline.importantOnly : t.timeline.showAll(detail.eventStats.all_count)}
                         </button>
                       )}
                     </div>
                     {visibleEvents.length ? (
                       <div className="events">
-                        {visibleEvents.map((event) => <EventRow key={event.id} event={event} />)}
+                        {visibleEvents.map((event) => <EventRow key={event.id} event={event} t={t} />)}
                       </div>
                     ) : (
-                      <div className="empty-note">暂无事件</div>
+                      <div className="empty-note">{t.timeline.empty}</div>
                     )}
                   </>
                 )}
@@ -902,13 +868,13 @@ export function App() {
                         {[...orderedRounds].reverse().map((round) => (
                           <article className="round" key={round.id}>
                             <div className="round-top">
-                              <span className="round-n">第 {round.round_index} 轮</span>
+                              <span className="round-n">{t.rounds.title(round.round_index)}</span>
                               <span className={`pill tone-${verdictTone(round.review_result?.verdict)}`}>
-                                {verdictLabel(round.review_result?.verdict)}
+                                {verdictLabel(t, round.review_result?.verdict)}
                               </span>
                               {(round.review_result?.finding_count ?? 0) > 0 && (
                                 <span className="verdict-count">
-                                  {round.review_result?.finding_count} 条问题
+                                  {t.counts.findings(round.review_result?.finding_count ?? 0)}
                                 </span>
                               )}
                             </div>
@@ -918,27 +884,27 @@ export function App() {
                             )}
                             <div className="kv-grid">
                               <div className="kv">
-                                <span className="kv-k">后端</span>
+                                <span className="kv-k">{t.rounds.agent}</span>
                                 <span className="kv-v">{round.backend}</span>
                               </div>
                               <div className="kv">
-                                <span className="kv-k">状态</span>
+                                <span className="kv-k">{t.rounds.status}</span>
                                 <span className="kv-v">{round.status}</span>
                               </div>
                               <div className="kv">
-                                <span className="kv-k">耗时</span>
+                                <span className="kv-k">{t.rounds.duration}</span>
                                 <span className="kv-v">{durationText(round.started_at, round.ended_at)}</span>
                               </div>
                               <div className="kv">
-                                <span className="kv-k">退出码</span>
+                                <span className="kv-k">{t.rounds.exitCode}</span>
                                 <span className="kv-v">{String(round.exit_code ?? '—')}</span>
                               </div>
                               <div className="kv">
-                                <span className="kv-k">Commit</span>
+                                <span className="kv-k">{t.rounds.commit}</span>
                                 <span className="kv-v mono">{shortSha(round.review_revision)}</span>
                               </div>
                               <div className="kv">
-                                <span className="kv-k">开始于</span>
+                                <span className="kv-k">{t.rounds.startedAt}</span>
                                 <span className="kv-v">{timeText(round.started_at)}</span>
                               </div>
                             </div>
@@ -946,7 +912,7 @@ export function App() {
                         ))}
                       </div>
                     ) : (
-                      <div className="empty-note">还没有跑过任何一轮审查</div>
+                      <div className="empty-note">{t.rounds.empty}</div>
                     )}
                   </>
                 )}
@@ -963,7 +929,7 @@ export function App() {
                         ))}
                       </div>
                     ) : (
-                      <div className="empty-note">暂无产物文件</div>
+                      <div className="empty-note">{t.artifacts.empty}</div>
                     )}
                   </>
                 )}
@@ -981,22 +947,20 @@ export function App() {
             onClick={(event) => event.stopPropagation()}
             role="dialog"
             aria-modal="true"
-            aria-label="新建代码审查"
+            aria-label={t.newReview.title}
           >
-            <h2>新建代码审查</h2>
+            <h2>{t.newReview.title}</h2>
             <p className="modal-hint">
-              {reviewSource === 'pull_request'
-                ? '拉取 GitHub PR 的 diff 与讨论，编译上下文后交给 AI 后端审查。'
-                : '审查本地仓库相对基准分支的提交、暂存区和工作区变更。'}
+              {reviewSource === 'pull_request' ? t.newReview.hintPullRequest : t.newReview.hintLocal}
             </p>
-            <div className="mode-switch" role="group" aria-label="审查来源">
+            <div className="mode-switch" role="group" aria-label={t.newReview.source}>
               <button
                 type="button"
                 className={reviewSource === 'pull_request' ? 'active' : ''}
                 aria-pressed={reviewSource === 'pull_request'}
                 onClick={() => setReviewSource('pull_request')}
               >
-                GitHub PR
+                {t.newReview.pullRequest}
               </button>
               <button
                 type="button"
@@ -1004,11 +968,11 @@ export function App() {
                 aria-pressed={reviewSource === 'local_diff'}
                 onClick={() => setReviewSource('local_diff')}
               >
-                本地变更
+                {t.newReview.localChanges}
               </button>
             </div>
             <label className="field">
-              <span className="field-label">本地仓库路径</span>
+              <span className="field-label">{t.newReview.repoPath}</span>
               <input
                 value={repoPath}
                 onChange={(event) => setRepoPath(event.target.value)}
@@ -1018,7 +982,7 @@ export function App() {
             </label>
             {reviewSource === 'pull_request' ? (
               <label className="field">
-                <span className="field-label">GitHub PR 链接</span>
+                <span className="field-label">{t.newReview.prUrl}</span>
                 <input
                   value={prUrl}
                   onChange={(event) => setPrUrl(event.target.value)}
@@ -1027,31 +991,33 @@ export function App() {
               </label>
             ) : (
               <label className="field">
-                <span className="field-label">基准分支（可选）</span>
+                <span className="field-label">{t.newReview.baseBranch}</span>
                 <input
                   value={baseBranch}
                   onChange={(event) => setBaseBranch(event.target.value)}
-                  placeholder="自动检测 main 或 master"
+                  placeholder={t.newReview.baseBranchPlaceholder}
                 />
               </label>
             )}
             <label className="field">
-              <span className="field-label">审查重点（可选）</span>
+              <span className="field-label">{t.newReview.focus}</span>
               <textarea
                 value={reviewFocus}
                 onChange={(event) => setReviewFocus(event.target.value)}
                 rows={3}
-                placeholder="想让审查特别关注的风险点、模块、兼容性或测试缺口"
+                placeholder={t.newReview.focusPlaceholder}
               />
             </label>
             <div className="modal-actions">
-              <button className="btn btn-ghost" disabled={isCreating} onClick={() => setShowModal(false)}>取消</button>
+              <button className="btn btn-ghost" disabled={isCreating} onClick={() => setShowModal(false)}>
+                {t.common.cancel}
+              </button>
               <button
                 className="btn btn-primary"
                 disabled={isCreating || !repoPath.trim() || (reviewSource === 'pull_request' && !prUrl.trim())}
                 onClick={createTask}
               >
-                {isCreating ? '正在创建…' : '创建审查'}
+                {isCreating ? t.newReview.creating : t.newReview.create}
               </button>
             </div>
           </div>

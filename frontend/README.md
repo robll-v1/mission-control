@@ -21,6 +21,7 @@ React + TypeScript + Vite single-page console for PR review management.
 - Artifacts tab for context snapshots, diffs, and summaries
 - Modal-based task creation from GitHub PR URLs
 - Light and dark themes; follows the OS preference, remembers an explicit choice
+- English by default, Simplified Chinese from the top bar (EN / 中文); remembers an explicit choice
 
 ## Design system
 
@@ -49,7 +50,8 @@ The themes are not the same design with the lights turned off.
   brightest value in the theme and `--ok` one of the dimmest.
 
 Because the dark ramp has no hue, severity must never depend on it alone. Every
-state also carries a text label (`严重/高/中/低`, `审查失败/需要关注/未发现明显问题`),
+state also carries a text label (`Critical/High/Medium/Low`,
+`Review failed/Needs attention/No issues found`, or their Chinese equivalents),
 and links carry a persistent underline rather than a colour shift.
 
 Conventions worth keeping:
@@ -70,6 +72,20 @@ Conventions worth keeping:
   seeds the initial value.
 - `prefers-reduced-motion` disables the running-task pulse and transitions.
 
+## Interface text
+
+All interface text lives in `src/i18n.ts`, in English (`en`, the default) and
+Simplified Chinese (`zh-CN`). `en` defines the shape of the dictionary, so a key
+missing from another language fails `npx tsc --noEmit`; `tests/i18n.test.ts`
+checks the same at runtime.
+
+- The top-bar switch stores an explicit choice in localStorage under
+  `amc_ui_language`. Until the user picks one, the UI is English.
+- The review output language is a separate setting. Each start request sends
+  `{"language": "en"}` (`DEFAULT_REVIEW_LANGUAGE`); switching the interface to
+  Chinese does not change it.
+- Text from the server, such as error details and review summaries, is shown as sent.
+
 ## Run
 - From the repository root: `./scripts/dev-frontend.sh`
 - Default: `http://127.0.0.1:5173` (proxies API to backend on `:8000`)
@@ -77,3 +93,4 @@ Conventions worth keeping:
 ## Build
 - From this directory: `npm run build`
 - Type check only: `npx tsc --noEmit`
+- Unit tests: `npm test` (Node 22.18 or later)
