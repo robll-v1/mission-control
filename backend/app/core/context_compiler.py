@@ -78,6 +78,47 @@ class CompiledContext:
     json_bytes: int = 0
 
 
+DEFAULT_REVIEW_LANGUAGE = 'en'
+# RFC 5646 §2.1 langtag grammar restricted to primary language 'en' or 'zh':
+#   language ["-" extlang] ["-" script] ["-" region] *("-" variant) *("-" extension) ["-" privateuse]
+_REVIEW_LANGUAGE_TAG_RE = re.compile(
+    r'^(?P<lang>en|zh)'
+    r'(?:-[a-z]{3}(?:-[a-z]{3}){0,2})?'                  # optional extlang (e.g. zh-cmn)
+    r'(?:-[a-z]{4})?'                                     # optional script (e.g. Hans)
+    r'(?:-(?:[a-z]{2}|[0-9]{3}))?'                        # optional region (e.g. US, CN, 419)
+    r'(?:-(?:[a-z0-9]{5,8}|[0-9][a-z0-9]{3}))*'           # optional variants
+    r'(?P<extensions>(?:-[0-9a-wy-z](?:-[a-z0-9]{2,8})+)*)'  # optional extensions (e.g. -u-ca-gregory)
+    r'(?:-x(?:-[a-z0-9]{1,8})+)?$'                        # optional privateuse
+)
+_EXTENSION_SINGLETON_RE = re.compile(r'-([0-9a-wy-z])(?=-)')
+
+
+def normalize_review_language(language: str | None, *, strict: bool = False) -> str:
+    """Normalize a review language code to ``'en'`` or ``'zh'``.
+
+    Accepts ``'en'``, ``'zh'``, and RFC 5646 §2.1 BCP 47 tags rooted at
+    ``en`` or ``zh`` (such as ``'en-US'``, ``'zh-Hans-CN'``, or
+    ``'en-US-u-ca-gregory'``). When ``strict=True`` (HTTP API input),
+    malformed or unsupported values raise ``ValueError``.
+    """
+    if language is None:
+        return DEFAULT_REVIEW_LANGUAGE
+    raw_str = str(language)
+    if raw_str.isascii():
+        raw = raw_str.strip().lower()
+        if not raw:
+            return DEFAULT_REVIEW_LANGUAGE
+        match = _REVIEW_LANGUAGE_TAG_RE.fullmatch(raw)
+        if match is not None:
+            extensions = match.group('extensions')
+            singletons = _EXTENSION_SINGLETON_RE.findall(extensions) if extensions else []
+            if len(singletons) == len(set(singletons)):
+                return match.group('lang')
+    if strict:
+        raise ValueError(f"unsupported review language: {language!r} (expected 'en' or 'zh')")
+    return DEFAULT_REVIEW_LANGUAGE
+
+
 class ContextCompiler:
     def __init__(self, artifacts: ArtifactStore):
         self.artifacts = artifacts
@@ -164,10 +205,15 @@ class ContextCompiler:
         )
 
     @staticmethod
-    def build_prompt(task: Task, compiled: CompiledContext, review_note: str | None = None, language: str = 'zh') -> str:
-        if language == 'en':
-            return ContextCompiler._build_prompt_en(compiled, review_note)
-        return ContextCompiler._build_prompt_zh(compiled, review_note)
+    def build_prompt(
+        task: Task,
+        compiled: CompiledContext,
+        review_note: str | None = None,
+        language: str | None = DEFAULT_REVIEW_LANGUAGE,
+    ) -> str:
+        if normalize_review_language(language) == 'zh':
+            return ContextCompiler._build_prompt_zh(compiled, review_note)
+        return ContextCompiler._build_prompt_en(compiled, review_note)
 
     @staticmethod
     def _build_prompt_zh(compiled: CompiledContext, review_note: str | None = None) -> str:

@@ -14,7 +14,11 @@ from pathlib import Path
 
 from app.adapters.base import RunnerAdapter, resolve_executable
 from app.core.config import load_repo_config, resolve_backend_config
-from app.core.context_compiler import ContextCompiler
+from app.core.context_compiler import (
+    DEFAULT_REVIEW_LANGUAGE,
+    ContextCompiler,
+    normalize_review_language,
+)
 from app.core.db import Database
 from app.core.github_ingest import fetch_pull_request
 from app.core.mission_engine import MissionEngine
@@ -105,7 +109,14 @@ class ExecutionService:
         with self._lock:
             return task_id in self._active
 
-    def start_task(self, task_id: str, prompt: str | None = None, review_note: str | None = None, language: str = 'zh') -> Run:
+    def start_task(
+        self,
+        task_id: str,
+        prompt: str | None = None,
+        review_note: str | None = None,
+        language: str | None = DEFAULT_REVIEW_LANGUAGE,
+    ) -> Run:
+        resolved_language = normalize_review_language(language)
         task = self.db.get_task(task_id)
         if task is None:
             raise KeyError(f'task not found: {task_id}')
@@ -124,7 +135,7 @@ class ExecutionService:
             placeholder = ActiveProcess(task_id=task_id, run_id=None, process=None, worker=None)
             self._active[task_id] = placeholder
         try:
-            return self._launch_round(task, prompt, review_note, language, placeholder)
+            return self._launch_round(task, prompt, review_note, resolved_language, placeholder)
         except BaseException as exc:
             try:
                 # Settle the task while the slot is still held: once it is
@@ -438,6 +449,7 @@ class ExecutionService:
                     # config that silently drops the selected model shows up
                     # in the event stream. No variant: most CLIs never get it.
                     'model': getattr(adapter, 'model', None),
+                    'language': language,
                     'worktree_path': task.worktree_path,
                     'idle_timeout_sec': idle_timeout_sec,
                     'round_index': round_index,

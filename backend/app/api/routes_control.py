@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
+from app.core.context_compiler import DEFAULT_REVIEW_LANGUAGE, normalize_review_language
 from app.core.execution import (
     BackendUnavailableError,
     ExecutionService,
@@ -19,12 +20,23 @@ router = APIRouter(prefix='/api/tasks', tags=['control'])
 class StartTaskRequest(BaseModel):
     review_note: str | None = None
     prompt: str | None = None
+    language: str | None = DEFAULT_REVIEW_LANGUAGE
+
+    @field_validator('language')
+    @classmethod
+    def _validate_language(cls, value: str | None) -> str:
+        return normalize_review_language(value, strict=True)
 
 
 @router.post('/{task_id}/start')
 def start_task(task_id: str, request: StartTaskRequest, execution: ExecutionService = Depends(get_execution)):
     try:
-        run = execution.start_task(task_id, prompt=request.prompt, review_note=request.review_note)
+        run = execution.start_task(
+            task_id,
+            prompt=request.prompt,
+            review_note=request.review_note,
+            language=request.language,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except BackendUnavailableError as exc:

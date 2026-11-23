@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 
+from app.core.context_compiler import normalize_review_language
 from app.core.db import Database
 from app.core.models import Event, EventLevel, ReviewFinding, ReviewResult, ReviewVerdict, Run, Task, TaskStatus
 
@@ -53,12 +54,22 @@ MESSAGES: dict[str, dict[str, str]] = {
 }
 
 
-def _message(key: str, language: str) -> str:
-    table = MESSAGES.get((language or DEFAULT_LANGUAGE).lower(), MESSAGES[DEFAULT_LANGUAGE])
+def _message(key: str, language: str | None) -> str:
+    canonical = normalize_review_language(language)
+    table = MESSAGES.get(canonical, MESSAGES[DEFAULT_LANGUAGE])
     return table.get(key, MESSAGES[DEFAULT_LANGUAGE][key])
 
 
 class ReviewResultService:
+    @staticmethod
+    def _run_language(events: list[Event], run_id: str) -> str:
+        for event in events:
+            if event.run_id == run_id and event.kind == 'review.round_started':
+                lang = event.payload.get('language')
+                if isinstance(lang, str) and lang.strip():
+                    return normalize_review_language(lang)
+        return DEFAULT_LANGUAGE
+
     @staticmethod
     def backfill_task(*, db: Database, task: Task) -> Task:
         with db.locked():
@@ -68,7 +79,10 @@ class ReviewResultService:
             updated = False
             for run in rounds:
                 if run.review_result is None and run.status in {'completed', 'failed'}:
-                    run.review_result = ReviewResultService.extract_result(events=events, run=run)
+                    run_lang = ReviewResultService._run_language(events, run.id)
+                    run.review_result = ReviewResultService.extract_result(
+                        events=events, run=run, language=run_lang
+                    )
                     db.save_run(run)
                     updated = True
             latest_round = rounds[-1] if rounds else None
