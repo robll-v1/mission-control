@@ -83,7 +83,9 @@ checks the same at runtime.
   `amc_ui_language`. Until the user picks one, the UI is English.
 - The review output language is a separate setting. Each start request sends
   `{"language": "en"}` (`DEFAULT_REVIEW_LANGUAGE`); switching the interface to
-  Chinese does not change it.
+  Chinese does not change it. Note: until the backend wires `StartTaskRequest.language`
+  to `ExecutionService.start_task`, the server ignores this field and uses its own
+  default review prompt language.
 - Text from the server, such as error details and review summaries, is shown as sent.
 
 ## Run

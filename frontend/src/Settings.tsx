@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { errorMessage, type Localized, type Messages } from './i18n'
+import { errorMessage, labelFor, type Localized, type Messages } from './i18n'
 
 type Backend = {
   name: string
@@ -47,7 +47,7 @@ const INSTALL_HINTS: { name: string; command: string }[] = [
 const SEARCH_THRESHOLD = 8
 
 function displayName(name: string) {
-  return DISPLAY_NAMES[name] ?? name
+  return labelFor(DISPLAY_NAMES, name)
 }
 
 function modelSourceDescription(t: Messages, source: Backend['models_source'], modelCount: number) {

@@ -345,8 +345,12 @@ export function App() {
   const [startingTaskIds, setStartingTaskIds] = useState<string[]>([])
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'light'
-    const stored = window.localStorage.getItem(THEME_KEY)
-    if (stored === 'light' || stored === 'dark') return stored
+    try {
+      const stored = window.localStorage.getItem(THEME_KEY)
+      if (stored === 'light' || stored === 'dark') return stored
+    } catch {
+      // Storage blocked (e.g. cookies disabled / SecurityError); fall back to system theme.
+    }
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
   })
   const eventSourceRef = useRef<EventSource | null>(null)
@@ -357,7 +361,11 @@ export function App() {
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
-    window.localStorage.setItem(THEME_KEY, theme)
+    try {
+      window.localStorage.setItem(THEME_KEY, theme)
+    } catch {
+      // Quota or privacy restrictions; theme still applies for the current session.
+    }
   }, [theme])
 
   // Screen readers and CJK font fallback both read the page's lang.
