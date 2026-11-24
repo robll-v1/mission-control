@@ -253,6 +253,7 @@ test('createRunDraft uses repo effective settings over global config for auto-cr
     reasoning: 'high',
     note: 'Keep my note',
     explicit: { agent: false, model: false, reasoning: true, language: false },
+    userEdited: { agent: false, model: false, reasoning: true, language: false },
   }
   const merged = mergeEffectiveIntoDraft(
     editedBeforeEffective,
@@ -270,21 +271,51 @@ test('createRunDraft uses repo effective settings over global config for auto-cr
     review_note: 'Keep my note',
   })
 
-  // Subsequent round with CLI/Model default + late savedConfig must still emit explicit nulls
-  const priorDefaultRound = { backend: 'codex', model: null, reasoning: null, language: 'en' }
-  const beforeSaved = createRunDraft({ backend: 'codex', model: null, reasoning: null, language: 'en' }, priorDefaultRound, null)
-  const afterSaved = mergeEffectiveIntoDraft(
-    beforeSaved,
-    { backend: 'codex', model: null, reasoning: null, language: 'en' },
-    priorDefaultRound,
-    SAVED,
-    null,
-  )
+  // Subsequent round with switched agent + CLI/Model default + late savedConfig must emit explicit nulls
+  const switchedTask = { backend: 'codex', model: null, reasoning: null, language: 'en' }
+  const priorSwitchedRound = { backend: 'claude-code', model: null, reasoning: null, language: 'en' }
+  const beforeSaved = createRunDraft(switchedTask, priorSwitchedRound, null)
+  const afterSaved = mergeEffectiveIntoDraft(beforeSaved, switchedTask, priorSwitchedRound, SAVED, null)
   assert.deepEqual(buildStartRoundPayload(afterSaved), {
     language: 'en',
+    backend: 'claude-code',
     model: null,
     reasoning: null,
   })
+
+  // Commutativity: saved-first vs effective-first converge to identical draft & payload
+  const openTask = { backend: 'opencode', model: null, reasoning: null, language: 'en' }
+  const openRound = {
+    backend: 'opencode',
+    model: null,
+    reasoning: null,
+    language: 'en',
+    settings: { agent: 'opencode', model: null, reasoning: null, language: 'en', sources: { model: 'default', reasoning: 'default' } },
+  }
+  const openSaved: SavedConfig = { backend: 'opencode', model: null, reasoning: 'high', variant: 'high' }
+  const openEffective = {
+    settings: openRound.settings,
+    backend: 'opencode',
+    model: null,
+    reasoning: null,
+    sources: openRound.settings.sources,
+  }
+  const openInit = createRunDraft(openTask, openRound, null)
+  const savedFirst = mergeEffectiveIntoDraft(
+    mergeEffectiveIntoDraft(openInit, openTask, openRound, openSaved, null),
+    openTask,
+    openRound,
+    openSaved,
+    openEffective,
+  )
+  const effectiveFirst = mergeEffectiveIntoDraft(
+    mergeEffectiveIntoDraft(openInit, openTask, openRound, null, openEffective),
+    openTask,
+    openRound,
+    openSaved,
+    openEffective,
+  )
+  assert.deepEqual(buildStartRoundPayload(savedFirst), buildStartRoundPayload(effectiveFirst))
 })
 
 test('formatRoundSettingsLabel formats agent, model, and raw reasoning level', () => {

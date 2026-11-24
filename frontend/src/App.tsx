@@ -900,12 +900,26 @@ export function App() {
                             onChange={(e) => {
                               const nextModel = e.target.value
                               const opts = resolveReasoningOptions(runAgentCap, nextModel)
-                              setRunDraft((prev) => ({
-                                ...prev,
-                                model: nextModel,
-                                reasoning: prev.reasoning && opts.supported && opts.levels.includes(prev.reasoning) ? prev.reasoning : '',
-                                explicit: { ...prev.explicit, model: true },
-                              }))
+                              setRunDraft((prev) => {
+                                const reasoningCleared = Boolean(
+                                  prev.reasoning && (!opts.supported || !opts.levels.includes(prev.reasoning)),
+                                )
+                                return {
+                                  ...prev,
+                                  model: nextModel,
+                                  reasoning: reasoningCleared ? '' : prev.reasoning,
+                                  explicit: {
+                                    ...prev.explicit,
+                                    model: true,
+                                    reasoning: reasoningCleared ? true : prev.explicit.reasoning,
+                                  },
+                                  userEdited: {
+                                    ...prev.userEdited,
+                                    model: true,
+                                    reasoning: reasoningCleared ? true : prev.userEdited.reasoning,
+                                  },
+                                }
+                              })
                             }}
                           >
                             <option value="">{t.settings.agentDefault}</option>
@@ -925,6 +939,7 @@ export function App() {
                               ...prev,
                               model: e.target.value,
                               explicit: { ...prev.explicit, model: true },
+                              userEdited: { ...prev.userEdited, model: true },
                             }))}
                           />
                         )}
@@ -939,6 +954,7 @@ export function App() {
                               ...prev,
                               reasoning: e.target.value,
                               explicit: { ...prev.explicit, reasoning: true },
+                              userEdited: { ...prev.userEdited, reasoning: true },
                             }))}
                           >
                             <option value="">
@@ -964,6 +980,7 @@ export function App() {
                             ...prev,
                             language: (e.target.value === 'zh' ? 'zh' : 'en'),
                             explicit: { ...prev.explicit, language: true },
+                            userEdited: { ...prev.userEdited, language: true },
                           }))}
                         >
                           <option value="en">{t.detail.reviewLangEn}</option>

@@ -90,6 +90,13 @@ export type RunDraft = {
     reasoning: boolean
     language: boolean
   }
+  /** Tracks fields directly edited by the user in this form session (distinct from latestRound carryover). */
+  userEdited: {
+    agent: boolean
+    model: boolean
+    reasoning: boolean
+    language: boolean
+  }
 }
 
 export type RoundLike = {
@@ -252,13 +259,22 @@ export function createRunDraft(
       reasoning: roundOverrodeReasoning,
       language: false,
     },
+    userEdited: {
+      agent: false,
+      model: false,
+      reasoning: false,
+      language: false,
+    },
   }
 }
 
 /**
- * Merge newly arrived saved/repo-effective config into a draft field-by-field,
- * preserving any fields the user has already edited while updating inherited
- * defaults and explicit carryover flags when config loads late.
+ * Merge newly arrived saved/repo-effective config into a draft field-by-field.
+ *
+ * Purely re-derives every non-user-edited field and its `explicit` flag from
+ * `createRunDraft(task, latestRound, saved, effective)` so the result is
+ * strictly commutative (independent of whether `saved` or `effective` arrives
+ * first), while never overwriting any field the user edited.
  */
 export function mergeEffectiveIntoDraft(
   prev: RunDraft,
@@ -267,18 +283,19 @@ export function mergeEffectiveIntoDraft(
   saved: SavedConfig | null,
   effective?: EffectiveSettingsResponse | null,
 ): RunDraft {
-  if (prev.explicit.agent) return prev
+  if (prev.userEdited.agent) return prev
   const next = createRunDraft(task, latestRound, saved, effective)
   return {
     ...prev,
-    model: prev.explicit.model ? prev.model : next.model,
-    reasoning: prev.explicit.reasoning ? prev.reasoning : next.reasoning,
-    language: prev.explicit.language ? prev.language : next.language,
+    agent: next.agent,
+    model: prev.userEdited.model ? prev.model : next.model,
+    reasoning: prev.userEdited.reasoning ? prev.reasoning : next.reasoning,
+    language: prev.userEdited.language ? prev.language : next.language,
     explicit: {
-      agent: prev.explicit.agent || next.explicit.agent,
-      model: prev.explicit.model || next.explicit.model,
-      reasoning: prev.explicit.reasoning || next.explicit.reasoning,
-      language: prev.explicit.language || next.explicit.language,
+      agent: next.explicit.agent,
+      model: prev.userEdited.model ? prev.explicit.model : next.explicit.model,
+      reasoning: prev.userEdited.reasoning ? prev.explicit.reasoning : next.explicit.reasoning,
+      language: prev.userEdited.language ? prev.explicit.language : next.explicit.language,
     },
   }
 }
@@ -305,6 +322,12 @@ export function switchDraftAgent(
     reasoning: nextReasoning,
     explicit: {
       ...draft.explicit,
+      agent: true,
+      model: false,
+      reasoning: false,
+    },
+    userEdited: {
+      ...draft.userEdited,
       agent: true,
       model: false,
       reasoning: false,
