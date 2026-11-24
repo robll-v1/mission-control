@@ -102,7 +102,8 @@ class DataDirLock:
         if self._fd is not None:
             return True
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_BINARY', 0)
+        fd = os.open(str(self.lock_path), flags, 0o600)
         try:
             if sys.platform == 'win32':
                 import msvcrt
@@ -118,10 +119,10 @@ class DataDirLock:
         try:
             os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
-            # Reserve byte 0 for Windows mandatory 1-byte lock (`msvcrt.locking`);
-            # store the holder PID starting at byte 1 so other processes can read
-            # it without hitting Windows byte-range PermissionError.
-            os.write(fd, b'\n' + f'{os.getpid()}\n'.encode('ascii'))
+            # Reserve byte 0 (non-newline ASCII space in binary mode) for Windows
+            # mandatory 1-byte lock (`msvcrt.locking`); store the holder PID
+            # starting at byte 1 so cross-process reads never hit PermissionError.
+            os.write(fd, b' ' + f'{os.getpid()}\n'.encode('ascii'))
             os.fsync(fd)
         except OSError:
             pass
@@ -152,7 +153,7 @@ class DataDirLock:
     def holder_pid(self) -> int | None:
         fd: int | None = None
         try:
-            fd = os.open(str(self.lock_path), os.O_RDONLY)
+            fd = os.open(str(self.lock_path), os.O_RDONLY | getattr(os, 'O_BINARY', 0))
             os.lseek(fd, 1, os.SEEK_SET)
             raw = os.read(fd, 64)
             text = raw.decode('ascii', errors='ignore').strip()
@@ -276,6 +277,12 @@ def _legacy_db_has_valid_amc_data(path: Path, *, trusted_root: Path | None = Non
                 pass
 
 
+def get_trusted_checkout_roots() -> list[Path]:
+    """Return this package's own verified AMC source checkout root, if running from source."""
+    checkout = Path(__file__).resolve().parent.parent.parent.parent
+    return [checkout] if _is_amc_checkout_root(checkout) else []
+
+
 def find_legacy_db_paths(*, extra_roots: Iterable[Path] = ()) -> list[Path]:
     """Locate existing legacy ``data/amc.db`` ONLY inside explicitly trusted AMC checkout roots.
 
@@ -335,7 +342,7 @@ def maybe_import_legacy_db(
     target_db: Path | None = None,
     *,
     candidates: Iterable[Path] | None = None,
-    extra_roots: Iterable[Path] = (),
+    extra_roots: Iterable[Path] | None = None,
 ) -> Path | None:
     """Atomically import a legacy ``./data/amc.db`` on first run into the app data dir.
 
@@ -358,10 +365,11 @@ def maybe_import_legacy_db(
     except OSError:
         return None
 
+    search_roots = get_trusted_checkout_roots() if extra_roots is None else list(extra_roots)
     search_list = (
         list(candidates)
         if candidates is not None
-        else find_legacy_db_paths(extra_roots=extra_roots)
+        else find_legacy_db_paths(extra_roots=search_roots)
     )
 
     for raw_cand in search_list:
@@ -393,6 +401,11 @@ def maybe_import_legacy_db(
             dst_conn = None
             src_conn.close()
             src_conn = None
+
+            # Validate the exact snapshot file about to be published (prevents TOCTOU).
+            if not _legacy_db_has_valid_amc_data(temp_path):
+                logger.warning('Skipping legacy database import from %s: backed-up snapshot failed validation.', cand)
+                continue
 
             if not _publish_no_overwrite(temp_path, target):
                 return None

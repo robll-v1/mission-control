@@ -164,7 +164,18 @@ def test_legacy_db_import_rejects_unrelated_db_symlinks_and_non_amc_cwd(tmp_path
     except OSError:
         pass
 
-    # 7. Opt-out flag skips even valid direct candidate
+    # 7. Default maybe_import_legacy_db() (as called by ReviewEngine / SDK) imports from
+    #    get_trusted_checkout_roots() without needing callers to pass extra_roots manually.
+    trusted_checkout = tmp_path / 'trusted-amc-checkout'
+    (trusted_checkout / 'data').mkdir(parents=True)
+    (trusted_checkout / 'pyproject.toml').write_text('[project]\nname = "agent-mission-control"\n', encoding='utf-8')
+    (trusted_checkout / 'data' / 'amc.db').write_bytes(real_amc_path.read_bytes())
+    monkeypatch.setattr(paths, 'get_trusted_checkout_roots', lambda: [trusted_checkout])
+    sdk_target = tmp_path / 'sdk-app-data' / 'amc.db'
+    assert paths.maybe_import_legacy_db(sdk_target) == (trusted_checkout / 'data' / 'amc.db').resolve()
+    assert sdk_target.is_file()
+
+    # 8. Opt-out flag skips even valid direct candidate
     monkeypatch.setenv('AMC_NO_LEGACY_IMPORT', '1')
     assert paths.maybe_import_legacy_db(target, candidates=[real_amc_path]) is None
     assert not target.exists()

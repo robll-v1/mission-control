@@ -1122,6 +1122,9 @@ def cmd_start(args: argparse.Namespace) -> None:
         if not ready:
             _fail(f'Backend did not become healthy within {HEALTH_TIMEOUT}s. Check {backend_log}')
 
+        if frontend_proc is not None and frontend_proc.poll() is not None:
+            _fail(f'Frontend exited with code {frontend_proc.returncode}. Check {frontend_log}')
+
         # save port info
         ports_info = {'backend': backend_port, 'frontend': frontend_port}
         _atomic_write_json(ports_path, ports_info)
