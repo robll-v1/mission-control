@@ -489,8 +489,9 @@ def _terminate_windows_tree(proc: subprocess.Popen[Any], state: _ProcessState, *
     # 1. Gentle tree termination via taskkill /T (never call proc.terminate()
     # on failure, because killing the wrapper parent alone could orphan
     # children before TerminateJobObject or taskkill /F /T can act).
+    gentle_accepted = False
     try:
-        subprocess.run(
+        res = subprocess.run(
             ['taskkill', '/T', '/PID', str(pid)],
             capture_output=True,
             text=True,
@@ -498,14 +499,19 @@ def _terminate_windows_tree(proc: subprocess.Popen[Any], state: _ProcessState, *
             errors='replace',
             timeout=5,
         )
+        gentle_accepted = res.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
-        pass
+        gentle_accepted = False
 
-    deadline = time.monotonic() + max(grace_sec, 0.0)
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            break
-        time.sleep(0.02)
+    # Console processes on Windows reject non-forced taskkill /T immediately
+    # ("can only be terminated forcefully (with /F option)"). Only wait the
+    # grace window when the gentle signal was actually accepted.
+    if gentle_accepted:
+        deadline = time.monotonic() + max(grace_sec, 0.0)
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.02)
 
     # 2. Force-kill the entire tree: Job Object first (kills descendants even
     # if the leader wrapper already exited), then taskkill /F /T as fallback.

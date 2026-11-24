@@ -370,9 +370,13 @@ def test_terminate_process_tree_windows_job_object_and_no_premature_terminate(mo
 
     fake = FakeProc()
     register_managed_process(fake)  # type: ignore[arg-type]
-    terminate_process_tree(fake, grace_sec=0.05)  # type: ignore[arg-type]
+    t0 = time.monotonic()
+    terminate_process_tree(fake, grace_sec=5.0)  # type: ignore[arg-type]
+    elapsed = time.monotonic() - t0
 
-    # Must NEVER call proc.terminate() prematurely when taskkill /T fails.
+    # Must NEVER call proc.terminate() prematurely when taskkill /T fails, and
+    # must not burn the full grace window after taskkill /T already rejected it.
+    assert elapsed < 1.0, f'rejected gentle taskkill /T still burned {elapsed:.2f}s of grace window'
     assert ['terminate'] not in calls
     assert ['taskkill', '/T', '/PID', '42424'] in calls
     assert ('terminate', 777) in job_calls
