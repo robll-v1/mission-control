@@ -11,7 +11,7 @@ Mission Control（命令 `amc`）：本地优先的 AI 代码审查控制台。
 
 - 入口：Web UI（FastAPI + React）、CLI `amc review`、Python SDK `app.sdk.ReviewEngine`。MCP 服务已归档，只保证 v1 API 能用。
 - 仓库：https://github.com/robll-v1/mission-control（MIT）
-- 用户是在读大学生，这个项目同时用于作品集和找实习，所以除了代码质量，**展示效果和可讲述性也很重要**。
+- 除了代码质量，**交互体验、架构清晰度与文档可读性也很重要**。
 
 ## 2. 协作约定
 
