@@ -266,16 +266,20 @@ def test_adapters_pass_reasoning_and_build_non_llm_doctor_commands():
     cmd = codex.make_command(task=task, prompt='review')
     assert '--model' in cmd and 'gpt-6.2-sol' in cmd
     assert '-c' in cmd and 'model_reasoning_effort=xhigh' in cmd
+    # doctor_command uses fixed arguments only (safe against Windows .cmd/.bat shims)
     assert codex.doctor_command()[-1] == '--version'
-    assert 'model_reasoning_effort=xhigh' in codex.doctor_command()
+    assert 'gpt-6.2-sol' not in codex.doctor_command()
+    assert 'model_reasoning_effort=xhigh' not in codex.doctor_command()
 
     # Default reasoning (None) passes no -c model_reasoning_effort flag
     codex_default = get_adapter('codex', model='gpt-6.2-sol', reasoning=None)
     assert '-c' not in codex_default.make_command(task=task, prompt='review')
 
-    # Injection / invalid chars rejected
+    # Shell/TOML injection in model or reasoning rejected
     with pytest.raises(ValueError, match='invalid reasoning'):
         get_adapter('codex', reasoning='high\nsandbox=danger')
+    with pytest.raises(ValueError, match='invalid model'):
+        get_adapter('codex', model='gpt-6&calc.exe')
 
     claude = get_adapter('claude-code', model='claude-opus-5.5', reasoning='max')
     assert isinstance(claude, ClaudeCodeAdapter)
@@ -283,10 +287,12 @@ def test_adapters_pass_reasoning_and_build_non_llm_doctor_commands():
     assert '--model' in c_cmd and 'claude-opus-5.5' in c_cmd
     assert '--effort' in c_cmd and 'max' in c_cmd
     assert claude.doctor_command()[-1] == '--version'
-    assert '--effort' in claude.doctor_command() and 'max' in claude.doctor_command()
+    assert 'claude-opus-5.5' not in claude.doctor_command()
 
     with pytest.raises(ValueError, match='invalid reasoning'):
         get_adapter('claude-code', reasoning='--dangerously-skip')
+    with pytest.raises(ValueError, match='invalid model'):
+        get_adapter('claude-code', model='sonnet|whoami')
 
     opencode = get_adapter('opencode', model='openai/gpt-6', reasoning='high')
     assert isinstance(opencode, OpenCodeAdapter)
@@ -296,10 +302,15 @@ def test_adapters_pass_reasoning_and_build_non_llm_doctor_commands():
     assert opencode.doctor_command()[-1] == '--version'
     assert 'run' not in opencode.doctor_command()
 
+    # OpenCode without model never passes #variant; adapter must reflect None
+    opencode_no_model = get_adapter('opencode', model=None, reasoning='high')
+    assert opencode_no_model.reasoning is None
+    assert opencode_no_model.variant is None
+
     copilot = get_adapter('copilot', model='gpt-4', reasoning='high')
     assert isinstance(copilot, CopilotAdapter)
     assert copilot.reasoning is None
-    assert copilot.doctor_command()[-1] == '--version'
+    assert copilot.doctor_command()[-2:] == ['copilot', '--help']
 
 
 # ── Config API: Explicit Null Reset, Effective Settings, and Check Agent ────
@@ -340,9 +351,11 @@ def test_config_save_distinguishes_omitted_vs_explicit_null_reset(isolated_confi
     assert 'reasoning' not in raw['backend']['codex']
     assert 'variant' not in raw['backend']['codex']
 
-    # Backward-compatible variant field still works
+    # Backward-compatible variant field: explicit variant: null preserves saved reasoning!
     r4 = client.post('/api/config/save', json={'backend': 'opencode', 'model': 'openai/gpt-6', 'variant': 'high'})
     assert r4.status_code == 200
+    r4_legacy = client.post('/api/config/save', json={'backend': 'opencode', 'model': 'openai/gpt-6', 'variant': None})
+    assert r4_legacy.status_code == 200
     cur4 = client.get('/api/config/current').json()['config']
     assert cur4['backend'] == 'opencode'
     assert cur4['reasoning'] == 'high'
@@ -351,7 +364,9 @@ def test_config_save_distinguishes_omitted_vs_explicit_null_reset(isolated_confi
     assert cur4['per_backend']['codex']['model'] == 'gpt-6.1-terra'
 
 
-def test_config_effective_and_check_agent_endpoints(tmp_path, isolated_config, monkeypatch):
+def test_config_effective_and_check_agent_endpoints(git_repo, tmp_path, isolated_config, monkeypatch):
+    from app.core.backend_detector import BackendInfo
+
     client = _config_client()
     save_global_config({
         'backend': {
@@ -359,11 +374,9 @@ def test_config_effective_and_check_agent_endpoints(tmp_path, isolated_config, m
             'codex': {'model': 'gpt-6.2-sol', 'reasoning': 'high'},
         }
     })
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    (repo / '.amc.yaml').write_text('backend:\n  codex:\n    reasoning: xhigh\n', encoding='utf-8')
+    (git_repo / '.amc.yaml').write_text('backend:\n  codex:\n    reasoning: xhigh\n', encoding='utf-8')
 
-    eff = client.get('/api/config/effective', params={'repo_path': str(repo)})
+    eff = client.get('/api/config/effective', params={'repo_path': str(git_repo)})
     assert eff.status_code == 200
     body = eff.json()
     assert body['backend'] == 'codex'
@@ -372,15 +385,39 @@ def test_config_effective_and_check_agent_endpoints(tmp_path, isolated_config, m
     assert body['sources']['model'] == 'global'
     assert body['sources']['reasoning'] == 'repo'
 
-    # Check agent runs static doctor_command without calling LLM
+    # Non-git directory rejected by /effective
+    non_git = tmp_path / 'not_a_repo'
+    non_git.mkdir()
+    assert client.get('/api/config/effective', params={'repo_path': str(non_git)}).status_code == 400
+
+    # Copilot /effective matches actual adapter behavior (reasoning degraded to None)
+    eff_cop = client.get('/api/config/effective', params={'backend': 'copilot', 'reasoning': 'high'})
+    assert eff_cop.status_code == 200
+    assert eff_cop.json()['reasoning'] is None
+    assert eff_cop.json()['sources']['reasoning'] == 'unsupported'
+
+    # OpenCode without model degrades reasoning to None to match CLI argv
+    eff_oc = client.get('/api/config/effective', params={'backend': 'opencode', 'reasoning': 'high'})
+    assert eff_oc.status_code == 200
+    assert eff_oc.json()['reasoning'] is None
+
+    # Check agent runs fixed-arg static doctor_command and validates reasoning in-process
     seen_cmds: list[list[str]] = []
 
     def fake_run_text(cmd, timeout=15):
         seen_cmds.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout='codex-cli-exec 0.169.0\n', stderr='')
 
+    fake_codex_info = BackendInfo(
+        'codex', 'codex', 'codex-cli 0.169.0', ['gpt-6.2-sol'],
+        reasoning_supported=True,
+        reasoning_levels=['low', 'medium', 'high', 'xhigh'],
+        reasoning_source='cache',
+        model_reasoning={'gpt-6.2-sol': {'levels': ['low', 'high', 'xhigh'], 'default': 'low'}},
+    )
     monkeypatch.setattr(routes_config.shutil, 'which', lambda name: f'/usr/local/bin/{name}')
     monkeypatch.setattr(routes_config, 'run_text', fake_run_text)
+    monkeypatch.setattr(routes_config.BackendDetector, 'detect_backend', staticmethod(lambda _n: fake_codex_info))
 
     chk = client.post('/api/config/check-agent', json={
         'backend': 'codex',
@@ -391,13 +428,24 @@ def test_config_effective_and_check_agent_endpoints(tmp_path, isolated_config, m
     data = chk.json()
     assert data['ok'] is True
     assert data['exit_code'] == 0
-    assert 'model_reasoning_effort=xhigh' in data['command']
     assert data['command'][-1] == '--version'
+    # User-supplied model/reasoning must NOT be interpolated into doctor_command
+    assert 'gpt-6.2-sol' not in data['command']
     assert len(seen_cmds) == 1
 
-    # Invalid reasoning rejected with 422
-    bad = client.post('/api/config/check-agent', json={'backend': 'codex', 'reasoning': 'bad;rm'})
-    assert bad.status_code == 422
+    # Unknown reasoning level rejected with ok=False instead of false-positive pass
+    chk_bad_lvl = client.post('/api/config/check-agent', json={
+        'backend': 'codex',
+        'model': 'gpt-6.2-sol',
+        'reasoning': 'unknownlevel',
+    })
+    assert chk_bad_lvl.status_code == 200
+    assert chk_bad_lvl.json()['ok'] is False
+    assert 'unknownlevel' in chk_bad_lvl.json()['message']
+
+    # Invalid chars in reasoning or model rejected with 422
+    assert client.post('/api/config/check-agent', json={'backend': 'codex', 'reasoning': 'bad;rm'}).status_code == 422
+    assert client.post('/api/config/check-agent', json={'backend': 'codex', 'model': 'm&calc.exe'}).status_code == 422
 
 
 # ── Per-Round Agent/Model/Reasoning Switching End-to-End (Mocked CLI) ───────
@@ -551,3 +599,129 @@ def test_per_round_agent_model_reasoning_switching_and_explicit_null_reset(git_r
         ]
     finally:
         db.close()
+
+
+def test_env_vars_do_not_leak_when_switching_agents(tmp_path, isolated_config, monkeypatch):
+    save_global_config({
+        'backend': {
+            'default': 'codex',
+            'codex': {'model': 'gpt-global', 'reasoning': 'medium'},
+            'claude-code': {'model': 'sonnet', 'reasoning': 'medium'},
+        }
+    })
+    monkeypatch.setenv('AMC_MODEL', 'gpt-env')
+    monkeypatch.setenv('AMC_REASONING', 'xhigh')
+
+    # Same agent (codex) gets AMC_MODEL / AMC_REASONING
+    same = SettingsResolver.resolve(str(tmp_path), review_agent='codex')
+    assert same.model == 'gpt-env'
+    assert same.reasoning == 'xhigh'
+
+    # Switching round to claude-code must NOT inherit codex's AMC_MODEL / AMC_REASONING
+    switched = SettingsResolver.resolve(str(tmp_path), review_agent='codex', round_agent='claude-code')
+    assert switched.agent == 'claude-code'
+    assert switched.model == 'sonnet'
+    assert switched.reasoning == 'medium'
+    assert switched.sources['model'] == 'global'
+    assert switched.sources['reasoning'] == 'global'
+
+
+def test_sdk_constructor_params_do_not_override_per_round_switch_or_null_reset(git_repo, tmp_path, isolated_config):
+    from app.sdk import ReviewEngine
+
+    (git_repo / 'a.txt').write_text('sdk test\n', encoding='utf-8')
+    seen: list[tuple[str, str | None, str | None, str]] = []
+
+    class _PromptCapturingAdapter(_RecordingAdapter):
+        def make_command(self, *, task, prompt):
+            seen.append((self.name, self.model, self.reasoning, prompt))
+            return super().make_command(task=task, prompt=prompt)
+
+    engine = ReviewEngine(
+        db_path=str(tmp_path / 'sdk.db'),
+        runtime_root=str(tmp_path / 'rt'),
+        backend='codex',
+        model='gpt-constructor',
+        reasoning='high',
+    )
+    engine._execution.adapter_factory = (
+        lambda name, *, model=None, variant=None, reasoning=None: _PromptCapturingAdapter(
+            name, model=model, reasoning=reasoning if reasoning is not None else variant,
+        )
+    )
+
+    def _wait_idle(task_id: str) -> None:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if not engine._execution.is_active(task_id):
+                return
+            time.sleep(0.05)
+        pytest.fail('round did not finish in time')
+
+    try:
+        task = engine.create_task(str(git_repo))
+        assert task.model == 'gpt-constructor'
+        assert task.reasoning == 'high'
+
+        # Round 1: explicit null resets constructor model & reasoning to CLI/Model default
+        r1 = engine.start_review(task.id, model=None, reasoning=None)
+        _wait_idle(task.id)
+        assert r1.model is None
+        assert r1.reasoning is None
+
+        # Round 2: switch to claude-code with sonnet/low & per-round review_focus
+        r2 = engine._execution.start_task(
+            task.id,
+            backend='claude-code',
+            model='sonnet',
+            reasoning='low',
+            review_focus='sql-injection-only',
+        )
+        _wait_idle(task.id)
+        assert r2.backend == 'claude-code'
+        assert r2.model == 'sonnet'
+        assert r2.reasoning == 'low'
+
+        assert seen[0][:3] == ('codex', None, None)
+        assert seen[1][:3] == ('claude-code', 'sonnet', 'low')
+        assert 'sql-injection-only' in seen[1][3]
+    finally:
+        engine._db.close()
+
+
+def test_codex_detector_honors_codex_home_and_current_ignores_non_string_values(tmp_path, isolated_config, monkeypatch):
+    codex_home = tmp_path / 'custom_codex_home'
+    codex_home.mkdir()
+    (codex_home / 'models_cache.json').write_text(json.dumps({
+        'models': [
+            {
+                'slug': 'gpt-custom-home',
+                'visibility': 'list',
+                'default_reasoning_level': 'high',
+                'supported_reasoning_levels': ['low', 'high'],
+            }
+        ]
+    }), encoding='utf-8')
+    monkeypatch.setenv('CODEX_HOME', str(codex_home))
+    monkeypatch.setattr(
+        BackendDetector, '_run_command', staticmethod(lambda cmd, timeout=5: (True, 'codex-cli 0.169.0')),
+    )
+
+    info = BackendDetector._detect_codex()
+    assert info is not None
+    assert info.models == ['gpt-custom-home']
+    assert info.reasoning_default is None  # per-model default lives in model_reasoning
+    assert info.model_reasoning['gpt-custom-home'] == {'levels': ['low', 'high'], 'default': 'high'}
+
+    # Non-string values in YAML must never be stringified by /api/config/current
+    save_global_config({
+        'backend': {
+            'default': 'codex',
+            'codex': {'model': {'nested': 'secret'}, 'reasoning': 123},
+        }
+    })
+    cur = routes_config.get_current_config()['config']
+    assert cur['model'] is None
+    assert cur['reasoning'] is None
+    assert 'secret' not in str(cur)
+

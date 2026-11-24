@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import shutil
+import stat
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -159,15 +161,16 @@ def get_current_config():
         if not isinstance(selected, dict):
             selected = {}
 
+        def _clean_str(val: Any) -> str | None:
+            if not isinstance(val, str):
+                return None
+            return val.strip() or None
+
         def _entry_view(entry: Any) -> dict[str, str | None]:
             if not isinstance(entry, dict):
                 return {'model': None, 'reasoning': None, 'variant': None}
-            model_val = str(entry.get('model') or '').strip() or None
-            reasoning_val = (
-                str(entry.get('reasoning') or '').strip()
-                or str(entry.get('variant') or '').strip()
-                or None
-            )
+            model_val = _clean_str(entry.get('model'))
+            reasoning_val = _clean_str(entry.get('reasoning')) or _clean_str(entry.get('variant'))
             return {
                 'model': model_val,
                 'reasoning': reasoning_val,
@@ -191,6 +194,27 @@ def get_current_config():
         raise HTTPException(status_code=500, detail=f'Failed to load config: {str(e)}')
 
 
+def _validate_effective_repo_path(repo_path: str | None) -> str | None:
+    if repo_path is None or not repo_path.strip():
+        return None
+    root = Path(repo_path.strip())
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(status_code=400, detail='repo_path must be an existing directory')
+    resolved_root = root.resolve()
+    if not (resolved_root / '.git').exists():
+        raise HTTPException(status_code=400, detail='repo_path must be a git repository')
+    cfg_path = resolved_root / '.amc.yaml'
+    if cfg_path.exists() or cfg_path.is_symlink():
+        try:
+            resolved_cfg = cfg_path.resolve(strict=True)
+            st = resolved_cfg.stat()
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f'unreadable .amc.yaml: {exc}') from exc
+        if not resolved_cfg.is_relative_to(resolved_root) or not stat.S_ISREG(st.st_mode):
+            raise HTTPException(status_code=400, detail='.amc.yaml must be a regular file inside repo_path')
+    return str(resolved_root)
+
+
 @router.get('/effective')
 def get_effective_settings(
     repo_path: str | None = None,
@@ -199,9 +223,10 @@ def get_effective_settings(
     reasoning: str | None = None,
 ):
     """Preview effective settings and the layer each value came from."""
+    safe_repo = _validate_effective_repo_path(repo_path)
     try:
         resolved = SettingsResolver.resolve(
-            repo_path,
+            safe_repo,
             round_agent=backend if backend is not None else UNSET,
             round_model=model if model is not None else UNSET,
             round_reasoning=reasoning if reasoning is not None else UNSET,
@@ -213,13 +238,15 @@ def get_effective_settings(
             'reasoning': resolved.reasoning,
             'sources': resolved.sources,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Failed to resolve effective settings: {str(e)}')
 
 
 @router.post('/check-agent', response_model=CheckAgentResponse)
 def check_agent(request: CheckAgentRequest):
-    """Run a strictly non-LLM static CLI probe with the selected model and reasoning."""
+    """Run a strictly non-LLM static CLI probe and in-process setting validation."""
     backend_name = request.backend.strip()
     if not backend_name:
         raise HTTPException(status_code=400, detail='backend is required')
@@ -234,6 +261,7 @@ def check_agent(request: CheckAgentRequest):
 
     executable = adapter.executable_name()
     cmd = adapter.doctor_command()
+    effective_reasoning = adapter.reasoning if adapter.supports_reasoning else None
     if not shutil.which(executable):
         return CheckAgentResponse(
             ok=False,
@@ -242,8 +270,8 @@ def check_agent(request: CheckAgentRequest):
             command=cmd,
             exit_code=None,
             message=f'Executable `{executable}` was not found on PATH.',
-            model=model_val,
-            reasoning=adapter.reasoning if adapter.supports_reasoning else None,
+            model=adapter.model,
+            reasoning=effective_reasoning,
         )
 
     try:
@@ -256,8 +284,8 @@ def check_agent(request: CheckAgentRequest):
             command=cmd,
             exit_code=None,
             message=f'Static probe timed out after 15s: {" ".join(cmd)}',
-            model=model_val,
-            reasoning=adapter.reasoning if adapter.supports_reasoning else None,
+            model=adapter.model,
+            reasoning=effective_reasoning,
         )
     except OSError as exc:
         return CheckAgentResponse(
@@ -267,26 +295,65 @@ def check_agent(request: CheckAgentRequest):
             command=cmd,
             exit_code=None,
             message=f'Failed to launch `{executable}`: {exc}',
-            model=model_val,
-            reasoning=adapter.reasoning if adapter.supports_reasoning else None,
+            model=adapter.model,
+            reasoning=effective_reasoning,
         )
 
     stdout = (result.stdout or '').strip()
     stderr = (result.stderr or '').strip()
     detail = (stdout.splitlines()[0] if stdout else '') or (stderr.splitlines()[0] if stderr else '')
-    if result.returncode == 0:
-        msg = detail or f'{backend_name} static check passed.'
-    else:
+    if result.returncode != 0:
         msg = stderr or stdout or f'Exited with code {result.returncode}'
+        return CheckAgentResponse(
+            ok=False,
+            backend=backend_name,
+            executable=executable,
+            command=cmd,
+            exit_code=result.returncode,
+            message=msg,
+            model=adapter.model,
+            reasoning=effective_reasoning,
+        )
+
+    # Validate requested reasoning against locally known CLI/cache capabilities
+    # because `--version` short-circuits before CLI flags validate effort names.
+    if effective_reasoning is not None:
+        detected = BackendDetector.detect_backend(backend_name)
+        if detected is not None:
+            allowed: list[str] = []
+            if adapter.model and adapter.model in detected.model_reasoning:
+                allowed = list(detected.model_reasoning[adapter.model].get('levels') or [])
+            elif detected.reasoning_levels:
+                allowed = list(detected.reasoning_levels)
+            if allowed and effective_reasoning not in allowed:
+                target = f'{backend_name} / {adapter.model}' if adapter.model else backend_name
+                return CheckAgentResponse(
+                    ok=False,
+                    backend=backend_name,
+                    executable=executable,
+                    command=cmd,
+                    exit_code=result.returncode,
+                    message=(
+                        f'CLI check passed ({detail or backend_name}), but reasoning level '
+                        f'{effective_reasoning!r} is not in detected levels for {target}: '
+                        f'{", ".join(allowed)}.'
+                    ),
+                    model=adapter.model,
+                    reasoning=effective_reasoning,
+                )
+
+    msg = detail or f'{backend_name} static check passed.'
+    if reasoning_val and not adapter.supports_reasoning:
+        msg = f'{msg} (note: {backend_name} ignores reasoning effort and uses its CLI default)'
     return CheckAgentResponse(
-        ok=result.returncode == 0,
+        ok=True,
         backend=backend_name,
         executable=executable,
         command=cmd,
         exit_code=result.returncode,
         message=msg,
-        model=model_val,
-        reasoning=adapter.reasoning if adapter.supports_reasoning else None,
+        model=adapter.model,
+        reasoning=effective_reasoning,
     )
 
 
@@ -333,8 +400,11 @@ def save_config(request: SaveConfigRequest):
                     else:
                         selected.pop('reasoning', None)
                         selected.pop('variant', None)
-                elif 'variant' in fields:
-                    cleaned_variant = (request.variant or '').strip()
+                elif 'variant' in fields and request.variant is not None:
+                    # Legacy alias compatibility: `variant: null` preserves the
+                    # existing saved value (only `reasoning: null` performs an
+                    # explicit reset).
+                    cleaned_variant = request.variant.strip()
                     if cleaned_variant:
                         selected['variant'] = cleaned_variant
                         selected['reasoning'] = cleaned_variant

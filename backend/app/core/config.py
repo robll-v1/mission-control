@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+_MAX_CONFIG_BYTES = 1_048_576  # 1 MiB guard against special/oversized files
 
 
 class ConfigError(RuntimeError):
@@ -122,6 +125,11 @@ def _load_yaml_file(path: Path, *, strict: bool = False) -> dict[str, Any]:
     file as empty and saving over it destroys the user's content.
     """
     try:
+        st = path.stat()
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f'not a regular file: {path}')
+        if st.st_size > _MAX_CONFIG_BYTES:
+            raise OSError(f'config file exceeds {_MAX_CONFIG_BYTES} bytes: {path}')
         loaded = yaml.safe_load(path.read_text(encoding='utf-8'))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         if strict:
@@ -252,6 +260,7 @@ class SettingsResolver:
         repo_default_agent = _clean_opt(repo_section.get('default'))
 
         # 1. Resolve agent
+        configured_default_agent = repo_default_agent or global_default_agent or default_agent
         cleaned_round_agent = None if isinstance(round_agent, _UnsetType) else _clean_opt(round_agent)
         cleaned_review_agent = _clean_opt(review_agent)
         if cleaned_round_agent:
@@ -270,18 +279,26 @@ class SettingsResolver:
             selected_agent = default_agent
             agent_source = 'default'
 
-        # Cross-agent guard: review-level model/reasoning only apply if the
-        # selected agent still matches the review's agent.
+        # Cross-agent guard:
+        # - Review-level model/reasoning only apply when the selected agent
+        #   still matches the review's agent.
+        # - AMC_MODEL / AMC_REASONING belong to AMC_BACKEND (when set) or the
+        #   base agent (review agent, else configured default). Switching to a
+        #   different agent must NOT carry over another agent's env vars.
         review_matches_agent = (
             cleaned_review_agent is not None and cleaned_review_agent == selected_agent
         )
         effective_review_model = _clean_opt(review_model) if review_matches_agent else None
         effective_review_reasoning = _clean_opt(review_reasoning) if review_matches_agent else None
 
+        base_agent = cleaned_review_agent or configured_default_agent
+        env_owner_agent = _clean_opt(os.environ.get('AMC_BACKEND', '')) or base_agent
+        env_applies = selected_agent == env_owner_agent
+
         repo_agent_cfg = _extract_agent_entry(repo_section, selected_agent)
         global_agent_cfg = _extract_agent_entry(global_section, selected_agent)
-        env_model = _clean_opt(os.environ.get('AMC_MODEL', ''))
-        env_reasoning = _clean_opt(os.environ.get('AMC_REASONING', ''))
+        env_model = _clean_opt(os.environ.get('AMC_MODEL', '')) if env_applies else None
+        env_reasoning = _clean_opt(os.environ.get('AMC_REASONING', '')) if env_applies else None
 
         # 2. Resolve model
         if not isinstance(round_model, _UnsetType):
@@ -322,6 +339,16 @@ class SettingsResolver:
         else:
             resolved_reasoning = None
             reasoning_source = 'default'
+
+        # Unify effective reasoning with what the adapter can actually pass on
+        # the CLI so /effective preview, Run records, and CLI argv agree.
+        if resolved_reasoning is not None:
+            if selected_agent == 'copilot':
+                resolved_reasoning = None
+                reasoning_source = 'unsupported'
+            elif selected_agent == 'opencode' and resolved_model is None:
+                resolved_reasoning = None
+                reasoning_source = 'default'
 
         # 4. Resolve language
         cleaned_round_lang = None if isinstance(round_language, _UnsetType) else _clean_opt(round_language)

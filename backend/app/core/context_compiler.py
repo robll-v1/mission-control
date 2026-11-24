@@ -837,6 +837,15 @@ class ContextCompiler:
             '- Service startup: disabled by default',
             '- Build/test execution: disabled by default',
             '',
+        ]
+        review_focus = str(task.get('review_focus') or '').strip()
+        if review_focus:
+            lines.extend([
+                '## Review Focus',
+                review_focus,
+                '',
+            ])
+        lines.extend([
             '## Review Brief',
             task['description'] or '(empty)',
             '',
@@ -848,7 +857,7 @@ class ContextCompiler:
             f'- Existing Comments: {review.get("comment_count", 0)}',
             '',
             '### Changed Files',
-        ]
+        ])
         changed_files = review.get('changed_files', []) or []
         if changed_files:
             lines.extend(f'- {item}' for item in changed_files)

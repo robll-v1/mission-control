@@ -96,6 +96,9 @@ class ExecutionService:
         artifacts: ArtifactStore,
         contexts: ContextCompiler,
         adapter_factory=None,
+        default_backend: str | None = None,
+        default_model: str | None = None,
+        default_reasoning: str | None = None,
     ):
         self.db = db
         self.mission = mission
@@ -104,6 +107,9 @@ class ExecutionService:
         self.artifacts = artifacts
         self.contexts = contexts
         self.adapter_factory = adapter_factory
+        self._default_backend = default_backend
+        self._default_model = default_model
+        self._default_reasoning = default_reasoning
         self._lock = threading.Lock()
         self._active: dict[str, ActiveProcess] = {}
 
@@ -128,6 +134,20 @@ class ExecutionService:
         task = self.db.get_task(task_id)
         if task is None:
             raise KeyError(f'task not found: {task_id}')
+        # If the execution service carries constructor-level defaults (e.g.
+        # ReviewEngine(backend=..., model=..., reasoning=...)) and the task did
+        # not record its own model/reasoning, apply them at the review layer
+        # only when the task's backend matches (SettingsResolver then handles
+        # explicit round overrides and cross-agent isolation cleanly).
+        default_matches_task = (
+            self._default_backend is None or self._default_backend == task.backend
+        )
+        eff_review_model = task.model if task.model is not None else (
+            self._default_model if default_matches_task else None
+        )
+        eff_review_reasoning = task.reasoning if task.reasoning is not None else (
+            self._default_reasoning if default_matches_task else None
+        )
         settings = SettingsResolver.resolve(
             task.repo_path,
             round_agent=backend,
@@ -137,8 +157,8 @@ class ExecutionService:
             round_focus=review_focus,
             round_note=review_note,
             review_agent=task.backend,
-            review_model=task.model,
-            review_reasoning=task.reasoning,
+            review_model=eff_review_model,
+            review_reasoning=eff_review_reasoning,
             review_language=task.language,
             review_focus=task.review_focus,
         )
@@ -184,6 +204,8 @@ class ExecutionService:
         kwargs: dict[str, Any] = {'model': settings.model, 'variant': settings.reasoning}
         if accepts_varkw or 'reasoning' in params:
             kwargs['reasoning'] = settings.reasoning
+        if accepts_varkw or '_resolved' in params:
+            kwargs['_resolved'] = True
         return self.adapter_factory(settings.agent, **kwargs)
 
     @staticmethod
@@ -247,20 +269,23 @@ class ExecutionService:
         branch_name, worktree_path, revision = self.worktrees.ensure_worktree(task)
         task.branch_name = branch_name
         task.worktree_path = worktree_path
+        # Compile context & build prompt with this round's effective backend
+        # and review_focus so per-round focus overrides actually enter the prompt.
+        round_task = task.model_copy(
+            update={
+                'backend': effective_settings.agent,
+                'review_focus': effective_settings.focus,
+            }
+        )
         compile_started_at = time.perf_counter()
-        compiled = self.contexts.compile_task(task, worktree_path=worktree_path)
+        compiled = self.contexts.compile_task(round_task, worktree_path=worktree_path)
         compile_context_ms = int((time.perf_counter() - compile_started_at) * 1000)
         prompt_build_ms = 0
         prompt_text = prompt
         if prompt_text is None:
             prompt_started_at = time.perf_counter()
-            prompt_task = (
-                task.model_copy(update={'review_focus': effective_settings.focus})
-                if effective_settings.focus != task.review_focus
-                else task
-            )
             prompt_text = self.contexts.build_prompt(
-                prompt_task, compiled, review_note=review_note, language=language,
+                round_task, compiled, review_note=review_note, language=language,
             )
             prompt_build_ms = int((time.perf_counter() - prompt_started_at) * 1000)
         prepare_metrics = {

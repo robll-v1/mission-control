@@ -3,23 +3,15 @@
 from __future__ import annotations
 
 import json
-import re
 
-from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable
+from app.adapters.base import (
+    AdapterEvent,
+    RunnerAdapter,
+    resolve_executable,
+    validate_model_name,
+    validate_reasoning_level,
+)
 from app.core.models import Task
-
-_SAFE_EFFORT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$')
-
-
-def _validate_effort(value: str | None) -> str | None:
-    if value is None:
-        return None
-    cleaned = value.strip()
-    if not cleaned:
-        return None
-    if not _SAFE_EFFORT_RE.fullmatch(cleaned):
-        raise ValueError(f'invalid reasoning effort value: {value!r}')
-    return cleaned
 
 
 class ClaudeCodeAdapter(RunnerAdapter):
@@ -28,8 +20,8 @@ class ClaudeCodeAdapter(RunnerAdapter):
     supports_reasoning = True
 
     def __init__(self, model: str | None = None, variant: str | None = None, reasoning: str | None = None):
-        self.model = model
-        eff = _validate_effort(reasoning if reasoning is not None else variant)
+        self.model = validate_model_name(model)
+        eff = validate_reasoning_level(reasoning if reasoning is not None else variant)
         self.reasoning = eff
         self.variant = eff
 
@@ -45,7 +37,9 @@ class ClaudeCodeAdapter(RunnerAdapter):
         return [resolve_executable('claude'), *self._selection_args(), '--version']
 
     def doctor_command(self) -> list[str]:
-        return [resolve_executable('claude'), *self._selection_args(), '--version']
+        # Fixed arguments only: avoids passing HTTP parameters into Windows
+        # .cmd/.bat wrappers; model and reasoning are validated in-process.
+        return [resolve_executable('claude'), '--version']
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         work_dir = task.worktree_path or task.repo_path

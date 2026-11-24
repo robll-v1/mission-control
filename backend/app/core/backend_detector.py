@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -521,12 +522,36 @@ class BackendDetector:
         )
 
     @staticmethod
+    def detect_backend(name: str) -> BackendInfo | None:
+        """Detect a single backend by name without probing unrelated CLIs."""
+        mapping = {
+            'opencode': ('opencode', BackendDetector._detect_opencode),
+            'claude-code': ('claude', BackendDetector._detect_claude_code),
+            'copilot': ('gh', BackendDetector._detect_copilot),
+            'codex': ('codex', BackendDetector._detect_codex),
+        }
+        spec = mapping.get(name)
+        if spec is None:
+            return None
+        cmd, fn = spec
+        if not shutil.which(cmd):
+            return None
+        return BackendDetector._detect_safely(name, cmd, fn)
+
+    @staticmethod
+    def _codex_home() -> Path:
+        raw = os.environ.get('CODEX_HOME', '').strip()
+        if raw:
+            return Path(raw).expanduser()
+        return Path.home() / '.codex'
+
+    @staticmethod
     def _probe_codex_reasoning() -> tuple[
         bool, list[str], str | None, str, str | None, dict[str, dict[str, Any]]
     ]:
-        """Read per-model reasoning levels from ~/.codex/models_cache.json."""
+        """Read per-model reasoning levels from $CODEX_HOME/models_cache.json."""
         canonical_order = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
-        cache_path = Path.home() / '.codex' / 'models_cache.json'
+        cache_path = BackendDetector._codex_home() / 'models_cache.json'
         if not cache_path.exists():
             return (
                 False,
@@ -553,7 +578,6 @@ class BackendDetector:
 
         model_reasoning: dict[str, dict[str, Any]] = {}
         union_levels: list[str] = []
-        first_default: str | None = None
         if isinstance(data, dict) and isinstance(data.get('models'), list):
             for model in data['models']:
                 if not isinstance(model, dict):
@@ -581,8 +605,6 @@ class BackendDetector:
                 )
                 if levels:
                     model_reasoning[slug] = {'levels': levels, 'default': default_level}
-                    if first_default is None and default_level:
-                        first_default = default_level
                     for lvl in levels:
                         if lvl not in union_levels:
                             union_levels.append(lvl)
@@ -601,10 +623,12 @@ class BackendDetector:
         ordered_levels = [lvl for lvl in canonical_order if lvl in union_levels] + [
             lvl for lvl in union_levels if lvl not in canonical_order
         ]
+        # Backend-level default is None because Codex defaults vary per model
+        # (callers should read model_reasoning[slug]['default']).
         return (
             True,
             ordered_levels,
-            first_default,
+            None,
             BackendInfo.REASONING_SOURCE_CACHE,
             "Read from Codex's local models_cache.json (passed via `-c model_reasoning_effort=<level>`).",
             model_reasoning,
@@ -616,10 +640,11 @@ class BackendDetector:
         # First try models_cache.json (written by Codex itself). A well-formed
         # file can still carry the wrong structure (models: null, slug: null),
         # so validate shapes instead of trusting the JSON to be typed.
-        cache_path = Path.home() / '.codex' / 'models_cache.json'
+        codex_home = BackendDetector._codex_home()
+        cache_path = codex_home / 'models_cache.json'
         if cache_path.exists():
             try:
-                with open(cache_path, 'r') as f:
+                with open(cache_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 models = []
                 if isinstance(data, dict) and isinstance(data.get('models'), list):
@@ -645,7 +670,7 @@ class BackendDetector:
         # real TOML — line-prefix matching misread model_provider="my-proxy"
         # and model_reasoning_effort as model names and swallowed inline
         # comments. Only the top-level `model` key counts.
-        config_path = Path.home() / '.codex' / 'config.toml'
+        config_path = codex_home / 'config.toml'
         if config_path.exists():
             try:
                 import tomllib

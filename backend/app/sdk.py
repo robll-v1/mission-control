@@ -129,18 +129,41 @@ class ReviewEngine:
             worktrees=self._worktrees,
             artifacts=self._artifacts,
             contexts=self._contexts,
-            adapter_factory=lambda name, *, model=None, variant=None, reasoning=None: get_adapter(
-                name,
-                model=self._explicit_model or model,
-                variant=self._explicit_reasoning or variant,
-                reasoning=self._explicit_reasoning or reasoning,
-            ),
+            default_backend=self._explicit_backend,
+            default_model=self._explicit_model,
+            default_reasoning=self._explicit_reasoning,
+            adapter_factory=self._make_adapter,
         )
         self._validation = ValidationService(
             db=self._db,
             mission=self._engine,
             artifacts=self._artifacts,
         )
+
+    def _make_adapter(
+        self,
+        name: str,
+        *,
+        model: str | None = None,
+        variant: str | None = None,
+        reasoning: str | None = None,
+        _resolved: bool = False,
+    ):
+        # ExecutionService already resolves constructor defaults, per-round
+        # overrides, explicit None resets, and cross-agent isolation via
+        # SettingsResolver (`_resolved=True`). Direct callers of
+        # `adapter_factory(name, model=..., variant=...)` still get the
+        # constructor-level explicit overrides for the configured backend.
+        if _resolved:
+            return get_adapter(name, model=model, variant=variant, reasoning=reasoning)
+        matches_explicit = self._explicit_backend is None or self._explicit_backend == name
+        eff_model = (self._explicit_model or model) if matches_explicit else model
+        eff_reasoning = (
+            (self._explicit_reasoning if self._explicit_reasoning is not None else (reasoning if reasoning is not None else variant))
+            if matches_explicit
+            else (reasoning if reasoning is not None else variant)
+        )
+        return get_adapter(name, model=eff_model, variant=eff_reasoning, reasoning=eff_reasoning)
 
     def _resolve_model(self, repo_path: str = '.') -> str | None:
         """Resolve the model from env var or merged config.
@@ -211,6 +234,9 @@ class ReviewEngine:
             source_type='pull_request',
             source_url=pr_url,
             backend=self.backend_name,
+            model=self._explicit_model,
+            reasoning=self._explicit_reasoning,
+            language=self.language,
             review_focus=review_focus,
             pr_owner=pull_request.owner,
             pr_repo=pull_request.repo,
@@ -257,6 +283,9 @@ class ReviewEngine:
             source_type='local_diff',
             source_url=None,
             backend=self.backend_name,
+            model=self._explicit_model,
+            reasoning=self._explicit_reasoning,
+            language=self.language,
             review_focus=review_focus,
             pr_base_ref=local.base_branch,
             review_paths=local.changed_files,
