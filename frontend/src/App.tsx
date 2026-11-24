@@ -403,6 +403,7 @@ export function App() {
   const startTrackerRef = useRef(new StartTracker())
   const findingSeqRef = useRef<Map<string, number>>(new Map())
   const streamEventsByTaskRef = useRef<Map<string, EventRecord[]>>(new Map())
+  const streamOverflowCutoffByTaskRef = useRef<Map<string, number>>(new Map())
   const [startingTaskIds, setStartingTaskIds] = useState<string[]>([])
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'light'
@@ -486,9 +487,9 @@ export function App() {
     try {
       const data = normalizeTaskDetail(await api<TaskDetailResponse>(`/api/tasks/${taskId}`))
       if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
+      const rawMaxFetchedSeq = data.events.reduce((max, ev) => Math.max(max, ev.seq), 0)
       const buffered = streamEventsByTaskRef.current.get(taskId) ?? []
       if (buffered.length > 0) {
-        const rawMaxFetchedSeq = data.events.reduce((max, ev) => Math.max(max, ev.seq), 0)
         const merged = mergeEventLists(data.events, data.importantEvents, buffered)
         data.events = merged.events
         data.importantEvents = merged.importantEvents
@@ -501,7 +502,28 @@ export function App() {
           streamEventsByTaskRef.current.delete(taskId)
         }
       }
-      setDetail(data)
+      setDetail((prev) => {
+        if (prev && prev.task.id === taskId && prev.events.length > 0) {
+          const mergedWithPrev = mergeEventLists(data.events, data.importantEvents, prev.events)
+          return {
+            ...data,
+            events: mergedWithPrev.events,
+            importantEvents: mergedWithPrev.importantEvents,
+            eventStats: mergedWithPrev.eventStats,
+          }
+        }
+        return data
+      })
+      // If the bounded SSE buffer evicted older events while this GET snapshot
+      // was stale (rawMaxFetchedSeq < evictedSeq), trigger one silent resync to
+      // recover the full contiguous event history from the server.
+      const overflowCutoff = streamOverflowCutoffByTaskRef.current.get(taskId) ?? 0
+      if (overflowCutoff > 0) {
+        streamOverflowCutoffByTaskRef.current.delete(taskId)
+        if (rawMaxFetchedSeq < overflowCutoff && selectedTaskIdRef.current === taskId) {
+          void loadTask(taskId, { silent: true })
+        }
+      }
     } catch (err) {
       if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
       if (!options?.silent) {
@@ -626,10 +648,20 @@ export function App() {
       }
       // Buffer per task so events arriving before initial loadTask finishes (or
       // while a stale GET snapshot is in flight) are never dropped or overwritten.
+      // If the 500-event cap evicts an older item, record the evicted max seq so
+      // loadTask triggers a silent resync if its snapshot predated the eviction.
       const prevBuf = streamEventsByTaskRef.current.get(selectedTaskId) ?? []
       if (!prevBuf.some((ev) => ev.seq === parsed.seq || ev.id === parsed.id)) {
-        const nextBuf = [...prevBuf, parsed].slice(-500)
-        streamEventsByTaskRef.current.set(selectedTaskId, nextBuf)
+        const combined = [...prevBuf, parsed]
+        if (combined.length > 500) {
+          const evicted = combined.slice(0, combined.length - 500)
+          const evictedMax = evicted.reduce((max, ev) => Math.max(max, ev.seq), 0)
+          const prevCutoff = streamOverflowCutoffByTaskRef.current.get(selectedTaskId) ?? 0
+          streamOverflowCutoffByTaskRef.current.set(selectedTaskId, Math.max(prevCutoff, evictedMax))
+          streamEventsByTaskRef.current.set(selectedTaskId, combined.slice(-500))
+        } else {
+          streamEventsByTaskRef.current.set(selectedTaskId, combined)
+        }
       }
       setDetail((prev) => {
         if (!prev || prev.task.id !== selectedTaskId) return prev

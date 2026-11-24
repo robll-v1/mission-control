@@ -130,13 +130,20 @@ async def lifespan(app: FastAPI):
                 if callable(prev):
                     prev_sig_handlers[sig] = prev
 
-                    def _make_sig_handler(previous):
+                    def _make_sig_handler(previous, target_loop):
                         def _handler(signum, frame):
-                            engine.event_bus.close_all()
+                            # Never acquire EventBus._lock synchronously inside a
+                            # signal handler (could self-deadlock if the signal
+                            # interrupted subscribe()/unsubscribe() on this thread).
+                            # Schedule close_all() onto the event loop instead.
+                            try:
+                                target_loop.call_soon_threadsafe(engine.event_bus.close_all)
+                            except RuntimeError:
+                                pass
                             previous(signum, frame)
                         return _handler
 
-                    signal.signal(sig, _make_sig_handler(prev))
+                    signal.signal(sig, _make_sig_handler(prev, loop))
             except (OSError, ValueError):
                 pass
     try:
