@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import signal
@@ -92,30 +93,50 @@ _prune_startup_worktrees()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Graceful shutdown: wake open SSE streams on SIGTERM/SIGINT and abort active tasks."""
-    prev_handlers: dict[int, object] = {}
+    prev_sig_handlers: dict[int, object] = {}
+    prev_loop_handlers: dict[int, tuple] = {}
     if threading.current_thread() is threading.main_thread():
         # Uvicorn waits for active StreamingResponses to end BEFORE invoking
-        # lifespan teardown; chain SIGINT/SIGTERM to close_all() first so open
-        # SSE connections terminate immediately instead of stalling shutdown.
+        # lifespan teardown. Hook Uvicorn's installed signal handler (via
+        # asyncio loop signal handlers on POSIX, or callable signal.signal
+        # handlers on Windows) so open SSE streams close immediately while
+        # Uvicorn still runs full graceful teardown (exit code 0).
+        loop = asyncio.get_running_loop()
+        loop_handlers = getattr(loop, '_signal_handlers', None)
         sigs = [signal.SIGINT]
         if hasattr(signal, 'SIGTERM'):
             sigs.append(signal.SIGTERM)
         for sig in sigs:
+            if isinstance(loop_handlers, dict) and sig in loop_handlers:
+                handle = loop_handlers[sig]
+                orig_cb = getattr(handle, '_callback', None)
+                orig_args = getattr(handle, '_args', ())
+                if callable(orig_cb):
+                    prev_loop_handlers[sig] = (orig_cb, orig_args)
+
+                    def _make_loop_cb(cb, args):
+                        def _cb():
+                            engine.event_bus.close_all()
+                            cb(*args)
+                        return _cb
+
+                    try:
+                        loop.add_signal_handler(sig, _make_loop_cb(orig_cb, orig_args))
+                        continue
+                    except (NotImplementedError, RuntimeError, ValueError):
+                        prev_loop_handlers.pop(sig, None)
             try:
                 prev = signal.getsignal(sig)
-                prev_handlers[sig] = prev
+                if callable(prev):
+                    prev_sig_handlers[sig] = prev
 
-                def _make_handler(previous):
-                    def _handler(signum, frame):
-                        engine.event_bus.close_all()
-                        if callable(previous):
+                    def _make_sig_handler(previous):
+                        def _handler(signum, frame):
+                            engine.event_bus.close_all()
                             previous(signum, frame)
-                        elif previous == signal.SIG_DFL:
-                            signal.signal(signum, signal.SIG_DFL)
-                            os.kill(os.getpid(), signum)
-                    return _handler
+                        return _handler
 
-                signal.signal(sig, _make_handler(prev))
+                    signal.signal(sig, _make_sig_handler(prev))
             except (OSError, ValueError):
                 pass
     try:
@@ -132,7 +153,14 @@ async def lifespan(app: FastAPI):
                     logger.info('Aborted task %s', task_id)
                 except Exception:
                     logger.exception('Failed to abort task %s during shutdown', task_id)
-        for sig, prev in prev_handlers.items():
+        if prev_loop_handlers:
+            try:
+                loop = asyncio.get_running_loop()
+                for sig, (orig_cb, orig_args) in prev_loop_handlers.items():
+                    loop.add_signal_handler(sig, orig_cb, *orig_args)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+        for sig, prev in prev_sig_handlers.items():
             try:
                 signal.signal(sig, prev)
             except (OSError, ValueError):
