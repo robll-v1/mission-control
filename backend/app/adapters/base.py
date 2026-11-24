@@ -44,6 +44,8 @@ class RunnerAdapter(ABC):
     #: ``claude-code`` runs ``claude``, ``copilot`` runs ``gh``. Preflight must
     #: probe *this*, not :attr:`name`.
     executable: str = ''
+    #: Whether this adapter forwards a reasoning effort level to its CLI.
+    supports_reasoning: bool = False
 
     @abstractmethod
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
@@ -63,6 +65,14 @@ class RunnerAdapter(ABC):
         credentials problem.
         """
         return None
+
+    def doctor_command(self) -> list[str]:
+        """Strictly non-LLM static command for `Check agent` / `amc doctor`.
+
+        Validates executable and CLI flag parsing (including selected model and
+        reasoning flags when supported) without making any model/network call.
+        """
+        return [resolve_executable(self.executable_name()), '--version']
 
     def parse_stdout_line(self, line: str) -> list[AdapterEvent]:
         stripped = line.strip()

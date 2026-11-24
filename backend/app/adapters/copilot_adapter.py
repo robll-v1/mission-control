@@ -11,14 +11,20 @@ from app.core.models import Task
 class CopilotAdapter(RunnerAdapter):
     name = 'copilot'
     executable = 'gh'
+    supports_reasoning = False
 
-    def __init__(self, model: str | None = None, variant: str | None = None):
+    def __init__(self, model: str | None = None, variant: str | None = None, reasoning: str | None = None):
         self.model = model
-        self.variant = variant
+        # Copilot CLI does not expose reasoning effort; degrade cleanly to CLI default.
+        self.variant = None
+        self.reasoning = None
 
     def probe_command(self) -> list[str] | None:
         # `gh copilot --version` would need the extension installed; checking gh
         # itself is the most we can assert cheaply and without side effects.
+        return [resolve_executable('gh'), '--version']
+
+    def doctor_command(self) -> list[str]:
         return [resolve_executable('gh'), '--version']
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:

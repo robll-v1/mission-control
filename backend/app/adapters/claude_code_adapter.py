@@ -3,21 +3,49 @@
 from __future__ import annotations
 
 import json
+import re
 
 from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable
 from app.core.models import Task
+
+_SAFE_EFFORT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$')
+
+
+def _validate_effort(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if not _SAFE_EFFORT_RE.fullmatch(cleaned):
+        raise ValueError(f'invalid reasoning effort value: {value!r}')
+    return cleaned
 
 
 class ClaudeCodeAdapter(RunnerAdapter):
     name = 'claude-code'
     executable = 'claude'
+    supports_reasoning = True
 
-    def __init__(self, model: str | None = None, variant: str | None = None):
+    def __init__(self, model: str | None = None, variant: str | None = None, reasoning: str | None = None):
         self.model = model
-        self.variant = variant
+        eff = _validate_effort(reasoning if reasoning is not None else variant)
+        self.reasoning = eff
+        self.variant = eff
+
+    def _selection_args(self) -> list[str]:
+        args: list[str] = []
+        if self.model:
+            args.extend(['--model', self.model])
+        if self.reasoning:
+            args.extend(['--effort', self.reasoning])
+        return args
 
     def probe_command(self) -> list[str] | None:
-        return [resolve_executable('claude'), '--version']
+        return [resolve_executable('claude'), *self._selection_args(), '--version']
+
+    def doctor_command(self) -> list[str]:
+        return [resolve_executable('claude'), *self._selection_args(), '--version']
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         work_dir = task.worktree_path or task.repo_path
@@ -27,9 +55,8 @@ class ClaudeCodeAdapter(RunnerAdapter):
             '--verbose',
             '--permission-mode', 'bypassPermissions',
             '--add-dir', work_dir,
+            *self._selection_args(),
         ]
-        if self.model:
-            cmd.extend(['--model', self.model])
         return cmd
 
     def parse_stdout_line(self, line: str) -> list[AdapterEvent]:

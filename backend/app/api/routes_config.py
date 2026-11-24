@@ -1,17 +1,32 @@
 """API routes for configuration management."""
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from __future__ import annotations
 
+import shutil
+import subprocess
+from typing import Any
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from app.adapters import get_adapter
 from app.core.backend_detector import BackendDetector, ModelFilter
 from app.core.config import (
     DEFAULT_CONFIG,
+    UNSET,
     ConfigError,
+    SettingsResolver,
     global_config_lock,
     load_global_config,
     save_global_config,
 )
+from app.core.proc import run_text
 
 router = APIRouter(prefix='/api/config', tags=['config'])
+
+
+class ModelReasoningResponse(BaseModel):
+    levels: list[str] = Field(default_factory=list)
+    default: str | None = None
 
 
 class BackendResponse(BaseModel):
@@ -30,6 +45,13 @@ class BackendResponse(BaseModel):
     # Enumeration never proves usability: detection makes no model calls, so
     # this stays false until a real review round has run that model.
     models_call_verified: bool = False
+    # P2 additive reasoning capabilities:
+    reasoning_supported: bool = False
+    reasoning_levels: list[str] = Field(default_factory=list)
+    reasoning_default: str | None = None
+    reasoning_source: str = 'unsupported'
+    reasoning_note: str | None = None
+    model_reasoning: dict[str, ModelReasoningResponse] = Field(default_factory=dict)
 
 
 class DetectResponse(BaseModel):
@@ -38,9 +60,15 @@ class DetectResponse(BaseModel):
 
 
 class SaveConfigRequest(BaseModel):
-    """Request model for saving configuration."""
+    """Request model for saving configuration.
+
+    Uses ``model_fields_set`` so callers can distinguish omitting a field
+    (keep existing saved value) from explicitly passing ``null`` / ``""``
+    (reset to CLI / Model default).
+    """
     backend: str
-    model: str
+    model: str | None = None
+    reasoning: str | None = None
     variant: str | None = None
 
 
@@ -51,13 +79,31 @@ class SaveConfigResponse(BaseModel):
     config_path: str | None = None
 
 
+class CheckAgentRequest(BaseModel):
+    """Request model for static CLI agent check (no LLM calls)."""
+    backend: str
+    model: str | None = None
+    reasoning: str | None = None
+
+
+class CheckAgentResponse(BaseModel):
+    ok: bool
+    backend: str
+    executable: str
+    command: list[str]
+    exit_code: int | None = None
+    message: str
+    model: str | None = None
+    reasoning: str | None = None
+
+
 @router.get('/detect', response_model=DetectResponse)
 def detect_backends():
     """Detect all available AI backends on the system.
 
     Returns:
-        List of detected backends with their versions and available models.
-        For backends with many models, they are filtered and grouped.
+        List of detected backends with their versions, available models, and
+        reasoning capabilities.
     """
     try:
         backends = BackendDetector.detect_all()
@@ -74,6 +120,18 @@ def detect_backends():
                     command=b.command,
                     model_count=len(b.models),
                     grouped_models=ModelFilter.group_models(b.models) if len(b.models) > 20 else None,
+                    reasoning_supported=b.reasoning_supported,
+                    reasoning_levels=b.reasoning_levels,
+                    reasoning_default=b.reasoning_default,
+                    reasoning_source=b.reasoning_source,
+                    reasoning_note=b.reasoning_note,
+                    model_reasoning={
+                        slug: ModelReasoningResponse(
+                            levels=list(info.get('levels') or []),
+                            default=info.get('default'),
+                        )
+                        for slug, info in b.model_reasoning.items()
+                    },
                 )
                 for b in backends
             ]
@@ -87,7 +145,8 @@ def get_current_config():
     """Get the current global configuration.
 
     Returns:
-        Current configuration or default config if none exists.
+        Current configuration (plus per-backend saved models/reasoning) or
+        default config if none exists.
     """
     try:
         config = load_global_config()
@@ -99,28 +158,150 @@ def get_current_config():
         selected = section.get(backend, {})
         if not isinstance(selected, dict):
             selected = {}
+
+        def _entry_view(entry: Any) -> dict[str, str | None]:
+            if not isinstance(entry, dict):
+                return {'model': None, 'reasoning': None, 'variant': None}
+            model_val = str(entry.get('model') or '').strip() or None
+            reasoning_val = (
+                str(entry.get('reasoning') or '').strip()
+                or str(entry.get('variant') or '').strip()
+                or None
+            )
+            return {
+                'model': model_val,
+                'reasoning': reasoning_val,
+                'variant': reasoning_val,
+            }
+
+        per_backend = {
+            key: _entry_view(val)
+            for key, val in section.items()
+            if key != 'default' and isinstance(val, dict)
+        }
+        selected_view = _entry_view(selected)
         return {'config': {
             'backend': backend,
-            'model': str(selected.get('model') or '').strip() or None,
-            'variant': str(selected.get('variant') or '').strip() or None,
+            'model': selected_view['model'],
+            'reasoning': selected_view['reasoning'],
+            'variant': selected_view['variant'],
+            'per_backend': per_backend,
         }}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Failed to load config: {str(e)}')
+
+
+@router.get('/effective')
+def get_effective_settings(
+    repo_path: str | None = None,
+    backend: str | None = None,
+    model: str | None = None,
+    reasoning: str | None = None,
+):
+    """Preview effective settings and the layer each value came from."""
+    try:
+        resolved = SettingsResolver.resolve(
+            repo_path,
+            round_agent=backend if backend is not None else UNSET,
+            round_model=model if model is not None else UNSET,
+            round_reasoning=reasoning if reasoning is not None else UNSET,
+        )
+        return {
+            'settings': resolved.model_dump(),
+            'backend': resolved.agent,
+            'model': resolved.model,
+            'reasoning': resolved.reasoning,
+            'sources': resolved.sources,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Failed to resolve effective settings: {str(e)}')
+
+
+@router.post('/check-agent', response_model=CheckAgentResponse)
+def check_agent(request: CheckAgentRequest):
+    """Run a strictly non-LLM static CLI probe with the selected model and reasoning."""
+    backend_name = request.backend.strip()
+    if not backend_name:
+        raise HTTPException(status_code=400, detail='backend is required')
+    model_val = (request.model or '').strip() or None
+    reasoning_val = (request.reasoning or '').strip() or None
+    try:
+        adapter = get_adapter(backend_name, model=model_val, reasoning=reasoning_val)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    executable = adapter.executable_name()
+    cmd = adapter.doctor_command()
+    if not shutil.which(executable):
+        return CheckAgentResponse(
+            ok=False,
+            backend=backend_name,
+            executable=executable,
+            command=cmd,
+            exit_code=None,
+            message=f'Executable `{executable}` was not found on PATH.',
+            model=model_val,
+            reasoning=adapter.reasoning if adapter.supports_reasoning else None,
+        )
+
+    try:
+        result = run_text(cmd, timeout=15)
+    except subprocess.TimeoutExpired:
+        return CheckAgentResponse(
+            ok=False,
+            backend=backend_name,
+            executable=executable,
+            command=cmd,
+            exit_code=None,
+            message=f'Static probe timed out after 15s: {" ".join(cmd)}',
+            model=model_val,
+            reasoning=adapter.reasoning if adapter.supports_reasoning else None,
+        )
+    except OSError as exc:
+        return CheckAgentResponse(
+            ok=False,
+            backend=backend_name,
+            executable=executable,
+            command=cmd,
+            exit_code=None,
+            message=f'Failed to launch `{executable}`: {exc}',
+            model=model_val,
+            reasoning=adapter.reasoning if adapter.supports_reasoning else None,
+        )
+
+    stdout = (result.stdout or '').strip()
+    stderr = (result.stderr or '').strip()
+    detail = (stdout.splitlines()[0] if stdout else '') or (stderr.splitlines()[0] if stderr else '')
+    if result.returncode == 0:
+        msg = detail or f'{backend_name} static check passed.'
+    else:
+        msg = stderr or stdout or f'Exited with code {result.returncode}'
+    return CheckAgentResponse(
+        ok=result.returncode == 0,
+        backend=backend_name,
+        executable=executable,
+        command=cmd,
+        exit_code=result.returncode,
+        message=msg,
+        model=model_val,
+        reasoning=adapter.reasoning if adapter.supports_reasoning else None,
+    )
 
 
 @router.post('/save', response_model=SaveConfigResponse)
 def save_config(request: SaveConfigRequest):
     """Save user-selected configuration to global config file.
 
-    Args:
-        request: Configuration with backend, model, and optional variant.
-
-    Returns:
-        Success status and config file path.
+    Distinguishes omitted fields (keep existing value) from explicit ``null`` /
+    empty string (clear saved value so CLI/model default takes effect).
     """
     try:
-        if not request.backend.strip():
+        backend_name = request.backend.strip()
+        if not backend_name:
             raise HTTPException(status_code=400, detail='backend is required')
+        fields = request.model_fields_set
         try:
             with global_config_lock:
                 # strict load: a corrupt file must abort the save, not be
@@ -130,14 +311,37 @@ def save_config(request: SaveConfigRequest):
                 if not isinstance(backend_config, dict):
                     backend_config = {}
                     config['backend'] = backend_config
-                backend_config['default'] = request.backend
-                selected = backend_config.setdefault(request.backend, {})
+                backend_config['default'] = backend_name
+                selected = backend_config.setdefault(backend_name, {})
                 if not isinstance(selected, dict):
                     selected = {}
-                    backend_config[request.backend] = selected
-                selected['model'] = request.model
-                if request.variant is not None:
-                    selected['variant'] = request.variant
+                    backend_config[backend_name] = selected
+
+                if 'model' in fields:
+                    cleaned_model = (request.model or '').strip()
+                    if cleaned_model:
+                        selected['model'] = cleaned_model
+                    else:
+                        selected.pop('model', None)
+
+                if 'reasoning' in fields:
+                    cleaned_reasoning = (request.reasoning or '').strip()
+                    if cleaned_reasoning:
+                        selected['reasoning'] = cleaned_reasoning
+                        # Keep variant in sync or clear stale variant so no split-brain.
+                        selected.pop('variant', None)
+                    else:
+                        selected.pop('reasoning', None)
+                        selected.pop('variant', None)
+                elif 'variant' in fields:
+                    cleaned_variant = (request.variant or '').strip()
+                    if cleaned_variant:
+                        selected['variant'] = cleaned_variant
+                        selected['reasoning'] = cleaned_variant
+                    else:
+                        selected.pop('variant', None)
+                        selected.pop('reasoning', None)
+
                 # Save inside the same lock: the atomic replace below prevents
                 # torn files, but only serialising the whole read-modify-write
                 # prevents one concurrent save from erasing another's backend.
@@ -156,7 +360,7 @@ def save_config(request: SaveConfigRequest):
 
         return SaveConfigResponse(
             status='success',
-            message=f'Configuration saved successfully',
+            message='Configuration saved successfully',
             config_path=config_path,
         )
     except HTTPException:

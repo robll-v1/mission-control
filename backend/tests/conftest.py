@@ -50,4 +50,5 @@ def isolated_config(tmp_path, monkeypatch):
     """Point global-config lookup at an empty temp dir so the host config cannot leak in."""
     monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
     monkeypatch.delenv('AMC_MODEL', raising=False)
+    monkeypatch.delenv('AMC_REASONING', raising=False)
     return tmp_path / 'xdg'

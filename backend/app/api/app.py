@@ -39,7 +39,9 @@ artifacts = ArtifactStore(RUNTIME_ROOT)
 contexts = ContextCompiler(artifacts)
 execution = ExecutionService(
     db=db, mission=engine, adapters=adapters, worktrees=worktrees, artifacts=artifacts, contexts=contexts,
-    adapter_factory=lambda name, *, model=None, variant=None: get_adapter(name, model=model, variant=variant),
+    adapter_factory=lambda name, *, model=None, variant=None, reasoning=None: get_adapter(
+        name, model=model, variant=variant, reasoning=reasoning,
+    ),
 )
 validation = ValidationService(db=db, mission=engine, artifacts=artifacts)
 diffs = DiffService(artifacts)

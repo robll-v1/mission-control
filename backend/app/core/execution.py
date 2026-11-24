@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import queue
@@ -11,9 +12,10 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from app.adapters.base import RunnerAdapter, resolve_executable
-from app.core.config import load_repo_config, resolve_backend_config
+from app.core.config import UNSET, SettingsResolver, _UnsetType, load_repo_config, resolve_backend_config
 from app.core.context_compiler import (
     DEFAULT_REVIEW_LANGUAGE,
     ContextCompiler,
@@ -22,7 +24,7 @@ from app.core.context_compiler import (
 from app.core.db import Database
 from app.core.github_ingest import fetch_pull_request
 from app.core.mission_engine import MissionEngine
-from app.core.models import EventLevel, Run, Task, TaskStatus
+from app.core.models import EventLevel, Run, RunSettings, Task, TaskStatus
 from app.core.proc import (
     mark_termination_requested,
     spawn_managed_process,
@@ -114,15 +116,35 @@ class ExecutionService:
         task_id: str,
         prompt: str | None = None,
         review_note: str | None = None,
-        language: str | None = DEFAULT_REVIEW_LANGUAGE,
+        language: str | None | _UnsetType = UNSET,
+        *,
+        backend: str | None | _UnsetType = UNSET,
+        model: str | None | _UnsetType = UNSET,
+        reasoning: str | None | _UnsetType = UNSET,
+        review_focus: str | None = None,
     ) -> Run:
-        resolved_language = normalize_review_language(language)
+        if not isinstance(language, _UnsetType) and language is not None:
+            normalize_review_language(language)
         task = self.db.get_task(task_id)
         if task is None:
             raise KeyError(f'task not found: {task_id}')
-        if task.backend not in self.adapters and self.adapter_factory is None:
+        settings = SettingsResolver.resolve(
+            task.repo_path,
+            round_agent=backend,
+            round_model=model,
+            round_reasoning=reasoning,
+            round_language=language,
+            round_focus=review_focus,
+            round_note=review_note,
+            review_agent=task.backend,
+            review_model=task.model,
+            review_reasoning=task.reasoning,
+            review_language=task.language,
+            review_focus=task.review_focus,
+        )
+        if settings.agent not in self.adapters and self.adapter_factory is None:
             raise BackendUnavailableError(
-                f'backend adapter not found: {task.backend}. '
+                f'backend adapter not found: {settings.agent}. '
                 f'Available: {", ".join(sorted(self.adapters)) or "(none)"}'
             )
         with self._lock:
@@ -135,7 +157,7 @@ class ExecutionService:
             placeholder = ActiveProcess(task_id=task_id, run_id=None, process=None, worker=None)
             self._active[task_id] = placeholder
         try:
-            return self._launch_round(task, prompt, review_note, resolved_language, placeholder)
+            return self._launch_round(task, prompt, review_note, settings, placeholder)
         except BaseException as exc:
             try:
                 # Settle the task while the slot is still held: once it is
@@ -152,6 +174,17 @@ class ExecutionService:
                     if self._active.get(task_id) is placeholder:
                         self._active.pop(task_id, None)
             raise
+
+    def _build_adapter(self, settings: RunSettings) -> RunnerAdapter | None:
+        if self.adapter_factory is None:
+            return self.adapters.get(settings.agent)
+        sig = inspect.signature(self.adapter_factory)
+        params = sig.parameters
+        accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        kwargs: dict[str, Any] = {'model': settings.model, 'variant': settings.reasoning}
+        if accepts_varkw or 'reasoning' in params:
+            kwargs['reasoning'] = settings.reasoning
+        return self.adapter_factory(settings.agent, **kwargs)
 
     @staticmethod
     def _raise_if_cancelled(placeholder: ActiveProcess) -> None:
@@ -176,18 +209,32 @@ class ExecutionService:
         task: Task,
         prompt: str | None,
         review_note: str | None,
-        language: str,
+        settings: RunSettings,
         placeholder: ActiveProcess,
     ) -> Run:
         # Show the round straight away. Preflight alone may take up to 150s,
         # and the Web UI only offers to abort a round it can see.
         task = self._advance(placeholder, stage='preflight', phase='preflight')
-        adapter = self.adapters.get(task.backend)
-        if self.adapter_factory is not None:
-            resolved = resolve_backend_config(task.repo_path, backend=task.backend)
-            adapter = self.adapter_factory(task.backend, model=resolved['model'], variant=resolved['variant'])
+        try:
+            adapter = self._build_adapter(settings)
+        except KeyError as exc:
+            raise BackendUnavailableError(f'backend adapter not found: {settings.agent}') from exc
         if adapter is None:
-            raise BackendUnavailableError(f'backend adapter not found: {task.backend}')
+            raise BackendUnavailableError(f'backend adapter not found: {settings.agent}')
+
+        # Reflect effective model/reasoning actually accepted by the adapter
+        # (e.g. Copilot degrades unsupported reasoning to None).
+        effective_model = getattr(adapter, 'model', settings.model)
+        effective_reasoning = (
+            getattr(adapter, 'reasoning', getattr(adapter, 'variant', None))
+            if hasattr(adapter, 'reasoning') or hasattr(adapter, 'variant')
+            else settings.reasoning
+        )
+        effective_settings = settings.model_copy(
+            update={'model': effective_model, 'reasoning': effective_reasoning}
+        )
+        language = effective_settings.language
+
         self._preflight_check(task, adapter=adapter)
 
         task = self._advance(placeholder, stage='prepare_review', phase='prepare')
@@ -207,7 +254,14 @@ class ExecutionService:
         prompt_text = prompt
         if prompt_text is None:
             prompt_started_at = time.perf_counter()
-            prompt_text = self.contexts.build_prompt(task, compiled, review_note=review_note, language=language)
+            prompt_task = (
+                task.model_copy(update={'review_focus': effective_settings.focus})
+                if effective_settings.focus != task.review_focus
+                else task
+            )
+            prompt_text = self.contexts.build_prompt(
+                prompt_task, compiled, review_note=review_note, language=language,
+            )
             prompt_build_ms = int((time.perf_counter() - prompt_started_at) * 1000)
         prepare_metrics = {
             'context_compile_ms': compile_context_ms,
@@ -246,7 +300,11 @@ class ExecutionService:
             round_index = len(self.db.list_runs(task.id)) + 1
             run = Run(
                 task_id=task.id,
-                backend=task.backend,
+                backend=effective_settings.agent,
+                model=effective_settings.model,
+                reasoning=effective_settings.reasoning,
+                language=language,
+                settings=effective_settings,
                 round_index=round_index,
                 review_note=(review_note or '').strip(),
                 review_revision=revision,
@@ -432,30 +490,32 @@ class ExecutionService:
                 slot = self._active.get(task.id)
                 if slot is not None:
                     self._raise_if_cancelled(slot)
-            adapter = adapter or self.adapters[task.backend]
+            adapter = adapter or self.adapters[run.backend]
             cmd = adapter.make_command(task=task, prompt=prompt)
             llm_started_at = time.perf_counter()
             agent_event_count = 0
             agent_text_bytes = 0
+            round_started_payload: dict[str, Any] = {
+                'entrypoint': cmd[:4],
+                'backend': run.backend,
+                # The model and reasoning effort handed to the agent CLI;
+                # None means the CLI's own default.
+                'model': getattr(adapter, 'model', run.model),
+                'reasoning': getattr(adapter, 'reasoning', run.reasoning),
+                'language': language,
+                'worktree_path': task.worktree_path,
+                'idle_timeout_sec': idle_timeout_sec,
+                'round_index': round_index,
+                'review_revision': run.review_revision,
+                'pr_head_sha': task.pr_head_sha,
+            }
+            if run.settings is not None:
+                round_started_payload['settings'] = run.settings.model_dump()
             self.mission.append_event(
                 task_id=task.id,
                 run_id=run.id,
                 kind='review.round_started',
-                payload={
-                    'entrypoint': cmd[:4],
-                    'backend': task.backend,
-                    # The model handed to the agent CLI (every adapter passes
-                    # it on); None means the CLI's own default. Recorded so a
-                    # config that silently drops the selected model shows up
-                    # in the event stream. No variant: most CLIs never get it.
-                    'model': getattr(adapter, 'model', None),
-                    'language': language,
-                    'worktree_path': task.worktree_path,
-                    'idle_timeout_sec': idle_timeout_sec,
-                    'round_index': round_index,
-                    'review_revision': run.review_revision,
-                    'pr_head_sha': task.pr_head_sha,
-                },
+                payload=round_started_payload,
             )
             proc = spawn_managed_process(
                 cmd,

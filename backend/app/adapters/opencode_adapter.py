@@ -7,14 +7,22 @@ from app.core.models import Task
 class OpenCodeAdapter(RunnerAdapter):
     name = 'opencode'
     executable = 'opencode'
+    supports_reasoning = False
 
-    def __init__(self, model: str | None = None, variant: str | None = None):
+    def __init__(self, model: str | None = None, variant: str | None = None, reasoning: str | None = None):
         self.model = model
-        self.variant = variant
+        eff = (reasoning if reasoning is not None else variant)
+        cleaned = eff.strip() if isinstance(eff, str) and eff.strip() else None
+        self.variant = cleaned
+        self.reasoning = cleaned
 
     def probe_command(self) -> list[str] | None:
         return [resolve_executable('opencode'), 'run', '--format', 'json',
                 'Reply with exactly one word: OK']
+
+    def doctor_command(self) -> list[str]:
+        # Never call the model during static `Check agent` / `doctor`.
+        return [resolve_executable('opencode'), '--version']
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         # The working directory comes from the process cwd, which

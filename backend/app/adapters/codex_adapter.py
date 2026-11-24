@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 from typing import Any
 
@@ -12,6 +13,18 @@ from app.core.models import Task
 from app.core.review_policy import BLOCKED_MARKER, forbidden_command_reason
 
 _SHELLS = {'bash', 'zsh', 'sh', 'dash'}
+_SAFE_REASONING_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$')
+
+
+def _validate_reasoning(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if not _SAFE_REASONING_RE.fullmatch(cleaned):
+        raise ValueError(f'invalid reasoning effort value: {value!r}')
+    return cleaned
 
 
 def _shell_script(command: str) -> str:
@@ -32,10 +45,13 @@ def _shell_script(command: str) -> str:
 class CodexAdapter(RunnerAdapter):
     name = 'codex'
     executable = 'codex'
+    supports_reasoning = True
 
-    def __init__(self, model: str | None = None, variant: str | None = None):
+    def __init__(self, model: str | None = None, variant: str | None = None, reasoning: str | None = None):
         self.model = model
-        self.variant = variant
+        eff = _validate_reasoning(reasoning if reasoning is not None else variant)
+        self.reasoning = eff
+        self.variant = eff
 
     def _exec_args(self, work_dir: str) -> list[str]:
         # codex-cli 0.169 rejects --full-auto (deprecated in 0.128, since
@@ -53,11 +69,16 @@ class CodexAdapter(RunnerAdapter):
         ]
         if self.model:
             args.extend(['--model', self.model])
+        if self.reasoning:
+            args.extend(['-c', f'model_reasoning_effort={self.reasoning}'])
         return args
 
     def probe_command(self) -> list[str] | None:
         # Parses the same flags as a round without starting a session, so a
         # CLI update that drops one fails preflight instead of the round.
+        return [*self._exec_args('.'), '--version']
+
+    def doctor_command(self) -> list[str]:
         return [*self._exec_args('.'), '--version']
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:

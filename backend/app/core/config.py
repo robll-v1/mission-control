@@ -169,26 +169,224 @@ def load_repo_config(repo_path: str) -> dict[str, Any]:
     return merged
 
 
+def _clean_opt(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _extract_backend_section(cfg: dict[str, Any]) -> dict[str, Any]:
+    cleaned = _without_unset_backend_values(cfg)
+    section = cleaned.get('backend', {})
+    return section if isinstance(section, dict) else {}
+
+
+def _extract_agent_entry(section: dict[str, Any], agent: str) -> dict[str, Any]:
+    entry = section.get(agent, {})
+    return entry if isinstance(entry, dict) else {}
+
+
+def _extract_reasoning(entry: dict[str, Any]) -> str | None:
+    """Read reasoning effort from an agent config mapping, honoring `variant` alias."""
+    return _clean_opt(entry.get('reasoning')) or _clean_opt(entry.get('variant'))
+
+
+class _UnsetType:
+    pass
+
+
+UNSET = _UnsetType()
+
+
+class SettingsResolver:
+    """Single source of truth for resolving effective per-round RunSettings.
+
+    Precedence per field (highest to lowest):
+      round override > env (AMC_MODEL / AMC_REASONING) > review default > repo (.amc.yaml) > global > default
+
+    Cross-agent isolation:
+      When a higher layer selects a different agent (e.g. round switches from
+      task's `codex` to `claude-code`), model and reasoning from the previous
+      agent's review-level defaults are NEVER inherited. Config files are
+      always looked up under `backend.<selected_agent>`.
+
+    Explicit reset:
+      Passing `round_model=None` or `round_reasoning=None` (as opposed to
+      `UNSET`) explicitly forces CLI/model default (`None`) for this round,
+      overriding env/review/repo/global values.
+    """
+
+    @staticmethod
+    def resolve(
+        repo_path: str | None = None,
+        *,
+        # Explicit round / CLI overrides (UNSET = not provided; None = explicit reset to default)
+        round_agent: str | None | _UnsetType = UNSET,
+        round_model: str | None | _UnsetType = UNSET,
+        round_reasoning: str | None | _UnsetType = UNSET,
+        round_language: str | None | _UnsetType = UNSET,
+        round_focus: str | None = None,
+        round_note: str | None = None,
+        # Review (task)-level defaults
+        review_agent: str | None = None,
+        review_model: str | None = None,
+        review_reasoning: str | None = None,
+        review_language: str | None = None,
+        review_focus: str = '',
+        # Reserved optional speed tier
+        speed: str | None = None,
+    ):
+        from app.core.context_compiler import DEFAULT_REVIEW_LANGUAGE, normalize_review_language
+        from app.core.models import RunSettings
+
+        default_agent = str(DEFAULT_CONFIG['backend']['default'])
+        global_section = _extract_backend_section(load_global_config())
+        repo_section: dict[str, Any] = {}
+        if repo_path:
+            config_path = Path(repo_path) / '.amc.yaml'
+            if config_path.exists():
+                repo_section = _extract_backend_section(_load_yaml_file(config_path))
+
+        global_default_agent = _clean_opt(global_section.get('default'))
+        repo_default_agent = _clean_opt(repo_section.get('default'))
+
+        # 1. Resolve agent
+        cleaned_round_agent = None if isinstance(round_agent, _UnsetType) else _clean_opt(round_agent)
+        cleaned_review_agent = _clean_opt(review_agent)
+        if cleaned_round_agent:
+            selected_agent = cleaned_round_agent
+            agent_source = 'round'
+        elif cleaned_review_agent:
+            selected_agent = cleaned_review_agent
+            agent_source = 'review'
+        elif repo_default_agent:
+            selected_agent = repo_default_agent
+            agent_source = 'repo'
+        elif global_default_agent:
+            selected_agent = global_default_agent
+            agent_source = 'global'
+        else:
+            selected_agent = default_agent
+            agent_source = 'default'
+
+        # Cross-agent guard: review-level model/reasoning only apply if the
+        # selected agent still matches the review's agent.
+        review_matches_agent = (
+            cleaned_review_agent is not None and cleaned_review_agent == selected_agent
+        )
+        effective_review_model = _clean_opt(review_model) if review_matches_agent else None
+        effective_review_reasoning = _clean_opt(review_reasoning) if review_matches_agent else None
+
+        repo_agent_cfg = _extract_agent_entry(repo_section, selected_agent)
+        global_agent_cfg = _extract_agent_entry(global_section, selected_agent)
+        env_model = _clean_opt(os.environ.get('AMC_MODEL', ''))
+        env_reasoning = _clean_opt(os.environ.get('AMC_REASONING', ''))
+
+        # 2. Resolve model
+        if not isinstance(round_model, _UnsetType):
+            resolved_model = _clean_opt(round_model)
+            model_source = 'round'
+        elif env_model:
+            resolved_model = env_model
+            model_source = 'env'
+        elif effective_review_model:
+            resolved_model = effective_review_model
+            model_source = 'review'
+        elif _clean_opt(repo_agent_cfg.get('model')):
+            resolved_model = _clean_opt(repo_agent_cfg.get('model'))
+            model_source = 'repo'
+        elif _clean_opt(global_agent_cfg.get('model')):
+            resolved_model = _clean_opt(global_agent_cfg.get('model'))
+            model_source = 'global'
+        else:
+            resolved_model = None
+            model_source = 'default'
+
+        # 3. Resolve reasoning (with `variant` backward-compat alias)
+        if not isinstance(round_reasoning, _UnsetType):
+            resolved_reasoning = _clean_opt(round_reasoning)
+            reasoning_source = 'round'
+        elif env_reasoning:
+            resolved_reasoning = env_reasoning
+            reasoning_source = 'env'
+        elif effective_review_reasoning:
+            resolved_reasoning = effective_review_reasoning
+            reasoning_source = 'review'
+        elif _extract_reasoning(repo_agent_cfg):
+            resolved_reasoning = _extract_reasoning(repo_agent_cfg)
+            reasoning_source = 'repo'
+        elif _extract_reasoning(global_agent_cfg):
+            resolved_reasoning = _extract_reasoning(global_agent_cfg)
+            reasoning_source = 'global'
+        else:
+            resolved_reasoning = None
+            reasoning_source = 'default'
+
+        # 4. Resolve language
+        cleaned_round_lang = None if isinstance(round_language, _UnsetType) else _clean_opt(round_language)
+        cleaned_review_lang = _clean_opt(review_language)
+        if cleaned_round_lang:
+            resolved_language = normalize_review_language(cleaned_round_lang)
+            language_source = 'round'
+        elif cleaned_review_lang:
+            resolved_language = normalize_review_language(cleaned_review_lang)
+            language_source = 'review'
+        else:
+            resolved_language = DEFAULT_REVIEW_LANGUAGE
+            language_source = 'default'
+
+        resolved_focus = (round_focus if round_focus is not None else review_focus).strip()
+        resolved_note = (round_note or '').strip()
+
+        return RunSettings(
+            agent=selected_agent,
+            model=resolved_model,
+            reasoning=resolved_reasoning,
+            speed=_clean_opt(speed),
+            language=resolved_language,
+            focus=resolved_focus,
+            note=resolved_note,
+            sources={
+                'agent': agent_source,
+                'model': model_source,
+                'reasoning': reasoning_source,
+                'language': language_source,
+            },
+        )
+
+
+def resolve_run_settings(
+    repo_path: str | None = None,
+    **kwargs: Any,
+):
+    """Convenience wrapper around :meth:`SettingsResolver.resolve`."""
+    return SettingsResolver.resolve(repo_path, **kwargs)
+
+
 def resolve_backend_config(
     repo_path: str,
     *,
     backend: str | None = None,
     model: str | None = None,
+    reasoning: str | None = None,
+    variant: str | None = None,
 ) -> dict[str, str | None]:
-    """Resolve the selected backend and its model from merged configuration."""
-    config = load_repo_config(repo_path)
-    section = config.get('backend', {})
-    if not isinstance(section, dict):
-        section = {}
-    selected_backend = backend or str(section.get('default') or DEFAULT_CONFIG['backend']['default'])
-    selected = section.get(selected_backend, {})
-    if not isinstance(selected, dict):
-        selected = {}
-    env_model = os.environ.get('AMC_MODEL', '').strip()
+    """Resolve the selected backend and its model/variant from merged configuration.
+
+    Kept as a thin backward-compatible view over :class:`SettingsResolver`.
+    """
+    eff_reasoning = reasoning if reasoning is not None else variant
+    resolved = SettingsResolver.resolve(
+        repo_path,
+        round_agent=backend if backend is not None else UNSET,
+        round_model=model if model is not None else UNSET,
+        round_reasoning=eff_reasoning if eff_reasoning is not None else UNSET,
+    )
     return {
-        'backend': selected_backend,
-        'model': model or env_model or str(selected.get('model') or '').strip() or None,
-        'variant': str(selected.get('variant') or '').strip() or None,
+        'backend': resolved.agent,
+        'model': resolved.model,
+        'variant': resolved.reasoning,
     }
 
 

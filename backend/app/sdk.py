@@ -18,7 +18,7 @@ from typing import Iterator
 
 from app.adapters import get_adapter, AVAILABLE_BACKENDS
 from app.core.context_compiler import ContextCompiler
-from app.core.config import resolve_backend_config
+from app.core.config import UNSET, _UnsetType, resolve_backend_config
 from app.core.db import Database
 from app.core.execution import ExecutionService
 from app.core.github_ingest import fetch_pull_request, is_github_pr_url
@@ -94,13 +94,16 @@ class ReviewEngine:
         language: str = 'en',
         backend: str | None = None,
         model: str | None = None,
+        reasoning: str | None = None,
     ):
         self.language = language
         self._explicit_backend = backend
         self._explicit_model = model
+        self._explicit_reasoning = reasoning
         initial = self._resolve_review_config('.')
         self.backend_name = str(initial['backend'])
         self.model = initial['model']
+        self.reasoning = initial['variant']
 
         self._db = Database(db_path)
         self._engine = MissionEngine(self._db)
@@ -108,7 +111,14 @@ class ReviewEngine:
         if self.backend_name == 'direct_api':
             self._adapters = {}
         else:
-            self._adapters = {self.backend_name: get_adapter(self.backend_name, model=self.model, variant=initial['variant'])}
+            self._adapters = {
+                self.backend_name: get_adapter(
+                    self.backend_name,
+                    model=self.model,
+                    variant=self.reasoning,
+                    reasoning=self.reasoning,
+                )
+            }
         self._worktrees = WorktreeManager(runtime_root)
         self._artifacts = ArtifactStore(runtime_root)
         self._contexts = ContextCompiler(self._artifacts)
@@ -119,8 +129,11 @@ class ReviewEngine:
             worktrees=self._worktrees,
             artifacts=self._artifacts,
             contexts=self._contexts,
-            adapter_factory=lambda name, *, model=None, variant=None: get_adapter(
-                name, model=self._explicit_model or model, variant=variant,
+            adapter_factory=lambda name, *, model=None, variant=None, reasoning=None: get_adapter(
+                name,
+                model=self._explicit_model or model,
+                variant=self._explicit_reasoning or variant,
+                reasoning=self._explicit_reasoning or reasoning,
             ),
         )
         self._validation = ValidationService(
@@ -147,6 +160,7 @@ class ReviewEngine:
             repo_path,
             backend=backend if backend is not None else self._explicit_backend,
             model=self._explicit_model,
+            reasoning=self._explicit_reasoning,
         )
 
     # ------------------------------------------------------------------
@@ -273,9 +287,21 @@ class ReviewEngine:
         *,
         prompt: str | None = None,
         review_note: str | None = None,
+        backend: str | None | _UnsetType = UNSET,
+        model: str | None | _UnsetType = UNSET,
+        reasoning: str | None | _UnsetType = UNSET,
+        language: str | None = None,
     ) -> Run:
         """Start a review round. Returns immediately; review runs in background thread."""
-        return self._execution.start_task(task_id, prompt=prompt, review_note=review_note, language=self.language)
+        return self._execution.start_task(
+            task_id,
+            prompt=prompt,
+            review_note=review_note,
+            backend=backend,
+            model=model,
+            reasoning=reasoning,
+            language=language if language is not None else self.language,
+        )
 
     def poll_status(self, task_id: str) -> dict:
         """Get current task status and progress."""
