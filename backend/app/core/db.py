@@ -46,10 +46,14 @@ class Database:
         self._is_memory = str(path) == ':memory:'
         if not self._is_memory:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path) if self._is_memory else self.path, check_same_thread=False)
+        self.conn = sqlite3.connect(
+            str(path) if self._is_memory else self.path,
+            timeout=30.0,
+            check_same_thread=False,
+        )
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute('PRAGMA busy_timeout = 30000')
         self._lock = threading.RLock()
-        self._event_seq_cache: dict[str, int] = {}
         self.last_backup_path: Path | None = None
         self._init_schema()
 
@@ -270,9 +274,9 @@ class Database:
         return runs
 
     def _current_max_event_seq_locked(self, task_id: str) -> int:
-        cached = self._event_seq_cache.get(task_id)
-        if cached is not None:
-            return cached
+        # Always query SQLite directly (indexed O(log N) lookup via task_event_seq
+        # PK and idx_events_task_seq) so multiple connections / processes opening
+        # the same DB file never read a stale in-memory sequence cache.
         seq_row = self.conn.execute(
             'SELECT last_seq FROM task_event_seq WHERE task_id = ?',
             (task_id,),
@@ -283,9 +287,7 @@ class Database:
         ).fetchone()
         seq_val = int(seq_row['last_seq']) if seq_row is not None else 0
         ev_val = int(ev_row['m']) if (ev_row is not None and ev_row['m'] is not None) else 0
-        best = max(seq_val, ev_val)
-        self._event_seq_cache[task_id] = best
-        return best
+        return max(seq_val, ev_val)
 
     def max_event_seq(self, task_id: str) -> int:
         with self._lock:
@@ -293,7 +295,11 @@ class Database:
 
     def append_event(self, event: Event) -> None:
         with self._lock:
-            self.conn.execute('SAVEPOINT amc_append_event')
+            nested = self.conn.in_transaction
+            if nested:
+                self.conn.execute('SAVEPOINT amc_append_event')
+            else:
+                self.conn.execute('BEGIN IMMEDIATE')
             try:
                 self.conn.execute(
                     'INSERT OR REPLACE INTO events (id, task_id, run_id, seq, data) VALUES (?, ?, ?, ?, ?)',
@@ -306,18 +312,19 @@ class Database:
                     ''',
                     (event.task_id, int(event.seq)),
                 )
-                self.conn.execute('RELEASE SAVEPOINT amc_append_event')
+                if nested:
+                    self.conn.execute('RELEASE SAVEPOINT amc_append_event')
                 self.conn.commit()
             except Exception:
                 try:
-                    self.conn.execute('ROLLBACK TO SAVEPOINT amc_append_event')
-                    self.conn.execute('RELEASE SAVEPOINT amc_append_event')
+                    if nested:
+                        self.conn.execute('ROLLBACK TO SAVEPOINT amc_append_event')
+                        self.conn.execute('RELEASE SAVEPOINT amc_append_event')
+                    else:
+                        self.conn.rollback()
                 except Exception:
                     pass
                 raise
-            prev = self._event_seq_cache.get(event.task_id, 0)
-            if event.seq > prev:
-                self._event_seq_cache[event.task_id] = int(event.seq)
 
     def append_event_auto_seq(
         self,
@@ -331,25 +338,28 @@ class Database:
         ts: float | None = None,
     ) -> Event:
         """Atomically allocate the next monotonic ``seq`` for ``task_id``, persist
-        the event (and optionally bump ``task.updated_at``) in one transaction.
-
-        Recovers from ``MAX(events.seq)`` and ``task_event_seq`` across restarts
-        without scanning/deserializing the full event list.
+        the event (and optionally bump ``task.updated_at``) in one ``BEGIN IMMEDIATE``
+        transaction so even separate connections/processes sharing the same SQLite
+        file can never allocate duplicate sequence numbers.
         """
         with self._lock:
-            next_seq = self._current_max_event_seq_locked(task_id) + 1
-            event_ts = time.time() if ts is None else float(ts)
-            event = Event(
-                task_id=task_id,
-                run_id=run_id,
-                seq=next_seq,
-                ts=event_ts,
-                kind=kind,
-                level=level,
-                payload=payload,
-            )
-            self.conn.execute('SAVEPOINT amc_append_auto_event')
+            nested = self.conn.in_transaction
+            if nested:
+                self.conn.execute('SAVEPOINT amc_append_auto_event')
+            else:
+                self.conn.execute('BEGIN IMMEDIATE')
             try:
+                next_seq = self._current_max_event_seq_locked(task_id) + 1
+                event_ts = time.time() if ts is None else float(ts)
+                event = Event(
+                    task_id=task_id,
+                    run_id=run_id,
+                    seq=next_seq,
+                    ts=event_ts,
+                    kind=kind,
+                    level=level,
+                    payload=payload,
+                )
                 self.conn.execute(
                     'INSERT INTO events (id, task_id, run_id, seq, data) VALUES (?, ?, ?, ?, ?)',
                     (event.id, event.task_id, event.run_id, event.seq, event.model_dump_json()),
@@ -370,19 +380,20 @@ class Database:
                             'INSERT OR REPLACE INTO tasks (id, data) VALUES (?, ?)',
                             (task.id, task.model_dump_json()),
                         )
-                self.conn.execute('RELEASE SAVEPOINT amc_append_auto_event')
+                if nested:
+                    self.conn.execute('RELEASE SAVEPOINT amc_append_auto_event')
                 self.conn.commit()
+                return event
             except Exception:
                 try:
-                    self.conn.execute('ROLLBACK TO SAVEPOINT amc_append_auto_event')
-                    self.conn.execute('RELEASE SAVEPOINT amc_append_auto_event')
+                    if nested:
+                        self.conn.execute('ROLLBACK TO SAVEPOINT amc_append_auto_event')
+                        self.conn.execute('RELEASE SAVEPOINT amc_append_auto_event')
+                    else:
+                        self.conn.rollback()
                 except Exception:
                     pass
-                # Invalidate cached sequence on failure so next caller re-reads DB.
-                self._event_seq_cache.pop(task_id, None)
                 raise
-            self._event_seq_cache[task_id] = next_seq
-            return event
 
     def list_events(self, task_id: str) -> list[Event]:
         with self._lock:

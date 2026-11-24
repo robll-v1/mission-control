@@ -305,3 +305,108 @@ def test_sse_slow_consumer_bounded_queue_resyncs_from_db_without_drops_or_dups(t
         assert bus.subscriber_count(task.id) == 0
     finally:
         db.close()
+
+
+def test_two_separate_connections_on_same_db_allocate_unique_monotonic_seqs(tmp_path):
+    """Two Database instances (e.g. API + SDK) sharing one SQLite file must never
+    allocate duplicate seq numbers, and a manual low-seq insert on a cold
+    connection must never regress the next auto-allocated seq.
+    """
+    db_file = tmp_path / 'shared.db'
+    db_a = Database(str(db_file))
+    db_b = Database(str(db_file))
+    mission_a = MissionEngine(db_a)
+    mission_b = MissionEngine(db_b)
+    task = mission_a.create_task(title='shared', repo_path=str(tmp_path))  # seq 1
+
+    try:
+        e2 = mission_a.append_event(task_id=task.id, kind='agent.text', payload={'from': 'a'})
+        e3 = mission_b.append_event(task_id=task.id, kind='agent.text', payload={'from': 'b'})
+        e4 = mission_a.append_event(task_id=task.id, kind='agent.text', payload={'from': 'a2'})
+        assert [e2.seq, e3.seq, e4.seq] == [2, 3, 4]
+
+        # Fresh connection manually writing a lower seq must never regress auto-seq
+        db_c = Database(str(db_file))
+        try:
+            db_c.append_event(Event(task_id=task.id, seq=2, ts=time.time(), kind='manual', payload={}))
+            e5 = MissionEngine(db_c).append_event(task_id=task.id, kind='agent.text', payload={'from': 'c'})
+            assert e5.seq == 5
+        finally:
+            db_c.close()
+    finally:
+        db_a.close()
+        db_b.close()
+
+
+def test_event_bus_coalesces_callbacks_to_one_per_subscriber_when_loop_paused():
+    """Publishing 400 events while the event loop is paused must schedule at most
+    ONE pending wake callback per subscriber (O(1) callback memory).
+    """
+    class _RecordingLoop:
+        def __init__(self):
+            self.callbacks: list = []
+
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, fn, *args):
+            self.callbacks.append((fn, args))
+
+    loop = _RecordingLoop()
+    bus = EventBus(max_queue_size=1)
+
+    async def _make_subs():
+        # Create subscriptions while an asyncio loop exists for asyncio.Event(),
+        # then swap their target loop to _RecordingLoop to count scheduled wakes.
+        s1 = bus.subscribe('t1')
+        s2 = bus.subscribe('t1')
+        s1.loop = loop  # type: ignore[assignment]
+        s2.loop = loop  # type: ignore[assignment]
+        return s1, s2
+
+    s1, s2 = asyncio.run(_make_subs())
+    for seq in range(1, 421):
+        bus.publish(Event(task_id='t1', seq=seq, ts=float(seq), kind='agent.text', payload={}))
+
+    # Strictly at most 1 pending wake callback per subscriber (2 total, not 840!)
+    assert len(loop.callbacks) == 2
+    assert s1.overflowed is True and s2.overflowed is True
+    bus.close_all()
+
+
+def test_sse_disconnect_before_iteration_does_not_leak_subscriber(tmp_path):
+    """If the ASGI client disconnects before StreamingResponse iterates the
+    generator, zero subscribers must remain registered on EventBus.
+    """
+    db = Database(str(tmp_path / 'leak.db'))
+    mission = MissionEngine(db)
+    task = mission.create_task(title='disconnect', repo_path=str(tmp_path))
+
+    async def run():
+        resp = await routes_stream.stream_task(
+            task_id=task.id,
+            request=None,  # type: ignore[arg-type]
+            last_event_id=None,
+            since_seq=None,
+            last_event_id_query=None,
+            mission=mission,
+        )
+
+        async def receive():
+            return {'type': 'http.disconnect'}
+
+        async def send(_message):
+            await asyncio.Future()
+
+        await asyncio.wait_for(
+            resp({'type': 'http', 'asgi': {'spec_version': '2.3'}}, receive, send),
+            timeout=1.0,
+        )
+        await resp.body_iterator.aclose()
+        assert mission.event_bus.subscriber_count(task.id) == 0
+
+    try:
+        asyncio.run(run())
+    finally:
+        mission.event_bus.close_all()
+        db.close()

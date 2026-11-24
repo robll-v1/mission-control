@@ -2,6 +2,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -90,20 +91,53 @@ _prune_startup_worktrees()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Graceful shutdown: abort all running tasks and close SSE streams before exit."""
-    yield
-    # ── shutdown ──
-    active_ids = list(execution._active.keys())
-    if active_ids:
-        logger.info('Graceful shutdown: aborting %d active task(s)...', len(active_ids))
-        for task_id in active_ids:
+    """Graceful shutdown: wake open SSE streams on SIGTERM/SIGINT and abort active tasks."""
+    prev_handlers: dict[int, object] = {}
+    if threading.current_thread() is threading.main_thread():
+        # Uvicorn waits for active StreamingResponses to end BEFORE invoking
+        # lifespan teardown; chain SIGINT/SIGTERM to close_all() first so open
+        # SSE connections terminate immediately instead of stalling shutdown.
+        sigs = [signal.SIGINT]
+        if hasattr(signal, 'SIGTERM'):
+            sigs.append(signal.SIGTERM)
+        for sig in sigs:
             try:
-                execution.abort_task(task_id)
-                logger.info('Aborted task %s', task_id)
-            except Exception:
-                logger.exception('Failed to abort task %s during shutdown', task_id)
-    engine.event_bus.close_all()
-    logger.info('Shutdown complete.')
+                prev = signal.getsignal(sig)
+                prev_handlers[sig] = prev
+
+                def _make_handler(previous):
+                    def _handler(signum, frame):
+                        engine.event_bus.close_all()
+                        if callable(previous):
+                            previous(signum, frame)
+                        elif previous == signal.SIG_DFL:
+                            signal.signal(signum, signal.SIG_DFL)
+                            os.kill(os.getpid(), signum)
+                    return _handler
+
+                signal.signal(sig, _make_handler(prev))
+            except (OSError, ValueError):
+                pass
+    try:
+        yield
+    finally:
+        # ── shutdown ──
+        engine.event_bus.close_all()
+        active_ids = list(execution._active.keys())
+        if active_ids:
+            logger.info('Graceful shutdown: aborting %d active task(s)...', len(active_ids))
+            for task_id in active_ids:
+                try:
+                    execution.abort_task(task_id)
+                    logger.info('Aborted task %s', task_id)
+                except Exception:
+                    logger.exception('Failed to abort task %s during shutdown', task_id)
+        for sig, prev in prev_handlers.items():
+            try:
+                signal.signal(sig, prev)
+            except (OSError, ValueError):
+                pass
+        logger.info('Shutdown complete.')
 
 
 app = FastAPI(title='PR Review Control', lifespan=lifespan)
@@ -121,7 +155,8 @@ def health():
 
 @app.post('/api/admin/shutdown')
 def admin_shutdown():
-    """Trigger graceful shutdown: abort active tasks, then terminate."""
+    """Trigger graceful shutdown: close SSE streams, abort active tasks, then terminate."""
+    engine.event_bus.close_all()
     active_ids = list(execution._active.keys())
     aborted = []
     for task_id in active_ids:

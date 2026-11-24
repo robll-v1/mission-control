@@ -2,22 +2,23 @@
 
 Publishers (sync FastAPI handlers, review/validation worker threads) publish
 committed ``Event`` objects from any OS thread. Subscribers (async SSE stream
-generators) consume from bounded ``asyncio.Queue`` instances on their own event
-loop via ``call_soon_threadsafe``.
+generators) consume from bounded buffers woken via coalesced loop callbacks.
 
 Slow-consumer protection:
-- Each subscriber queue is bounded (``DEFAULT_QUEUE_MAXSIZE``).
+- Each subscriber buffer is strictly bounded (``DEFAULT_QUEUE_MAXSIZE``).
+- At most ONE wake callback is ever pending on a subscriber's event loop at a
+  time, even if thousands of events arrive while the loop is stalled.
 - Publishers NEVER block when a subscriber falls behind.
-- When a subscriber's queue is full, ``overflowed`` is latched on that
-  subscriber; the SSE generator detects overflow, drains stale buffered items,
-  and resyncs directly from SQLite starting after ``last_sent_seq`` so zero
-  events are lost or duplicated while memory remains strictly bounded.
+- When a subscriber's buffer fills, ``overflowed`` is latched and the buffer
+  is cleared; the SSE generator detects overflow and resyncs directly from
+  SQLite starting after ``last_sent_seq`` so zero events are lost or duplicated
+  while both queue and callback memory remain strictly O(1).
 """
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import threading
-from typing import Callable
 
 from app.core.models import Event
 
@@ -36,78 +37,92 @@ class EventSubscription:
     ):
         self.task_id = task_id
         self.loop = loop
-        self.queue: asyncio.Queue[Event | None] = asyncio.Queue(maxsize=max(1, maxsize))
+        self._maxsize = max(1, maxsize)
+        self._lock = threading.Lock()
+        self._buffer: deque[Event] = deque()
         self._overflowed = False
+        self._shutdown = False
         self._closed = False
+        self._wake_scheduled = False
+        self._signal = asyncio.Event()
 
-    def _offer_on_loop(self, item: Event | None) -> None:
-        """Enqueue an event on the subscriber's owning event loop."""
-        if self._closed:
-            return
-        if item is None:
-            # Shutdown sentinel: make room if full so the consumer always wakes up.
-            self._closed = True
-            while self.queue.full():
-                try:
-                    self.queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-            try:
-                self.queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
-            return
-        if self._overflowed:
-            # Already awaiting a DB resync; avoid pointless queue churn.
-            return
-        if self.queue.full():
-            self._overflowed = True
-            return
-        try:
-            self.queue.put_nowait(item)
-        except asyncio.QueueFull:
-            self._overflowed = True
+    def _wake_on_loop(self) -> None:
+        with self._lock:
+            self._wake_scheduled = False
+        self._signal.set()
 
-    def notify(self, item: Event | None) -> bool:
-        """Thread-safely schedule delivery of ``item``. Returns False if loop is closed."""
-        if self._closed and item is not None:
-            return False
+    def _schedule_wake_locked(self) -> bool:
+        """Schedule at most one coalesced wake callback on ``self.loop``."""
         if self.loop.is_closed():
             return False
+        if self._wake_scheduled:
+            return True
+        self._wake_scheduled = True
         try:
-            self.loop.call_soon_threadsafe(self._offer_on_loop, item)
+            self.loop.call_soon_threadsafe(self._wake_on_loop)
             return True
         except RuntimeError:
+            self._wake_scheduled = False
             return False
+
+    def notify(self, item: Event | None) -> bool:
+        """Thread-safely enqueue ``item`` (or shutdown sentinel ``None``).
+
+        Returns False if the subscriber is closed or its event loop is closed.
+        """
+        with self._lock:
+            if item is None:
+                self._shutdown = True
+                self._closed = True
+                self._buffer.clear()
+                return self._schedule_wake_locked()
+            if self._closed:
+                return False
+            if self._overflowed:
+                # Already latched for DB resync; schedule wake only if not pending.
+                return self._schedule_wake_locked()
+            if len(self._buffer) >= self._maxsize:
+                self._overflowed = True
+                self._buffer.clear()
+                return self._schedule_wake_locked()
+            self._buffer.append(item)
+            return self._schedule_wake_locked()
 
     @property
     def overflowed(self) -> bool:
-        return self._overflowed
+        with self._lock:
+            return self._overflowed
 
     def consume_overflow(self) -> bool:
         """Clear the overflow flag and drain buffered items so caller can resync from DB."""
-        if not self._overflowed:
-            return False
-        self._overflowed = False
-        while True:
-            try:
-                item = self.queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if item is None:
-                # Preserve shutdown sentinel if it arrived concurrently.
-                try:
-                    self.queue.put_nowait(None)
-                except asyncio.QueueFull:
-                    pass
-                break
-        return True
+        with self._lock:
+            if not self._overflowed:
+                return False
+            self._overflowed = False
+            self._buffer.clear()
+            return True
 
-    async def get(self) -> Event | None:
-        return await self.queue.get()
+    async def wait_next(self) -> tuple[str, Event | None]:
+        """Await the next item: ``('event', Event)``, ``('overflow', None)``, or ``('shutdown', None)``."""
+        while True:
+            with self._lock:
+                if self._shutdown:
+                    return 'shutdown', None
+                if self._overflowed:
+                    self._overflowed = False
+                    self._buffer.clear()
+                    return 'overflow', None
+                if self._buffer:
+                    return 'event', self._buffer.popleft()
+                # Buffer empty & not overflowed/shutdown: arm signal while
+                # holding `_lock` so a concurrent `notify()` cannot slip through.
+                self._signal.clear()
+            await self._signal.wait()
 
     def close(self) -> None:
-        self._closed = True
+        with self._lock:
+            self._closed = True
+            self._buffer.clear()
 
 
 class EventBus:

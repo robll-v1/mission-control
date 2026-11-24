@@ -15,6 +15,7 @@ import {
   type ReviewLanguage,
 } from './i18n'
 import {
+  mergeEventLists,
   mergeStreamEvent,
   parseStreamEventPayload,
   shouldRefreshTaskOnEvent,
@@ -401,6 +402,7 @@ export function App() {
   // per task, so actions on another task cannot affect this one.
   const startTrackerRef = useRef(new StartTracker())
   const findingSeqRef = useRef<Map<string, number>>(new Map())
+  const streamEventsByTaskRef = useRef<Map<string, EventRecord[]>>(new Map())
   const [startingTaskIds, setStartingTaskIds] = useState<string[]>([])
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'light'
@@ -484,6 +486,21 @@ export function App() {
     try {
       const data = normalizeTaskDetail(await api<TaskDetailResponse>(`/api/tasks/${taskId}`))
       if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
+      const buffered = streamEventsByTaskRef.current.get(taskId) ?? []
+      if (buffered.length > 0) {
+        const rawMaxFetchedSeq = data.events.reduce((max, ev) => Math.max(max, ev.seq), 0)
+        const merged = mergeEventLists(data.events, data.importantEvents, buffered)
+        data.events = merged.events
+        data.importantEvents = merged.importantEvents
+        data.eventStats = merged.eventStats
+        // Prune only buffered items already present in the fetched server snapshot.
+        const remaining = buffered.filter((ev) => ev.seq > rawMaxFetchedSeq)
+        if (remaining.length > 0) {
+          streamEventsByTaskRef.current.set(taskId, remaining)
+        } else {
+          streamEventsByTaskRef.current.delete(taskId)
+        }
+      }
       setDetail(data)
     } catch (err) {
       if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
@@ -606,6 +623,13 @@ export function App() {
         void loadTask(selectedTaskId, { silent: true })
         void refreshTasks({ silent: true })
         return
+      }
+      // Buffer per task so events arriving before initial loadTask finishes (or
+      // while a stale GET snapshot is in flight) are never dropped or overwritten.
+      const prevBuf = streamEventsByTaskRef.current.get(selectedTaskId) ?? []
+      if (!prevBuf.some((ev) => ev.seq === parsed.seq || ev.id === parsed.id)) {
+        const nextBuf = [...prevBuf, parsed].slice(-500)
+        streamEventsByTaskRef.current.set(selectedTaskId, nextBuf)
       }
       setDetail((prev) => {
         if (!prev || prev.task.id !== selectedTaskId) return prev

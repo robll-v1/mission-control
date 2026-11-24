@@ -4,6 +4,7 @@ import { test } from 'node:test'
 
 import {
   isImportantEvent,
+  mergeEventLists,
   mergeStreamEvent,
   parseStreamEventPayload,
   shouldRefreshTaskOnEvent,
@@ -68,4 +69,13 @@ test('isImportantEvent and shouldRefreshTaskOnEvent avoid HTTP storms on noisy a
   assert.equal(shouldRefreshTaskOnEvent(ev(15, 'task.stage_changed')), true)
   assert.equal(shouldRefreshTaskOnEvent(ev(16, 'validation.finished')), true)
   assert.equal(shouldRefreshTaskOnEvent(ev(17, 'agent.text', 'error')), true)
+})
+
+test('mergeEventLists preserves buffered SSE events when initial or stale GET snapshot arrives', () => {
+  const snapshot = [ev(1, 'task.created')]
+  const buffered = [ev(2, 'agent.text'), ev(3, 'agent.step_start')]
+  const merged = mergeEventLists(snapshot, snapshot, buffered)
+  assert.deepEqual(merged.events.map((e) => e.seq), [1, 2, 3])
+  assert.deepEqual(merged.importantEvents.map((e) => e.seq), [1, 2])
+  assert.deepEqual(merged.eventStats, { all_count: 3, important_count: 2, hidden_count: 1 })
 })

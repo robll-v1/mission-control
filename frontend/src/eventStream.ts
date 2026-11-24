@@ -142,3 +142,35 @@ export function mergeStreamEvent(
     changed: true,
   }
 }
+
+/**
+ * Merge a freshly fetched GET snapshot with buffered live SSE events so events
+ * received before initial detail load (or while a stale GET was in flight) are
+ * never dropped or rolled back.
+ */
+export function mergeEventLists(
+  baseEvents: StreamEventRecord[],
+  baseImportantEvents: StreamEventRecord[],
+  bufferedEvents: StreamEventRecord[],
+): {
+  events: StreamEventRecord[]
+  importantEvents: StreamEventRecord[]
+  eventStats: StreamEventStats
+} {
+  let events = baseEvents
+  let importantEvents = baseImportantEvents
+  for (const incoming of bufferedEvents) {
+    const merged = mergeStreamEvent(events, importantEvents, incoming)
+    events = merged.events
+    importantEvents = merged.importantEvents
+  }
+  return {
+    events,
+    importantEvents,
+    eventStats: {
+      all_count: events.length,
+      important_count: importantEvents.length,
+      hidden_count: Math.max(events.length - importantEvents.length, 0),
+    },
+  }
+}

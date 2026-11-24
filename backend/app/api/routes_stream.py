@@ -63,13 +63,13 @@ async def stream_task(
         _parse_seq(since_seq),
     )
 
-    # Subscribe BEFORE reading DB backlog so events published during the
-    # boundary window are queued and deduplicated by `seq` instead of lost.
-    loop = asyncio.get_running_loop()
-    sub = mission.event_bus.subscribe(task_id, loop=loop)
-
     async def event_generator():
         last_sent_seq = initial_cursor
+        # Subscribe INSIDE the generator (strictly before reading the DB backlog)
+        # so disconnecting before iteration starts never leaks a subscriber, and
+        # boundary-window events are still captured and deduplicated by `seq`.
+        loop = asyncio.get_running_loop()
+        sub = mission.event_bus.subscribe(task_id, loop=loop)
         try:
             backlog = await asyncio.to_thread(
                 mission.db.list_events_after, task_id, after_seq=last_sent_seq
@@ -84,32 +84,18 @@ async def stream_task(
                 if await request.is_disconnected():
                     break
 
-                # If the bounded queue overflowed while catching up or stalling,
-                # resync directly from SQLite so no events are ever dropped.
-                if sub.consume_overflow():
-                    resync = await asyncio.to_thread(
-                        mission.db.list_events_after, task_id, after_seq=last_sent_seq
-                    )
-                    for ev in resync:
-                        if ev.seq <= last_sent_seq:
-                            continue
-                        yield _format_sse_event(ev)
-                        last_sent_seq = ev.seq
-                    continue
-
                 try:
-                    event = await asyncio.wait_for(sub.get(), timeout=HEARTBEAT_INTERVAL_SEC)
+                    kind, event = await asyncio.wait_for(sub.wait_next(), timeout=HEARTBEAT_INTERVAL_SEC)
                 except asyncio.TimeoutError:
                     if await request.is_disconnected():
                         break
                     yield ': keepalive\n\n'
                     continue
 
-                if event is None:
-                    # EventBus shutdown sentinel.
+                if kind == 'shutdown':
                     break
 
-                if sub.consume_overflow():
+                if kind == 'overflow':
                     resync = await asyncio.to_thread(
                         mission.db.list_events_after, task_id, after_seq=last_sent_seq
                     )
@@ -120,13 +106,11 @@ async def stream_task(
                         last_sent_seq = ev.seq
                     continue
 
+                assert event is not None
                 if event.seq <= last_sent_seq:
-                    # Already sent during backlog catch-up or earlier resync.
                     continue
 
                 if event.seq > last_sent_seq + 1:
-                    # Fill any gap (e.g. out-of-order thread scheduling) from DB
-                    # before emitting `event` so seq stays strictly ordered.
                     gap_events = await asyncio.to_thread(
                         mission.db.list_events_after, task_id, after_seq=last_sent_seq
                     )
