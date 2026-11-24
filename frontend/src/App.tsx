@@ -18,6 +18,7 @@ import {
   buildStartRoundPayload,
   createRunDraft,
   formatRoundSettingsLabel,
+  mergeEffectiveIntoDraft,
   resolveReasoningOptions,
   savedForAgent,
   switchDraftAgent,
@@ -541,11 +542,7 @@ export function App() {
 
   useEffect(() => {
     if (!activeTaskEffective || !selectedTask || latestRound) return
-    setRunDraft((prev) => {
-      if (prev.explicit.agent || prev.explicit.model || prev.explicit.reasoning) return prev
-      const next = createRunDraft(selectedTask, undefined, savedConfig, activeTaskEffective)
-      return { ...next, note: prev.note, language: prev.explicit.language ? prev.language : next.language, explicit: prev.explicit }
-    })
+    setRunDraft((prev) => mergeEffectiveIntoDraft(prev, selectedTask, savedConfig, activeTaskEffective))
   }, [activeTaskEffective, selectedTask?.id, latestRound?.id, savedConfig])
 
   useEffect(() => {

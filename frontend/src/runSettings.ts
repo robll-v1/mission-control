@@ -256,6 +256,26 @@ export function createRunDraft(
 }
 
 /**
+ * Merge newly arrived repo-effective defaults into a first-round draft
+ * field-by-field, preserving any fields the user has already edited.
+ */
+export function mergeEffectiveIntoDraft(
+  prev: RunDraft,
+  task: TaskLike,
+  saved: SavedConfig | null,
+  effective: EffectiveSettingsResponse,
+): RunDraft {
+  if (prev.explicit.agent) return prev
+  const next = createRunDraft(task, undefined, saved, effective)
+  return {
+    ...prev,
+    model: prev.explicit.model ? prev.model : next.model,
+    reasoning: prev.explicit.reasoning ? prev.reasoning : next.reasoning,
+    language: prev.explicit.language ? prev.language : next.language,
+  }
+}
+
+/**
  * Switch the agent on a draft: resets model and reasoning to the target
  * agent's saved defaults (or CLI/Model default) and clears explicit model/reasoning
  * flags so the previous agent's values never leak across agents.

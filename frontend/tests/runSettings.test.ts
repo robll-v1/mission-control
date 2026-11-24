@@ -7,6 +7,7 @@ import {
   buildStartRoundPayload,
   createRunDraft,
   formatRoundSettingsLabel,
+  mergeEffectiveIntoDraft,
   normalizeReviewLang,
   resolveReasoningOptions,
   savedForAgent,
@@ -245,6 +246,28 @@ test('createRunDraft uses repo effective settings over global config for auto-cr
   assert.equal(draft.reasoning, 'medium')
   // Still untouched so backend resolves from repo/env cleanly
   assert.deepEqual(buildStartRoundPayload(draft), { language: 'en' })
+
+  // If user edited reasoning before /effective returned, merge updates untouched model while keeping edited reasoning
+  const editedBeforeEffective = {
+    ...createRunDraft({ backend: 'codex', model: null, reasoning: null, language: 'en' }, undefined, SAVED),
+    reasoning: 'high',
+    note: 'Keep my note',
+    explicit: { agent: false, model: false, reasoning: true, language: false },
+  }
+  const merged = mergeEffectiveIntoDraft(
+    editedBeforeEffective,
+    { backend: 'codex', model: null, reasoning: null, language: 'en' },
+    SAVED,
+    effectiveForRepo,
+  )
+  assert.equal(merged.model, 'gpt-repo-only')
+  assert.equal(merged.reasoning, 'high')
+  assert.equal(merged.note, 'Keep my note')
+  assert.deepEqual(buildStartRoundPayload(merged), {
+    language: 'en',
+    reasoning: 'high',
+    review_note: 'Keep my note',
+  })
 })
 
 test('formatRoundSettingsLabel formats agent, model, and raw reasoning level', () => {
