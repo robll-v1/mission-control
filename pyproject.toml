@@ -30,9 +30,13 @@ pythonpath = ['backend']
 
 [tool.setuptools]
 package-dir = {"" = "backend"}
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["backend"]
+
+[tool.setuptools.package-data]
+app = ["static/*", "static/ui/*", "static/ui/assets/*"]
 
 [project.scripts]
 amc = "app.cli:main"

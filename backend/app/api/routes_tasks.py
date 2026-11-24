@@ -36,6 +36,8 @@ def get_contexts() -> ContextCompiler:
 
 
 def _generated_paths(repo_path: str, mission: MissionEngine, artifacts: ArtifactStore) -> list[str]:
+    from app.api.app import worktrees as app_worktrees
+
     repo = Path(repo_path).resolve()
     worktrees_root = artifacts.runtime_root / 'worktrees'
     if not worktrees_root.is_absolute():
@@ -43,14 +45,19 @@ def _generated_paths(repo_path: str, mission: MissionEngine, artifacts: Artifact
     paths = [
         (artifacts.runtime_root / 'tasks').resolve(),
         worktrees_root.resolve(),
+        app_worktrees._worktrees_root_for_repo(repo_path).resolve(),
         *(p.resolve() for p in mission.db.generated_paths()),
     ]
-    excluded = []
+    excluded: list[str] = []
+    seen: set[str] = set()
     for path in paths:
         try:
-            excluded.append(path.relative_to(repo).as_posix())
+            rel = path.relative_to(repo).as_posix()
         except ValueError:
-            pass
+            continue
+        if rel not in seen:
+            seen.add(rel)
+            excluded.append(rel)
     return excluded
 
 

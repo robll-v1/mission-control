@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -19,6 +20,14 @@ import time
 import webbrowser
 from pathlib import Path
 
+from app.core.paths import (
+    get_data_dir,
+    get_db_path,
+    get_packaged_run_dir,
+    has_bundled_ui,
+    maybe_import_legacy_db,
+    probe_data_dir_lock,
+)
 from app.core.proc import run_text
 
 RUN_DIR_NAME = '.run'
@@ -87,7 +96,7 @@ def _color(code: str, msg: str) -> str:
 
 
 def _root_dir() -> Path:
-    """Resolve the source checkout used for .venv, frontend and .run."""
+    """Resolve the source checkout root, or the platform data dir when installed as a package."""
     override = os.environ.get('AMC_ROOT', '').strip()
     if override:
         root = Path(override).expanduser().resolve()
@@ -98,11 +107,20 @@ def _root_dir() -> Path:
     for ancestor in [here, here.parent, here.parent.parent]:
         if (ancestor / 'pyproject.toml').exists():
             return ancestor
-    return here.parent
+    return get_data_dir()
+
+
+def _is_packaged_mode(root: Path | None = None) -> bool:
+    """Return True when running from an installed package (wheel/pipx) without a source checkout."""
+    target = root if root is not None else _root_dir()
+    return not (target / 'pyproject.toml').exists()
 
 
 def _run_dir() -> Path:
-    return _root_dir() / RUN_DIR_NAME
+    root = _root_dir()
+    if _is_packaged_mode(root):
+        return get_packaged_run_dir()
+    return root / RUN_DIR_NAME
 
 
 def _venv_python() -> Path:
@@ -416,6 +434,8 @@ def _ports_file_matches_services(items: list[dict]) -> bool:
 
 def _service_signature(kind: str, root: Path, port: int) -> list[str]:
     if kind == 'backend':
+        if _is_packaged_mode(root):
+            return ['app.api.app:app', '--host', '127.0.0.1', '--port', str(port)]
         return ['app.api.app:app', '--app-dir', str(root / 'backend'), '--port', str(port)]
     return [str(root / 'frontend' / 'node_modules' / 'vite' / 'bin' / 'vite.js'), '--port', str(port)]
 
@@ -695,6 +715,8 @@ def _port_owner_pid(port: int) -> int | None:
         else:
             import shutil
             executable = shutil.which('lsof')
+            if not executable and Path('/usr/sbin/lsof').is_file():
+                executable = '/usr/sbin/lsof'
             if not executable:
                 return None
             result = run_text(
@@ -901,24 +923,42 @@ def cmd_start(args: argparse.Namespace) -> None:
     if stale and _ports_file_matches_services(existing):
         _remove_ports_file()
 
+    # Prevent a second backend (e.g. source checkout + packaged install) from
+    # sharing the same AMC_DATA_DIR and clobbering active tasks/worktrees.
+    locked, holder_pid = probe_data_dir_lock(get_data_dir())
+    if locked:
+        holder_hint = f' (PID {holder_pid})' if holder_pid else ''
+        _fail(
+            f'Another Mission Control backend{holder_hint} is already using data directory {get_data_dir()}. '
+            'Stop it first or set a separate AMC_DATA_DIR.'
+        )
+
     # prerequisites
     _info('Checking prerequisites...')
+
+    packaged = _is_packaged_mode(root)
+    bundled_requested = bool(getattr(args, 'bundled_ui', False))
+    use_bundled_ui = (not args.no_ui) and (packaged or bundled_requested)
 
     python_ver = f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'
     if sys.version_info < (3, 11):
         _fail(f'Python 3.11+ required, found {python_ver}')
     _ok(f'Python: {python_ver}')
 
-    node_bin = _which('node')
-    has_node = bool(node_bin)
-    if has_node:
-        node_ver = (run_text([node_bin, '--version']).stdout or '').strip()
-        _ok(f'Node.js: {node_ver}')
-    else:
-        _warn('Node.js not found. Frontend will not be started.')
-    has_npm = bool(_resolve_npm()) if has_node else False
-    if has_node and not has_npm:
-        _warn('npm not found. Frontend will not be started.')
+    node_bin = None
+    has_node = False
+    has_npm = False
+    if not use_bundled_ui:
+        node_bin = _which('node')
+        has_node = bool(node_bin)
+        if has_node:
+            node_ver = (run_text([node_bin, '--version']).stdout or '').strip()
+            _ok(f'Node.js: {node_ver}')
+        else:
+            _warn('Node.js not found. Frontend will not be started.')
+        has_npm = bool(_resolve_npm()) if has_node else False
+        if has_node and not has_npm:
+            _warn('npm not found. Frontend will not be started.')
 
     detected_backends = _detect_backends()
     if detected_backends:
@@ -930,9 +970,24 @@ def cmd_start(args: argparse.Namespace) -> None:
     if not gh_token:
         _warn('No GITHUB_TOKEN or GH_TOKEN set. GitHub API rate limits will apply.')
 
+    # Legacy DB auto-import on first start into platform app data dir
+    extra_roots = [] if packaged else [root]
+    imported_legacy = maybe_import_legacy_db(extra_roots=extra_roots)
+    if imported_legacy is not None:
+        _ok(f'Imported legacy database from {imported_legacy} -> {get_db_path()}')
+
     # bootstrap
-    _ensure_venv()
-    skip_ui = args.no_ui or not has_node or not has_npm
+    if packaged:
+        if importlib.util.find_spec('uvicorn') is None:
+            _fail('uvicorn is not installed in the active Python environment.')
+        _ok('Using installed Python environment')
+    else:
+        _ensure_venv()
+
+    skip_ui = args.no_ui or use_bundled_ui or not has_node or not has_npm
+    serve_bundled_ui = (not args.no_ui) and skip_ui and has_bundled_ui()
+    if use_bundled_ui and not serve_bundled_ui:
+        _warn('Bundled Web UI assets were not found in this installation; starting API server only.')
     if not skip_ui:
         _ensure_frontend_deps()
 
@@ -952,24 +1007,65 @@ def cmd_start(args: argparse.Namespace) -> None:
     try:
         # start backend
         _info(f'Starting backend on port {backend_port}...')
-        uvicorn_bin = str(_venv_bin('uvicorn'))
         backend_log = _run_dir() / 'backend.log'
         _run_dir().mkdir(parents=True, exist_ok=True)
 
-        backend_cmd = [
-            uvicorn_bin, 'app.api.app:app',
-            '--app-dir', str(root / 'backend'),
-            '--host', '127.0.0.1',
-            '--port', str(backend_port),
-        ]
+        if packaged:
+            backend_cmd = [
+                sys.executable, '-P', '-m', 'uvicorn', 'app.api.app:app',
+                '--host', '127.0.0.1',
+                '--port', str(backend_port),
+                '--no-proxy-headers',
+            ]
+        else:
+            uvicorn_bin = str(_venv_bin('uvicorn'))
+            backend_cmd = [
+                uvicorn_bin, 'app.api.app:app',
+                '--app-dir', str(root / 'backend'),
+                '--host', '127.0.0.1',
+                '--port', str(backend_port),
+                '--no-proxy-headers',
+            ]
         # --reload spawns a separate reloader+worker pair, which makes process
         # cleanup unreliable (especially on Windows). Allow opt-in for dev only.
         if os.environ.get('AMC_DEV_RELOAD'):
             backend_cmd.append('--reload')
+        backend_env = os.environ.copy()
+        # Normalize any relative path env overrides against the caller's CWD before
+        # launching the backend subprocess (whose CWD in packaged mode is data_dir),
+        # so CLI and backend always open the exact same DB and data-dir lock.
+        for path_var in (
+            'AMC_DATA_DIR',
+            'AMC_DB_PATH',
+            'AMC_RUNTIME_DIR',
+            'AMC_WORKTREES_DIR',
+            'XDG_DATA_HOME',
+            'XDG_CONFIG_HOME',
+        ):
+            raw_val = backend_env.get(path_var, '').strip()
+            if raw_val:
+                backend_env[path_var] = str(Path(raw_val).expanduser().resolve())
+        if frontend_port is not None:
+            vite_origins = ','.join([
+                f'http://127.0.0.1:{frontend_port}',
+                f'http://localhost:{frontend_port}',
+                f'http://[::1]:{frontend_port}',
+            ])
+            existing_origins = backend_env.get('AMC_ALLOWED_ORIGINS', '').strip()
+            backend_env['AMC_ALLOWED_ORIGINS'] = (
+                f'{existing_origins},{vite_origins}' if existing_origins else vite_origins
+            )
+        backend_cwd: str | None = None
+        if packaged:
+            data_dir = get_data_dir()
+            data_dir.mkdir(parents=True, exist_ok=True)
+            backend_cwd = str(data_dir)
         try:
             with open(backend_log, 'a', encoding='utf-8', errors='replace', newline='') as log:
                 backend_proc = subprocess.Popen(
                     backend_cmd,
+                    cwd=backend_cwd,
+                    env=backend_env,
                     stdout=log, stderr=log,
                     start_new_session=not IS_WINDOWS,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0,
@@ -992,7 +1088,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             vite_entry = root / 'frontend' / 'node_modules' / 'vite' / 'bin' / 'vite.js'
             if not vite_entry.is_file():
                 _fail(f'Vite entry point is missing: {vite_entry}. Run npm install in frontend/.')
-            frontend_cmd = [node_bin, str(vite_entry), '--host', '127.0.0.1', '--port', str(frontend_port)]
+            frontend_cmd = [node_bin, str(vite_entry), '--host', '127.0.0.1', '--port', str(frontend_port), '--strictPort']
             try:
                 with open(frontend_log, 'a', encoding='utf-8', errors='replace', newline='') as log:
                     frontend_proc = subprocess.Popen(
@@ -1026,6 +1122,9 @@ def cmd_start(args: argparse.Namespace) -> None:
         if not ready:
             _fail(f'Backend did not become healthy within {HEALTH_TIMEOUT}s. Check {backend_log}')
 
+        if frontend_proc is not None and frontend_proc.poll() is not None:
+            _fail(f'Frontend exited with code {frontend_proc.returncode}. Check {frontend_log}')
+
         # save port info
         ports_info = {'backend': backend_port, 'frontend': frontend_port}
         _atomic_write_json(ports_path, ports_info)
@@ -1049,24 +1148,31 @@ def cmd_start(args: argparse.Namespace) -> None:
         raise
 
     # summary
+    web_url = (
+        f'http://127.0.0.1:{frontend_port}'
+        if frontend_port
+        else (f'http://127.0.0.1:{backend_port}' if serve_bundled_ui else None)
+    )
     print()
     _ok('Mission Control is running!')
     print()
-    if frontend_port:
-        print(f'   Web UI:   http://localhost:{frontend_port}')
-    print(f'   API:      http://localhost:{backend_port}')
-    print(f'   Health:   http://localhost:{backend_port}/api/health')
+    if web_url:
+        label = 'Web UI (bundled):' if serve_bundled_ui and not frontend_port else 'Web UI:          '
+        print(f'   {label} {web_url}')
+    print(f'   API:              http://127.0.0.1:{backend_port}')
+    print(f'   Health:           http://127.0.0.1:{backend_port}/api/health')
+    print(f'   Data:             {get_data_dir()}')
     print()
-    print(f'   Logs:     {_run_dir() / "backend.log"}')
+    print(f'   Logs:             {_run_dir() / "backend.log"}')
     if frontend_port:
-        print(f'             {_run_dir() / "frontend.log"}')
-    print(f'   Stop:     amc stop')
+        print(f'                     {_run_dir() / "frontend.log"}')
+    print(f'   Stop:             amc stop')
     print()
 
     # open browser
-    if not args.no_browser and frontend_port:
+    if not args.no_browser and web_url:
         try:
-            webbrowser.open(f'http://localhost:{frontend_port}')
+            webbrowser.open(web_url)
         except Exception:
             pass
 
@@ -1641,14 +1747,15 @@ def cmd_review(args: argparse.Namespace) -> None:
 
     # ── Run review ────────────────────────────────────────────────────
     root = _root_dir()
-    try:
-        os.chdir(root)
-    except OSError as exc:
-        _review_error(
-            f'Could not switch to the project root {root}: {exc}',
-            code='chdir_failed',
-            output_format=output_format,
-        )
+    if not _is_packaged_mode(root):
+        try:
+            os.chdir(root)
+        except OSError as exc:
+            _review_error(
+                f'Could not switch to the project root {root}: {exc}',
+                code='chdir_failed',
+                output_format=output_format,
+            )
 
     from app.sdk import ReviewEngine
 
@@ -1844,7 +1951,8 @@ def _print_review_markdown(report) -> None:
 def cmd_mcp(args: argparse.Namespace) -> None:
     """Start MCP server (stdio mode)."""
     root = _root_dir()
-    os.chdir(root)
+    if not _is_packaged_mode(root):
+        os.chdir(root)
 
     # Show model info on stderr so user knows what's being used
     import sys
@@ -1879,6 +1987,7 @@ def main() -> None:
     start_p.add_argument('--port', type=int, default=BACKEND_DEFAULT_PORT, help='Backend port (default: 8000)')
     start_p.add_argument('--ui-port', type=int, default=FRONTEND_DEFAULT_PORT, help='Frontend port (default: 5173)')
     start_p.add_argument('--no-ui', action='store_true', help='Skip frontend')
+    start_p.add_argument('--bundled-ui', action='store_true', help='Serve the bundled Web UI from the backend without Node/Vite')
     start_p.add_argument('--no-browser', action='store_true', help='Do not open browser')
 
     sub.add_parser('stop', help='Stop all services')

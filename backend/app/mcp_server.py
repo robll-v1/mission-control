@@ -228,9 +228,11 @@ async def get_review_findings(
     import os
 
     from app.core.db import Database
+    from app.core.paths import get_db_path, maybe_import_legacy_db
     from app.services.review_result_service import ReviewResultService
 
-    db = Database('data/amc.db')
+    maybe_import_legacy_db()
+    db = Database(str(get_db_path()))
     target = os.path.normcase(os.path.abspath(repo_path))
     matching = [
         task for task in db.list_tasks()

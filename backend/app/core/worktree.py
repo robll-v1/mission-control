@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from app.core.models import Task
@@ -9,12 +10,15 @@ from app.core.proc import run_git
 
 
 GITHUB_REMOTE_RE = re.compile(r'github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$')
+_CLEANUP_RETRY_DELAYS = (0.2, 0.5)
 
 
 class WorktreeManager:
-    def __init__(self, runtime_root: str):
+    def __init__(self, runtime_root: str, *, worktrees_root: str | Path | None = None):
         self.runtime_root = Path(runtime_root)
-        self.worktrees_root = self.runtime_root / 'worktrees'
+        self.worktrees_root = (
+            Path(worktrees_root) if worktrees_root is not None else (self.runtime_root / 'worktrees')
+        )
         self.worktrees_root.mkdir(parents=True, exist_ok=True)
 
     def ensure_worktree(self, task: Task) -> tuple[str, str, str]:
@@ -93,6 +97,16 @@ class WorktreeManager:
                 ['worktree', 'remove', '--force', str(worktree_path)],
                 timeout=120,
             )
+            # Bounded backoff retry for transient file locks (notably Windows AV/handles).
+            for delay in _CLEANUP_RETRY_DELAYS:
+                if result.returncode == 0 or not worktree_path.exists():
+                    break
+                time.sleep(delay)
+                result = self._run_git(
+                    repo_path,
+                    ['worktree', 'remove', '--force', str(worktree_path)],
+                    timeout=120,
+                )
             if result.returncode != 0 and worktree_path.exists():
                 errors.append(result.stderr.strip() or 'failed to remove git worktree')
             removed = not worktree_path.exists()

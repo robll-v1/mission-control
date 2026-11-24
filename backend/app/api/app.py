@@ -7,8 +7,9 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.adapters import get_adapter, AVAILABLE_BACKENDS
 from app.api.routes_artifacts import router as artifact_router
@@ -16,12 +17,22 @@ from app.api.routes_control import router as control_router
 from app.api.routes_config import router as config_router
 from app.api.routes_stream import router as stream_router
 from app.api.routes_tasks import router as task_router
+from app.api.security import LocalSecurityMiddleware
 from app.core.config import load_repo_config, resolve_backend_config
 from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
 from app.core.execution import ExecutionService
 from app.core.mission_engine import MissionEngine
 from app.core.models import TaskStatus
+from app.core.paths import (
+    DataDirLock,
+    get_bundled_ui_dir,
+    get_data_dir,
+    get_db_path,
+    get_runtime_dir,
+    get_worktrees_dir,
+    maybe_import_legacy_db,
+)
 from app.core.recovery import recover_stale_tasks
 from app.core.validation import ValidationService
 from app.core.worktree import WorktreeManager
@@ -32,11 +43,21 @@ from app.services.summary_service import SummaryService
 logger = logging.getLogger(__name__)
 
 
-RUNTIME_ROOT = 'runtime'
-db = Database('data/amc.db')
+DATA_DIR = get_data_dir()
+DB_PATH = get_db_path()
+RUNTIME_ROOT = str(get_runtime_dir())
+WORKTREES_ROOT = str(get_worktrees_dir())
+
+_checkout_root = Path(__file__).resolve().parent.parent.parent.parent
+_extra_legacy_roots = [_checkout_root] if (_checkout_root / 'pyproject.toml').is_file() else []
+_imported_legacy_db = maybe_import_legacy_db(extra_roots=_extra_legacy_roots)
+if _imported_legacy_db is not None:
+    logger.info('Imported legacy database from %s into %s', _imported_legacy_db, DB_PATH)
+
+db = Database(str(DB_PATH))
 engine = MissionEngine(db)
 adapters = {name: get_adapter(name) for name in AVAILABLE_BACKENDS}
-worktrees = WorktreeManager(RUNTIME_ROOT)
+worktrees = WorktreeManager(RUNTIME_ROOT, worktrees_root=WORKTREES_ROOT)
 artifacts = ArtifactStore(RUNTIME_ROOT)
 contexts = ContextCompiler(artifacts)
 execution = ExecutionService(
@@ -83,70 +104,78 @@ def _prune_startup_worktrees() -> None:
             continue
 
 
-# Recovery runs before pruning: worktree pruning treats VALIDATING (and the
-# other mid-flight statuses) as active and skips those tasks, so the stale
-# states must be cleared first for their worktrees to be cleaned up too.
-recover_stale_tasks(db, engine)
-_prune_startup_worktrees()
+_data_dir_lock = DataDirLock(DATA_DIR)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Graceful shutdown: wake open SSE streams on SIGTERM/SIGINT and abort active tasks."""
+    """Startup exclusivity/recovery and graceful shutdown for SSE streams and active tasks."""
+    if not _data_dir_lock.acquire():
+        holder = _data_dir_lock.holder_pid()
+        holder_hint = f' (PID {holder})' if holder else ''
+        raise RuntimeError(
+            f'Another Mission Control backend is already using data directory {DATA_DIR}{holder_hint}. '
+            'Stop it first or set a separate AMC_DATA_DIR.'
+        )
+
     prev_sig_handlers: dict[int, object] = {}
     prev_loop_handlers: dict[int, tuple] = {}
-    if threading.current_thread() is threading.main_thread():
-        # Uvicorn waits for active StreamingResponses to end BEFORE invoking
-        # lifespan teardown. Hook Uvicorn's installed signal handler (via
-        # asyncio loop signal handlers on POSIX, or callable signal.signal
-        # handlers on Windows) so open SSE streams close immediately while
-        # Uvicorn still runs full graceful teardown (exit code 0).
-        loop = asyncio.get_running_loop()
-        loop_handlers = getattr(loop, '_signal_handlers', None)
-        sigs = [signal.SIGINT]
-        if hasattr(signal, 'SIGTERM'):
-            sigs.append(signal.SIGTERM)
-        for sig in sigs:
-            if isinstance(loop_handlers, dict) and sig in loop_handlers:
-                handle = loop_handlers[sig]
-                orig_cb = getattr(handle, '_callback', None)
-                orig_args = getattr(handle, '_args', ())
-                if callable(orig_cb):
-                    prev_loop_handlers[sig] = (orig_cb, orig_args)
-
-                    def _make_loop_cb(cb, args):
-                        def _cb():
-                            engine.event_bus.close_all()
-                            cb(*args)
-                        return _cb
-
-                    try:
-                        loop.add_signal_handler(sig, _make_loop_cb(orig_cb, orig_args))
-                        continue
-                    except (NotImplementedError, RuntimeError, ValueError):
-                        prev_loop_handlers.pop(sig, None)
-            try:
-                prev = signal.getsignal(sig)
-                if callable(prev):
-                    prev_sig_handlers[sig] = prev
-
-                    def _make_sig_handler(previous, target_loop):
-                        def _handler(signum, frame):
-                            # Never acquire EventBus._lock synchronously inside a
-                            # signal handler (could self-deadlock if the signal
-                            # interrupted subscribe()/unsubscribe() on this thread).
-                            # Schedule close_all() onto the event loop instead.
-                            try:
-                                target_loop.call_soon_threadsafe(engine.event_bus.close_all)
-                            except RuntimeError:
-                                pass
-                            previous(signum, frame)
-                        return _handler
-
-                    signal.signal(sig, _make_sig_handler(prev, loop))
-            except (OSError, ValueError):
-                pass
     try:
+        # Recovery runs inside try/finally so any failure still releases _data_dir_lock.
+        recover_stale_tasks(db, engine)
+        _prune_startup_worktrees()
+
+        if threading.current_thread() is threading.main_thread():
+            # Uvicorn waits for active StreamingResponses to end BEFORE invoking
+            # lifespan teardown. Hook Uvicorn's installed signal handler (via
+            # asyncio loop signal handlers on POSIX, or callable signal.signal
+            # handlers on Windows) so open SSE streams close immediately while
+            # Uvicorn still runs full graceful teardown (exit code 0).
+            loop = asyncio.get_running_loop()
+            loop_handlers = getattr(loop, '_signal_handlers', None)
+            sigs = [signal.SIGINT]
+            if hasattr(signal, 'SIGTERM'):
+                sigs.append(signal.SIGTERM)
+            for sig in sigs:
+                if isinstance(loop_handlers, dict) and sig in loop_handlers:
+                    handle = loop_handlers[sig]
+                    orig_cb = getattr(handle, '_callback', None)
+                    orig_args = getattr(handle, '_args', ())
+                    if callable(orig_cb):
+                        prev_loop_handlers[sig] = (orig_cb, orig_args)
+
+                        def _make_loop_cb(cb, args):
+                            def _cb():
+                                engine.event_bus.close_all()
+                                cb(*args)
+                            return _cb
+
+                        try:
+                            loop.add_signal_handler(sig, _make_loop_cb(orig_cb, orig_args))
+                            continue
+                        except (NotImplementedError, RuntimeError, ValueError):
+                            prev_loop_handlers.pop(sig, None)
+                try:
+                    prev = signal.getsignal(sig)
+                    if callable(prev):
+                        prev_sig_handlers[sig] = prev
+
+                        def _make_sig_handler(previous, target_loop):
+                            def _handler(signum, frame):
+                                # Never acquire EventBus._lock synchronously inside a
+                                # signal handler (could self-deadlock if the signal
+                                # interrupted subscribe()/unsubscribe() on this thread).
+                                # Schedule close_all() onto the event loop instead.
+                                try:
+                                    target_loop.call_soon_threadsafe(engine.event_bus.close_all)
+                                except RuntimeError:
+                                    pass
+                                previous(signum, frame)
+                            return _handler
+
+                        signal.signal(sig, _make_sig_handler(prev, loop))
+                except (OSError, ValueError):
+                    pass
         yield
     finally:
         # ── shutdown ──
@@ -172,10 +201,12 @@ async def lifespan(app: FastAPI):
                 signal.signal(sig, prev)
             except (OSError, ValueError):
                 pass
+        _data_dir_lock.release()
         logger.info('Shutdown complete.')
 
 
 app = FastAPI(title='PR Review Control', lifespan=lifespan)
+app.add_middleware(LocalSecurityMiddleware)
 app.include_router(task_router)
 app.include_router(config_router)
 app.include_router(stream_router)
@@ -235,9 +266,42 @@ def admin_shutdown():
     return {'ok': True, 'aborted_tasks': aborted}
 
 
-STATIC_INDEX = Path(__file__).resolve().parent.parent / 'static' / 'index.html'
+STATIC_DIR = Path(__file__).resolve().parent.parent / 'static'
+BUNDLED_UI_DIR = get_bundled_ui_dir()
+STATIC_INDEX = (
+    BUNDLED_UI_DIR / 'index.html'
+    if (BUNDLED_UI_DIR / 'index.html').is_file()
+    else STATIC_DIR / 'index.html'
+)
+
+if (BUNDLED_UI_DIR / 'assets').is_dir():
+    app.mount('/assets', StaticFiles(directory=str(BUNDLED_UI_DIR / 'assets')), name='ui-assets')
+
+
+def _resolve_static_index() -> Path:
+    bundled = BUNDLED_UI_DIR / 'index.html'
+    if bundled.is_file():
+        return bundled
+    return STATIC_DIR / 'index.html'
 
 
 @app.get('/')
 def root():
-    return FileResponse(STATIC_INDEX)
+    return FileResponse(_resolve_static_index())
+
+
+@app.get('/{full_path:path}')
+def spa_fallback(full_path: str):
+    if full_path == 'api' or full_path.startswith('api/'):
+        raise HTTPException(status_code=404, detail='Not Found')
+    # Serve top-level bundled static files safely (no directory traversal).
+    if full_path and BUNDLED_UI_DIR.is_dir():
+        ui_root = BUNDLED_UI_DIR.resolve()
+        candidate = (ui_root / full_path).resolve()
+        try:
+            candidate.relative_to(ui_root)
+        except ValueError:
+            raise HTTPException(status_code=404, detail='Not Found')
+        if candidate.is_file():
+            return FileResponse(candidate)
+    return FileResponse(_resolve_static_index())
