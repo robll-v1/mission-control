@@ -21,6 +21,7 @@ import {
   mergeEffectiveIntoDraft,
   resolveReasoningOptions,
   savedForAgent,
+  selectDraftModel,
   switchDraftAgent,
   type BackendCapability,
   type EffectiveSettingsResponse,
@@ -542,8 +543,10 @@ export function App() {
 
   useEffect(() => {
     if (!selectedTask) return
-    setRunDraft((prev) => mergeEffectiveIntoDraft(prev, selectedTask, latestRound, savedConfig, activeTaskEffective))
-  }, [activeTaskEffective, savedConfig, selectedTask?.id, latestRound?.id])
+    setRunDraft((prev) =>
+      mergeEffectiveIntoDraft(prev, selectedTask, latestRound, savedConfig, activeTaskEffective, backends),
+    )
+  }, [activeTaskEffective, savedConfig, backends, selectedTask?.id, latestRound?.id])
 
   useEffect(() => {
     if (!selectedTaskId) return
@@ -899,27 +902,7 @@ export function App() {
                             disabled={roundActive || isStarting}
                             onChange={(e) => {
                               const nextModel = e.target.value
-                              const opts = resolveReasoningOptions(runAgentCap, nextModel)
-                              setRunDraft((prev) => {
-                                const reasoningCleared = Boolean(
-                                  prev.reasoning && (!opts.supported || !opts.levels.includes(prev.reasoning)),
-                                )
-                                return {
-                                  ...prev,
-                                  model: nextModel,
-                                  reasoning: reasoningCleared ? '' : prev.reasoning,
-                                  explicit: {
-                                    ...prev.explicit,
-                                    model: true,
-                                    reasoning: reasoningCleared ? true : prev.explicit.reasoning,
-                                  },
-                                  userEdited: {
-                                    ...prev.userEdited,
-                                    model: true,
-                                    reasoning: reasoningCleared ? true : prev.userEdited.reasoning,
-                                  },
-                                }
-                              })
+                              setRunDraft((prev) => selectDraftModel(prev, nextModel, runAgentCap))
                             }}
                           >
                             <option value="">{t.settings.agentDefault}</option>
@@ -935,12 +918,10 @@ export function App() {
                             value={runDraft.model}
                             disabled={roundActive || isStarting}
                             placeholder={t.settings.agentDefault}
-                            onChange={(e) => setRunDraft((prev) => ({
-                              ...prev,
-                              model: e.target.value,
-                              explicit: { ...prev.explicit, model: true },
-                              userEdited: { ...prev.userEdited, model: true },
-                            }))}
+                            onChange={(e) => {
+                              const nextModel = e.target.value
+                              setRunDraft((prev) => selectDraftModel(prev, nextModel, runAgentCap))
+                            }}
                           />
                         )}
                       </label>

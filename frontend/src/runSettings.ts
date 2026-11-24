@@ -268,13 +268,58 @@ export function createRunDraft(
   }
 }
 
+function backendHasReasoningSupport(backend: BackendCapability | undefined): boolean {
+  return Boolean(
+    backend &&
+      (backend.reasoning_supported ||
+        (backend.model_reasoning && Object.keys(backend.model_reasoning).length > 0)),
+  )
+}
+
+/**
+ * Update the model on a draft: marks `model` as explicitly/user edited and
+ * clears any reasoning level that is incompatible with the newly selected
+ * model (marking `explicit.reasoning = true` so the backend receives
+ * `reasoning: null` instead of inheriting the old model's saved reasoning).
+ */
+export function selectDraftModel(
+  draft: RunDraft,
+  nextModel: string,
+  backend: BackendCapability | undefined,
+): RunDraft {
+  const supportsReasoning = backendHasReasoningSupport(backend)
+  const opts = resolveReasoningOptions(backend, nextModel)
+  const reasoningCleared = Boolean(
+    supportsReasoning &&
+      draft.reasoning &&
+      (!opts.supported || !opts.levels.includes(draft.reasoning)),
+  )
+  return {
+    ...draft,
+    model: nextModel,
+    reasoning: reasoningCleared ? '' : draft.reasoning,
+    explicit: {
+      ...draft.explicit,
+      model: true,
+      reasoning: reasoningCleared ? true : draft.explicit.reasoning,
+    },
+    userEdited: {
+      ...draft.userEdited,
+      model: true,
+    },
+  }
+}
+
 /**
  * Merge newly arrived saved/repo-effective config into a draft field-by-field.
  *
  * Purely re-derives every non-user-edited field and its `explicit` flag from
  * `createRunDraft(task, latestRound, saved, effective)` so the result is
  * strictly commutative (independent of whether `saved` or `effective` arrives
- * first), while never overwriting any field the user edited.
+ * first), while never overwriting any field the user edited. If the user
+ * already chose a different model and late-arriving config carries a reasoning
+ * level incompatible with that model, clears reasoning and marks it explicit
+ * (`null` in payload) so the backend does not inherit the incompatible level.
  */
 export function mergeEffectiveIntoDraft(
   prev: RunDraft,
@@ -282,19 +327,39 @@ export function mergeEffectiveIntoDraft(
   latestRound: RoundLike | undefined,
   saved: SavedConfig | null,
   effective?: EffectiveSettingsResponse | null,
+  backends?: BackendCapability[],
 ): RunDraft {
   if (prev.userEdited.agent) return prev
   const next = createRunDraft(task, latestRound, saved, effective)
+  const mergedAgent = next.agent
+  const mergedModel = prev.userEdited.model ? prev.model : next.model
+
+  let mergedReasoning = prev.userEdited.reasoning ? prev.reasoning : next.reasoning
+  let mergedReasoningExplicit = prev.userEdited.reasoning
+    ? prev.explicit.reasoning
+    : next.explicit.reasoning
+
+  if (prev.userEdited.model && !prev.userEdited.reasoning && mergedReasoning) {
+    const cap = backends?.find((b) => b.name === mergedAgent)
+    if (backendHasReasoningSupport(cap)) {
+      const opts = resolveReasoningOptions(cap, mergedModel)
+      if (!opts.supported || !opts.levels.includes(mergedReasoning)) {
+        mergedReasoning = ''
+        mergedReasoningExplicit = true
+      }
+    }
+  }
+
   return {
     ...prev,
-    agent: next.agent,
-    model: prev.userEdited.model ? prev.model : next.model,
-    reasoning: prev.userEdited.reasoning ? prev.reasoning : next.reasoning,
+    agent: mergedAgent,
+    model: mergedModel,
+    reasoning: mergedReasoning,
     language: prev.userEdited.language ? prev.language : next.language,
     explicit: {
       agent: next.explicit.agent,
       model: prev.userEdited.model ? prev.explicit.model : next.explicit.model,
-      reasoning: prev.userEdited.reasoning ? prev.explicit.reasoning : next.explicit.reasoning,
+      reasoning: mergedReasoningExplicit,
       language: prev.userEdited.language ? prev.explicit.language : next.explicit.language,
     },
   }

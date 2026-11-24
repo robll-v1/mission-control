@@ -11,6 +11,7 @@ import {
   normalizeReviewLang,
   resolveReasoningOptions,
   savedForAgent,
+  selectDraftModel,
   switchDraftAgent,
   type BackendCapability,
   type SavedConfig,
@@ -316,6 +317,94 @@ test('createRunDraft uses repo effective settings over global config for auto-cr
     openEffective,
   )
   assert.deepEqual(buildStartRoundPayload(savedFirst), buildStartRoundPayload(effectiveFirst))
+})
+
+test('selectDraftModel and late config never leak incompatible reasoning to Codex', () => {
+  const task = { backend: 'codex', model: null, reasoning: null, language: 'en' }
+
+  // Case 1: User switches to gpt-6-luna (max high) BEFORE savedConfig (xhigh) arrives
+  const initialBeforeConfig = createRunDraft(task, undefined, null)
+  const switchedBeforeConfig = selectDraftModel(initialBeforeConfig, 'gpt-6-luna', CODEX)
+  const afterLateSaved = mergeEffectiveIntoDraft(
+    switchedBeforeConfig,
+    task,
+    undefined,
+    SAVED,
+    null,
+    BACKENDS,
+  )
+  assert.equal(afterLateSaved.model, 'gpt-6-luna')
+  assert.equal(afterLateSaved.reasoning, '')
+  assert.deepEqual(buildStartRoundPayload(afterLateSaved), {
+    language: 'en',
+    model: 'gpt-6-luna',
+    reasoning: null,
+  })
+
+  // Case 2: savedConfig (xhigh) arrives FIRST, then user switches to gpt-6-luna, then effective (xhigh) arrives
+  const effectiveXhigh = {
+    settings: { agent: 'codex', model: 'gpt-6.2-sol', reasoning: 'xhigh', language: 'en' },
+    backend: 'codex',
+    model: 'gpt-6.2-sol',
+    reasoning: 'xhigh',
+    sources: { agent: 'global', model: 'global', reasoning: 'global', language: 'default' },
+  }
+  const initialAfterSaved = createRunDraft(task, undefined, SAVED)
+  const switchedAfterSaved = selectDraftModel(initialAfterSaved, 'gpt-6-luna', CODEX)
+  assert.equal(switchedAfterSaved.reasoning, '')
+  assert.equal(switchedAfterSaved.explicit.reasoning, true)
+  const afterLateEffectiveXhigh = mergeEffectiveIntoDraft(
+    switchedAfterSaved,
+    task,
+    undefined,
+    SAVED,
+    effectiveXhigh,
+    BACKENDS,
+  )
+  assert.deepEqual(afterLateEffectiveXhigh, afterLateSaved)
+  assert.deepEqual(buildStartRoundPayload(afterLateEffectiveXhigh), {
+    language: 'en',
+    model: 'gpt-6-luna',
+    reasoning: null,
+  })
+
+  // Case 3: Compatible repo effective reasoning ('medium') converges cleanly regardless of order
+  const effectiveMedium = {
+    settings: { agent: 'codex', model: 'gpt-6.2-sol', reasoning: 'medium', language: 'en' },
+    backend: 'codex',
+    model: 'gpt-6.2-sol',
+    reasoning: 'medium',
+    sources: { agent: 'global', model: 'global', reasoning: 'repo', language: 'default' },
+  }
+  const orderA = mergeEffectiveIntoDraft(afterLateSaved, task, undefined, SAVED, effectiveMedium, BACKENDS)
+  const orderB = mergeEffectiveIntoDraft(switchedAfterSaved, task, undefined, SAVED, effectiveMedium, BACKENDS)
+  assert.equal(orderA.reasoning, 'medium')
+  assert.equal(orderA.explicit.reasoning, false)
+  assert.deepEqual(orderA, orderB)
+
+  // Case 4: OpenCode (reasoning unsupported) model edit + late savedConfig with legacy variant preserves variant
+  const opencodeCap: BackendCapability = {
+    name: 'opencode',
+    version: '2.0.14',
+    models: ['openai/gpt-5', 'anthropic/claude-sonnet'],
+    command: 'opencode',
+    model_count: 2,
+    reasoning_supported: false,
+    reasoning_levels: [],
+  }
+  const openTask = { backend: 'opencode', model: null, reasoning: null, language: 'en' }
+  const openSaved: SavedConfig = {
+    backend: 'opencode',
+    model: 'openai/gpt-5',
+    reasoning: null,
+    variant: 'high',
+  }
+  const openEdited = selectDraftModel(createRunDraft(openTask, undefined, null), 'anthropic/claude-sonnet', opencodeCap)
+  const openMerged = mergeEffectiveIntoDraft(openEdited, openTask, undefined, openSaved, null, [opencodeCap])
+  assert.deepEqual(buildStartRoundPayload(openMerged), {
+    language: 'en',
+    model: 'anthropic/claude-sonnet',
+  })
 })
 
 test('formatRoundSettingsLabel formats agent, model, and raw reasoning level', () => {
