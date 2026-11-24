@@ -404,6 +404,7 @@ export function App() {
   const findingSeqRef = useRef<Map<string, number>>(new Map())
   const streamEventsByTaskRef = useRef<Map<string, EventRecord[]>>(new Map())
   const streamOverflowCutoffByTaskRef = useRef<Map<string, number>>(new Map())
+  const inFlightLoadsByTaskRef = useRef<Map<string, number>>(new Map())
   const [startingTaskIds, setStartingTaskIds] = useState<string[]>([])
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'light'
@@ -480,10 +481,11 @@ export function App() {
     }
   }, [])
 
-  const loadTask = useCallback(async (taskId: string, options?: { silent?: boolean }) => {
+  const loadTask = useCallback(async (taskId: string, options?: { silent?: boolean; isOverflowResync?: boolean }) => {
     if (selectedTaskIdRef.current !== taskId) return
     const nextSeq = (loadSeqByTaskRef.current.get(taskId) ?? 0) + 1
     loadSeqByTaskRef.current.set(taskId, nextSeq)
+    inFlightLoadsByTaskRef.current.set(taskId, (inFlightLoadsByTaskRef.current.get(taskId) ?? 0) + 1)
     try {
       const data = normalizeTaskDetail(await api<TaskDetailResponse>(`/api/tasks/${taskId}`))
       if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
@@ -514,20 +516,28 @@ export function App() {
         }
         return data
       })
-      // If the bounded SSE buffer evicted older events while this GET snapshot
-      // was stale (rawMaxFetchedSeq < evictedSeq), trigger one silent resync to
-      // recover the full contiguous event history from the server.
+      // Keep the overflow cutoff armed until a server snapshot actually covers
+      // all evicted events (`rawMaxFetchedSeq >= overflowCutoff`). If this resync
+      // fails or stays stale, subsequent SSE events will retry cleanly.
       const overflowCutoff = streamOverflowCutoffByTaskRef.current.get(taskId) ?? 0
       if (overflowCutoff > 0) {
-        streamOverflowCutoffByTaskRef.current.delete(taskId)
-        if (rawMaxFetchedSeq < overflowCutoff && selectedTaskIdRef.current === taskId) {
-          void loadTask(taskId, { silent: true })
+        if (rawMaxFetchedSeq >= overflowCutoff) {
+          streamOverflowCutoffByTaskRef.current.delete(taskId)
+        } else if (!options?.isOverflowResync && selectedTaskIdRef.current === taskId) {
+          void loadTask(taskId, { silent: true, isOverflowResync: true })
         }
       }
     } catch (err) {
       if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
       if (!options?.silent) {
         setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.loadReview) })
+      }
+    } finally {
+      const remainingLoads = (inFlightLoadsByTaskRef.current.get(taskId) ?? 1) - 1
+      if (remainingLoads > 0) {
+        inFlightLoadsByTaskRef.current.set(taskId, remainingLoads)
+      } else {
+        inFlightLoadsByTaskRef.current.delete(taskId)
       }
     }
   }, [])
@@ -677,6 +687,11 @@ export function App() {
       if (shouldRefreshTaskOnEvent(parsed)) {
         void loadTask(selectedTaskId, { silent: true })
         void refreshTasks({ silent: true })
+      } else if (
+        (streamOverflowCutoffByTaskRef.current.get(selectedTaskId) ?? 0) > 0 &&
+        (inFlightLoadsByTaskRef.current.get(selectedTaskId) ?? 0) === 0
+      ) {
+        void loadTask(selectedTaskId, { silent: true, isOverflowResync: true })
       }
     }
 
