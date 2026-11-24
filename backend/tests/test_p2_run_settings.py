@@ -763,7 +763,7 @@ def test_sdk_explicit_flags_beat_env_and_round_focus_strips_stale_focus(git_repo
         pytest.fail('round did not finish in time')
 
     try:
-        task = engine.create_task(str(git_repo), review_focus='  old-focus-alpha  ')
+        task = engine.create_task(str(git_repo), review_focus='\n  old-focus-alpha  \n')
         # Round 1: explicit constructor --model/--reasoning MUST beat AMC_MODEL/AMC_REASONING
         r1 = engine.start_review(task.id)
         _wait_idle(task.id)
@@ -773,7 +773,7 @@ def test_sdk_explicit_flags_beat_env_and_round_focus_strips_stale_focus(git_repo
         assert r1.settings.sources['reasoning'] == 'explicit'
         assert 'old-focus-alpha' in seen[0][3]
 
-        # Round 2: overriding review_focus must replace stale embedded focus in prompt (even with whitespace)
+        # Round 2: overriding review_focus must replace stale embedded focus in prompt (even with newlines)
         engine._execution.start_task(task.id, review_focus='new-focus-beta')
         _wait_idle(task.id)
         assert 'new-focus-beta' in seen[1][3]
@@ -812,10 +812,12 @@ def test_check_agent_rejects_unsupported_claude_effort_and_invalid_copilot_reaso
     bad_cop = client.post('/api/config/check-agent', json={'backend': 'copilot', 'reasoning': 'bad;rm'})
     assert bad_cop.status_code == 422
 
-    # /effective rejects fake .git directory without HEAD, invalid gitdir pointer, and oversized .amc.yaml (>1 MiB)
+    # /effective rejects fake .git directory without HEAD, invalid/NUL gitdir pointer, and oversized .amc.yaml (>1 MiB)
     fake_ptr = tmp_path / 'fake_git_ptr'
     fake_ptr.mkdir()
     (fake_ptr / '.git').write_text('gitdir:\n', encoding='utf-8')
+    assert client.get('/api/config/effective', params={'repo_path': str(fake_ptr)}).status_code == 400
+    (fake_ptr / '.git').write_text('gitdir: bad\x00path\n', encoding='utf-8')
     assert client.get('/api/config/effective', params={'repo_path': str(fake_ptr)}).status_code == 400
 
     fake_repo = tmp_path / 'fake_git'

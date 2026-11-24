@@ -47,8 +47,8 @@ def _strip_embedded_review_focus(description: str, old_focus: str) -> str:
     if not description or not cleaned_old:
         return description
     escaped = re.escape(cleaned_old)
-    updated = re.sub(rf'\n\n## Review Focus\n[ \t]*{escaped}[ \t]*(?=\n|$)', '', description)
-    updated = re.sub(rf'(?:^|\n)Review focus:[ \t]*{escaped}[ \t]*(?=\n|$)', '', updated)
+    updated = re.sub(rf'\n\n## Review Focus\n\s*{escaped}\s*(?=\n|$)', '', description)
+    updated = re.sub(rf'(?:^|\n)Review focus:\s*{escaped}\s*(?=\n|$)', '', updated)
     return updated.strip('\n') if updated != description else description
 
 

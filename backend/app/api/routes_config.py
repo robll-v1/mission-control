@@ -212,12 +212,15 @@ def _is_git_repo_dir(resolved_root: Path) -> bool:
         if not first_line.startswith('gitdir:'):
             return False
         raw_target = first_line[len('gitdir:'):].strip()
-        if not raw_target:
+        if not raw_target or '\x00' in raw_target:
             return False
-        target = Path(raw_target)
-        if not target.is_absolute():
-            target = (resolved_root / target).resolve()
-        return target.is_dir() and (target / 'HEAD').is_file()
+        try:
+            target = Path(raw_target)
+            if not target.is_absolute():
+                target = (resolved_root / target).resolve()
+            return target.is_dir() and (target / 'HEAD').is_file()
+        except (OSError, ValueError):
+            return False
     return False
 
 
