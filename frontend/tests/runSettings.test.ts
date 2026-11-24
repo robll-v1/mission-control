@@ -257,6 +257,7 @@ test('createRunDraft uses repo effective settings over global config for auto-cr
   const merged = mergeEffectiveIntoDraft(
     editedBeforeEffective,
     { backend: 'codex', model: null, reasoning: null, language: 'en' },
+    undefined,
     SAVED,
     effectiveForRepo,
   )
@@ -267,6 +268,22 @@ test('createRunDraft uses repo effective settings over global config for auto-cr
     language: 'en',
     reasoning: 'high',
     review_note: 'Keep my note',
+  })
+
+  // Subsequent round with CLI/Model default + late savedConfig must still emit explicit nulls
+  const priorDefaultRound = { backend: 'codex', model: null, reasoning: null, language: 'en' }
+  const beforeSaved = createRunDraft({ backend: 'codex', model: null, reasoning: null, language: 'en' }, priorDefaultRound, null)
+  const afterSaved = mergeEffectiveIntoDraft(
+    beforeSaved,
+    { backend: 'codex', model: null, reasoning: null, language: 'en' },
+    priorDefaultRound,
+    SAVED,
+    null,
+  )
+  assert.deepEqual(buildStartRoundPayload(afterSaved), {
+    language: 'en',
+    model: null,
+    reasoning: null,
   })
 })
 

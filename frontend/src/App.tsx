@@ -541,8 +541,8 @@ export function App() {
   }, [selectedTask?.id, latestRound?.id])
 
   useEffect(() => {
-    if (!selectedTask || latestRound) return
-    setRunDraft((prev) => mergeEffectiveIntoDraft(prev, selectedTask, savedConfig, activeTaskEffective))
+    if (!selectedTask) return
+    setRunDraft((prev) => mergeEffectiveIntoDraft(prev, selectedTask, latestRound, savedConfig, activeTaskEffective))
   }, [activeTaskEffective, savedConfig, selectedTask?.id, latestRound?.id])
 
   useEffect(() => {

@@ -256,22 +256,30 @@ export function createRunDraft(
 }
 
 /**
- * Merge newly arrived repo-effective defaults into a first-round draft
- * field-by-field, preserving any fields the user has already edited.
+ * Merge newly arrived saved/repo-effective config into a draft field-by-field,
+ * preserving any fields the user has already edited while updating inherited
+ * defaults and explicit carryover flags when config loads late.
  */
 export function mergeEffectiveIntoDraft(
   prev: RunDraft,
   task: TaskLike,
+  latestRound: RoundLike | undefined,
   saved: SavedConfig | null,
   effective?: EffectiveSettingsResponse | null,
 ): RunDraft {
   if (prev.explicit.agent) return prev
-  const next = createRunDraft(task, undefined, saved, effective)
+  const next = createRunDraft(task, latestRound, saved, effective)
   return {
     ...prev,
     model: prev.explicit.model ? prev.model : next.model,
     reasoning: prev.explicit.reasoning ? prev.reasoning : next.reasoning,
     language: prev.explicit.language ? prev.language : next.language,
+    explicit: {
+      agent: prev.explicit.agent || next.explicit.agent,
+      model: prev.explicit.model || next.explicit.model,
+      reasoning: prev.explicit.reasoning || next.explicit.reasoning,
+      language: prev.explicit.language || next.explicit.language,
+    },
   }
 }
 
