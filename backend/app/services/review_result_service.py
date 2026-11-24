@@ -31,7 +31,14 @@ PATH_LINE_PATTERN = re.compile(r'`([^`:\s]+):(\d+)(?:-\d+)?`')
 PATH_PATTERN = re.compile(r'`([^`/\s]+/[^`:\s]+)`')
 # Match bare path:line, with optional backticks and optional line range
 BARE_PATH_LINE_PATTERN = re.compile(r'`?([^`\s:]+/[^`\s:]+):(\d+)(?:-\d+)?`?')
-JSON_FENCE_PATTERN = re.compile(r'```(?:json|amc-review-json)\s*\n(.*?)\n?```', re.DOTALL | re.IGNORECASE)
+JSON_FENCE_OPEN_PATTERN = re.compile(
+    r'^[ \t]*```(?:json|amc-review-json)[ \t]*$',
+    re.MULTILINE | re.IGNORECASE,
+)
+JSON_FENCE_PATTERN = re.compile(
+    r'^[ \t]*```(?:json|amc-review-json)[ \t]*\r?\n(.*?)\r?\n?[ \t]*```[ \t]*$',
+    re.DOTALL | re.MULTILINE | re.IGNORECASE,
+)
 NOISE_TEXT_PREFIXES = ('[mnemo]',)
 NOISY_EVENT_KINDS = {'agent.step_start', 'agent.step_finish'}
 
@@ -188,9 +195,11 @@ class ReviewResultService:
     @staticmethod
     def _strip_json_fences(text: str) -> str:
         cleaned = JSON_FENCE_PATTERN.sub('', text)
-        # Also strip any truncated/unclosed trailing ```json fence so partial JSON
-        # never pollutes the fallback summary.
-        cleaned = re.sub(r'```(?:json|amc-review-json)\b[\s\S]*$', '', cleaned, flags=re.IGNORECASE)
+        # Also strip any truncated/unclosed trailing ```json fence on its own line
+        # so partial JSON never pollutes the fallback summary.
+        open_match = JSON_FENCE_OPEN_PATTERN.search(cleaned)
+        if open_match is not None:
+            cleaned = cleaned[:open_match.start()]
         return cleaned.strip()
 
     @staticmethod
@@ -219,9 +228,9 @@ class ReviewResultService:
             return None, False
         last_match = matches[-1]
         trailing = text[last_match.end():]
-        # If an unclosed ```json fence or Markdown findings appear after the last
-        # closed fence, that fence was an earlier example, not the final payload.
-        if re.search(r'```(?:json|amc-review-json)\b', trailing, re.IGNORECASE):
+        # If an unclosed standalone ```json fence or Markdown findings appear after
+        # the last closed fence, that fence was an earlier example, not final output.
+        if JSON_FENCE_OPEN_PATTERN.search(trailing):
             return None, False
         if any(SEVERITY_PATTERN.match(line.rstrip()) for line in trailing.splitlines()):
             return None, False

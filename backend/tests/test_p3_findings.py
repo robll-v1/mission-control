@@ -1028,6 +1028,31 @@ def test_unclosed_trailing_json_and_4301_digit_line_do_not_break_parsing():
     assert res_huge.finding_count == 1
     assert res_huge.findings[0].line is None
 
+    # Inline ```json mention and ```json-schema block must NOT swallow real findings
+    inline_and_schema = (
+        '## Review Summary\n\nMentions inline ```json fence and a json-schema block.\n\n'
+        '```json-schema\n{"type": "object"}\n```\n\n'
+        '## Findings\n\n'
+        '- high: `app/api.py:12` — Unchecked request payload\n'
+    )
+    res_inline = ReviewResultService.parse_raw_text(inline_and_schema)
+    assert res_inline.parse_mode == 'markdown'
+    assert res_inline.verdict == ReviewVerdict.CONCERNS
+    assert res_inline.finding_count == 1
+    assert res_inline.findings[0].path == 'app/api.py'
+
+    trailing_schema_after_json = (
+        '```json\n'
+        '{"verdict": "concerns", "summary": "One real bug.", "findings": [{"severity": "high", "path": "a.py", "line": 4, "title": "Bug"}]}\n'
+        '```\n\n'
+        'Note: mentions ```json inline and:\n'
+        '```json-schema\n{"type": "object"}\n```\n'
+    )
+    res_after = ReviewResultService.parse_raw_text(trailing_schema_after_json)
+    assert res_after.parse_mode == 'json'
+    assert res_after.verdict == ReviewVerdict.CONCERNS
+    assert res_after.finding_count == 1
+
 
 def test_upgrade_preserves_resolved_without_sync_state_and_snapshot_diff_after_head_advances(git_repo, tmp_path):
     import subprocess as _sp
