@@ -1031,6 +1031,20 @@ def cmd_start(args: argparse.Namespace) -> None:
         if os.environ.get('AMC_DEV_RELOAD'):
             backend_cmd.append('--reload')
         backend_env = os.environ.copy()
+        # Normalize any relative path env overrides against the caller's CWD before
+        # launching the backend subprocess (whose CWD in packaged mode is data_dir),
+        # so CLI and backend always open the exact same DB and data-dir lock.
+        for path_var in (
+            'AMC_DATA_DIR',
+            'AMC_DB_PATH',
+            'AMC_RUNTIME_DIR',
+            'AMC_WORKTREES_DIR',
+            'XDG_DATA_HOME',
+            'XDG_CONFIG_HOME',
+        ):
+            raw_val = backend_env.get(path_var, '').strip()
+            if raw_val:
+                backend_env[path_var] = str(Path(raw_val).expanduser().resolve())
         if frontend_port is not None:
             vite_origins = ','.join([
                 f'http://127.0.0.1:{frontend_port}',
@@ -1074,7 +1088,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             vite_entry = root / 'frontend' / 'node_modules' / 'vite' / 'bin' / 'vite.js'
             if not vite_entry.is_file():
                 _fail(f'Vite entry point is missing: {vite_entry}. Run npm install in frontend/.')
-            frontend_cmd = [node_bin, str(vite_entry), '--host', '127.0.0.1', '--port', str(frontend_port)]
+            frontend_cmd = [node_bin, str(vite_entry), '--host', '127.0.0.1', '--port', str(frontend_port), '--strictPort']
             try:
                 with open(frontend_log, 'a', encoding='utf-8', errors='replace', newline='') as log:
                     frontend_proc = subprocess.Popen(

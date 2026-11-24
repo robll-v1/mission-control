@@ -133,14 +133,38 @@ def test_legacy_db_import_rejects_unrelated_db_symlinks_and_non_amc_cwd(tmp_path
     assert paths.maybe_import_legacy_db(target, candidates=candidates) is None
     assert not target.exists()
 
-    # 4. find_legacy_db_paths ignores cwd/data/amc.db when cwd is not an AMC checkout
+    # 4. find_legacy_db_paths NEVER trusts caller CWD (even if CWD plants a fake pyproject.toml)
     random_repo = tmp_path / 'other-project'
     (random_repo / 'data').mkdir(parents=True)
+    (random_repo / 'pyproject.toml').write_text('[project]\nname = "agent-mission-control"\n', encoding='utf-8')
     (random_repo / 'data' / 'amc.db').write_bytes(real_amc_path.read_bytes())
     monkeypatch.chdir(random_repo)
     assert paths.find_legacy_db_paths() == []
 
-    # 5. Opt-out flag skips even valid direct candidate
+    # 5. Corrupt second row in tasks table causes validation to reject the legacy DB
+    corrupt_second = tmp_path / 'corrupt-second.db'
+    cdb = Database(str(corrupt_second))
+    cdb.save_task(Task(title='Good first row', repo_path=str(tmp_path), created_at=1.0, updated_at=1.0))
+    cdb.conn.execute("INSERT INTO tasks (id, data) VALUES ('bad-row', '{not-valid-task-json')")
+    cdb.conn.commit()
+    cdb.close()
+    assert paths.maybe_import_legacy_db(target, candidates=[corrupt_second]) is None
+    assert not target.exists()
+
+    # 6. Symlinked parent `data/` directory under an explicit checkout root is rejected
+    sym_checkout = tmp_path / 'sym-checkout'
+    sym_checkout.mkdir()
+    (sym_checkout / 'pyproject.toml').write_text('[project]\nname = "agent-mission-control"\n', encoding='utf-8')
+    outside_data = tmp_path / 'outside-data'
+    outside_data.mkdir()
+    (outside_data / 'amc.db').write_bytes(real_amc_path.read_bytes())
+    try:
+        (sym_checkout / 'data').symlink_to(outside_data, target_is_directory=True)
+        assert paths.find_legacy_db_paths(extra_roots=[sym_checkout]) == []
+    except OSError:
+        pass
+
+    # 7. Opt-out flag skips even valid direct candidate
     monkeypatch.setenv('AMC_NO_LEGACY_IMPORT', '1')
     assert paths.maybe_import_legacy_db(target, candidates=[real_amc_path]) is None
     assert not target.exists()
@@ -410,12 +434,17 @@ def test_cli_packaged_mode_starts_safely_without_node_or_venv(tmp_path, monkeypa
         def poll(self):
             return 0
 
-    spawned: list[tuple[list[str], str | None]] = []
+    spawned: list[tuple[list[str], str | None, dict | None]] = []
     monkeypatch.setattr(
         cli.subprocess,
         'Popen',
-        lambda cmd, **kwargs: spawned.append((cmd, kwargs.get('cwd'))) or FakeProc(),
+        lambda cmd, **kwargs: spawned.append((cmd, kwargs.get('cwd'), kwargs.get('env'))) or FakeProc(),
     )
+
+    # Use a RELATIVE AMC_DATA_DIR to verify cli.py normalizes it to an absolute
+    # path before switching cwd=data_dir for the backend subprocess.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('AMC_DATA_DIR', 'pkg-data')
 
     args = SimpleNamespace(no_ui=False, bundled_ui=False, no_browser=True, port=port, ui_port=18261)
     cli.cmd_start(args)
@@ -424,12 +453,14 @@ def test_cli_packaged_mode_starts_safely_without_node_or_venv(tmp_path, monkeypa
     assert 'Node.js not found' not in captured.err
     assert f'http://127.0.0.1:{port}' in captured.out
     assert len(spawned) == 1
-    cmd, cwd = spawned[0]
+    cmd, cwd, proc_env = spawned[0]
     assert cmd == [
         sys.executable, '-P', '-m', 'uvicorn', 'app.api.app:app',
         '--host', '127.0.0.1', '--port', str(port), '--no-proxy-headers',
     ]
     assert cwd == str(data_dir.resolve())
+    assert proc_env is not None
+    assert proc_env['AMC_DATA_DIR'] == str(data_dir.resolve())
     assert (data_dir / 'run' / 'ports.json').is_file()
     state = json.loads((data_dir / 'run' / 'backend.json').read_text(encoding='utf-8'))
     assert cli._verify_service_state(state)[0] is True

@@ -118,7 +118,10 @@ class DataDirLock:
         try:
             os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
-            os.write(fd, f'{os.getpid()}\n'.encode('ascii'))
+            # Reserve byte 0 for Windows mandatory 1-byte lock (`msvcrt.locking`);
+            # store the holder PID starting at byte 1 so other processes can read
+            # it without hitting Windows byte-range PermissionError.
+            os.write(fd, b'\n' + f'{os.getpid()}\n'.encode('ascii'))
             os.fsync(fd)
         except OSError:
             pass
@@ -147,11 +150,21 @@ class DataDirLock:
                 pass
 
     def holder_pid(self) -> int | None:
+        fd: int | None = None
         try:
-            text = self.lock_path.read_text(encoding='ascii', errors='ignore').strip()
+            fd = os.open(str(self.lock_path), os.O_RDONLY)
+            os.lseek(fd, 1, os.SEEK_SET)
+            raw = os.read(fd, 64)
+            text = raw.decode('ascii', errors='ignore').strip()
             return int(text) if text.isdigit() else None
         except OSError:
             return None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def probe_data_dir_lock(data_dir: Path | str) -> tuple[bool, int | None]:
@@ -176,13 +189,39 @@ def _is_amc_checkout_root(root: Path) -> bool:
     return 'agent-mission-control' in text
 
 
-def _is_nonempty_regular_sqlite_file(path: Path) -> bool:
-    """Verify ``path`` is a regular non-symlink file starting with the SQLite magic header."""
-    try:
-        lst = path.lstat()
-        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+def _has_symlink_component(path: Path, *, stop_at: Path | None = None) -> bool:
+    """Return True if ``path`` or any inspected parent up to ``stop_at`` is a symlink."""
+    current = path
+    boundary = stop_at.resolve() if stop_at is not None else None
+    while True:
+        try:
+            lst = current.lstat()
+        except OSError:
+            return True
+        if stat.S_ISLNK(lst.st_mode):
+            return True
+        if boundary is not None and current.resolve() == boundary:
             return False
-        if lst.st_size < len(_SQLITE_MAGIC):
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
+def _is_nonempty_regular_sqlite_file(path: Path, *, trusted_root: Path | None = None) -> bool:
+    """Verify ``path`` is a regular non-symlink SQLite file (and its parents under ``trusted_root`` are not symlinks)."""
+    try:
+        if trusted_root is not None:
+            if _has_symlink_component(path, stop_at=trusted_root):
+                return False
+        else:
+            lst = path.lstat()
+            if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+                return False
+            parent_lst = path.parent.lstat()
+            if stat.S_ISLNK(parent_lst.st_mode):
+                return False
+        lst = path.lstat()
+        if not stat.S_ISREG(lst.st_mode) or lst.st_size < len(_SQLITE_MAGIC):
             return False
         with path.open('rb') as handle:
             return handle.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
@@ -196,9 +235,9 @@ def _open_readonly_sqlite(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True, timeout=5.0)
 
 
-def _legacy_db_has_valid_amc_data(path: Path) -> bool:
-    """Return True iff ``path`` is a genuine AMC SQLite database containing >=1 valid Task."""
-    if not _is_nonempty_regular_sqlite_file(path):
+def _legacy_db_has_valid_amc_data(path: Path, *, trusted_root: Path | None = None) -> bool:
+    """Return True iff ``path`` is a genuine AMC SQLite DB where EVERY Task row is valid."""
+    if not _is_nonempty_regular_sqlite_file(path, trusted_root=trusted_root):
         return False
     conn: sqlite3.Connection | None = None
     try:
@@ -219,10 +258,13 @@ def _legacy_db_has_valid_amc_data(path: Path) -> bool:
         event_cols = {row['name'] for row in conn.execute('PRAGMA table_info(events)').fetchall()}
         if not _REQUIRED_EVENT_COLUMNS.issubset(event_cols):
             return False
-        row = conn.execute('SELECT data FROM tasks LIMIT 1').fetchone()
-        if row is None or not isinstance(row['data'], str):
+        rows = conn.execute('SELECT data FROM tasks').fetchall()
+        if not rows:
             return False
-        Task.model_validate_json(row['data'])
+        for row in rows:
+            if not isinstance(row['data'], str):
+                return False
+            Task.model_validate_json(row['data'])
         return True
     except (sqlite3.Error, ValueError):
         return False
@@ -235,15 +277,19 @@ def _legacy_db_has_valid_amc_data(path: Path) -> bool:
 
 
 def find_legacy_db_paths(*, extra_roots: Iterable[Path] = ()) -> list[Path]:
-    """Locate existing legacy ``./data/amc.db`` databases from verified AMC source checkouts."""
+    """Locate existing legacy ``data/amc.db`` ONLY inside explicitly trusted AMC checkout roots.
+
+    Never scans untrusted caller CWD automatically (prevents a malicious or
+    unrelated repo's ``./data/amc.db`` from being imported into the user's app
+    data directory).
+    """
     candidates: list[Path] = []
     seen: set[Path] = set()
-    roots = [Path.cwd(), *extra_roots]
-    for root in roots:
+    for root in extra_roots:
         if not _is_amc_checkout_root(root):
             continue
         raw_cand = root / 'data' / 'amc.db'
-        if not _is_nonempty_regular_sqlite_file(raw_cand):
+        if not _is_nonempty_regular_sqlite_file(raw_cand, trusted_root=root):
             continue
         try:
             cand = raw_cand.resolve()
@@ -259,9 +305,9 @@ def find_legacy_db_paths(*, extra_roots: Iterable[Path] = ()) -> list[Path]:
 def _publish_no_overwrite(temp_path: Path, target: Path) -> bool:
     """Atomically publish ``temp_path`` to ``target`` ONLY if ``target`` does not exist.
 
-    Uses ``os.link()`` (kernel-atomic create-if-absent) with an exclusive
-    lockfile fallback on filesystems that do not support hard links.
-    Returns True if published, False if ``target`` already exists.
+    Uses kernel-atomic ``os.link()`` (create-if-absent on POSIX and Windows NTFS).
+    If the underlying filesystem does not support hard links, refuses to perform a
+    racy ``os.replace()`` that could clobber a concurrently created database.
     """
     try:
         os.link(temp_path, target)
@@ -269,30 +315,20 @@ def _publish_no_overwrite(temp_path: Path, target: Path) -> bool:
     except FileExistsError:
         return False
     except OSError as exc:
-        # Filesystems without hard-link support (e.g., FAT/exFAT/network mounts)
-        if exc.errno not in {errno.EPERM, errno.EXDEV, errno.ENOTSUP, getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP), errno.EINVAL}:
-            raise
-        lock_path = target.parent / f'.{target.name}.import.lock'
-        lock_fd: int | None = None
-        try:
-            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
+        if exc.errno in {
+            errno.EPERM,
+            errno.EXDEV,
+            errno.ENOTSUP,
+            getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP),
+            errno.EINVAL,
+        }:
+            logger.warning(
+                'Skipping automatic legacy DB import into %s: filesystem does not support atomic non-overwriting link (%s).',
+                target,
+                exc,
+            )
             return False
-        try:
-            if target.exists():
-                return False
-            os.replace(temp_path, target)
-            return True
-        finally:
-            if lock_fd is not None:
-                try:
-                    os.close(lock_fd)
-                except OSError:
-                    pass
-            try:
-                lock_path.unlink()
-            except OSError:
-                pass
+        raise
 
 
 def maybe_import_legacy_db(
