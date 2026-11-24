@@ -36,6 +36,12 @@ from app.core.models import (
     TrackedFinding,
 )
 from app.core.proc import run_text
+from app.core.paths import (
+    get_db_path,
+    get_runtime_dir,
+    get_worktrees_dir,
+    maybe_import_legacy_db,
+)
 from app.core.validation import ValidationService
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
@@ -92,8 +98,9 @@ class ReviewEngine:
     def __init__(
         self,
         *,
-        db_path: str = 'data/amc.db',
-        runtime_root: str = 'runtime',
+        db_path: str | None = None,
+        runtime_root: str | None = None,
+        worktrees_root: str | None = None,
         language: str = 'en',
         backend: str | None = None,
         model: str | None = None,
@@ -108,7 +115,19 @@ class ReviewEngine:
         self.model = initial['model']
         self.reasoning = initial['variant']
 
-        self._db = Database(db_path)
+        if db_path is None:
+            maybe_import_legacy_db()
+            resolved_db_path = str(get_db_path())
+        else:
+            resolved_db_path = db_path
+        if runtime_root is None:
+            resolved_runtime_root = str(get_runtime_dir())
+            resolved_worktrees_root = worktrees_root if worktrees_root is not None else str(get_worktrees_dir())
+        else:
+            resolved_runtime_root = runtime_root
+            resolved_worktrees_root = worktrees_root
+
+        self._db = Database(resolved_db_path)
         self._engine = MissionEngine(self._db)
         # direct_api backend doesn't use subprocess adapters
         if self.backend_name == 'direct_api':
@@ -122,8 +141,8 @@ class ReviewEngine:
                     reasoning=self.reasoning,
                 )
             }
-        self._worktrees = WorktreeManager(runtime_root)
-        self._artifacts = ArtifactStore(runtime_root)
+        self._worktrees = WorktreeManager(resolved_runtime_root, worktrees_root=resolved_worktrees_root)
+        self._artifacts = ArtifactStore(resolved_runtime_root)
         self._contexts = ContextCompiler(self._artifacts)
         self._execution = ExecutionService(
             db=self._db,

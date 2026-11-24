@@ -7,8 +7,9 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.adapters import get_adapter, AVAILABLE_BACKENDS
 from app.api.routes_artifacts import router as artifact_router
@@ -16,12 +17,21 @@ from app.api.routes_control import router as control_router
 from app.api.routes_config import router as config_router
 from app.api.routes_stream import router as stream_router
 from app.api.routes_tasks import router as task_router
+from app.api.security import LocalSecurityMiddleware
 from app.core.config import load_repo_config, resolve_backend_config
 from app.core.context_compiler import ContextCompiler
 from app.core.db import Database
 from app.core.execution import ExecutionService
 from app.core.mission_engine import MissionEngine
 from app.core.models import TaskStatus
+from app.core.paths import (
+    get_bundled_ui_dir,
+    get_data_dir,
+    get_db_path,
+    get_runtime_dir,
+    get_worktrees_dir,
+    maybe_import_legacy_db,
+)
 from app.core.recovery import recover_stale_tasks
 from app.core.validation import ValidationService
 from app.core.worktree import WorktreeManager
@@ -32,11 +42,21 @@ from app.services.summary_service import SummaryService
 logger = logging.getLogger(__name__)
 
 
-RUNTIME_ROOT = 'runtime'
-db = Database('data/amc.db')
+DATA_DIR = get_data_dir()
+DB_PATH = get_db_path()
+RUNTIME_ROOT = str(get_runtime_dir())
+WORKTREES_ROOT = str(get_worktrees_dir())
+
+_checkout_root = Path(__file__).resolve().parent.parent.parent.parent
+_extra_legacy_roots = [_checkout_root] if (_checkout_root / 'pyproject.toml').is_file() else []
+_imported_legacy_db = maybe_import_legacy_db(extra_roots=_extra_legacy_roots)
+if _imported_legacy_db is not None:
+    logger.info('Imported legacy database from %s into %s', _imported_legacy_db, DB_PATH)
+
+db = Database(str(DB_PATH))
 engine = MissionEngine(db)
 adapters = {name: get_adapter(name) for name in AVAILABLE_BACKENDS}
-worktrees = WorktreeManager(RUNTIME_ROOT)
+worktrees = WorktreeManager(RUNTIME_ROOT, worktrees_root=WORKTREES_ROOT)
 artifacts = ArtifactStore(RUNTIME_ROOT)
 contexts = ContextCompiler(artifacts)
 execution = ExecutionService(
@@ -176,6 +196,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title='PR Review Control', lifespan=lifespan)
+app.add_middleware(LocalSecurityMiddleware)
 app.include_router(task_router)
 app.include_router(config_router)
 app.include_router(stream_router)
@@ -235,9 +256,42 @@ def admin_shutdown():
     return {'ok': True, 'aborted_tasks': aborted}
 
 
-STATIC_INDEX = Path(__file__).resolve().parent.parent / 'static' / 'index.html'
+STATIC_DIR = Path(__file__).resolve().parent.parent / 'static'
+BUNDLED_UI_DIR = get_bundled_ui_dir()
+STATIC_INDEX = (
+    BUNDLED_UI_DIR / 'index.html'
+    if (BUNDLED_UI_DIR / 'index.html').is_file()
+    else STATIC_DIR / 'index.html'
+)
+
+if (BUNDLED_UI_DIR / 'assets').is_dir():
+    app.mount('/assets', StaticFiles(directory=str(BUNDLED_UI_DIR / 'assets')), name='ui-assets')
+
+
+def _resolve_static_index() -> Path:
+    bundled = BUNDLED_UI_DIR / 'index.html'
+    if bundled.is_file():
+        return bundled
+    return STATIC_DIR / 'index.html'
 
 
 @app.get('/')
 def root():
-    return FileResponse(STATIC_INDEX)
+    return FileResponse(_resolve_static_index())
+
+
+@app.get('/{full_path:path}')
+def spa_fallback(full_path: str):
+    if full_path == 'api' or full_path.startswith('api/'):
+        raise HTTPException(status_code=404, detail='Not Found')
+    # Serve top-level bundled static files safely (no directory traversal).
+    if full_path and BUNDLED_UI_DIR.is_dir():
+        ui_root = BUNDLED_UI_DIR.resolve()
+        candidate = (ui_root / full_path).resolve()
+        try:
+            candidate.relative_to(ui_root)
+        except ValueError:
+            raise HTTPException(status_code=404, detail='Not Found')
+        if candidate.is_file():
+            return FileResponse(candidate)
+    return FileResponse(_resolve_static_index())

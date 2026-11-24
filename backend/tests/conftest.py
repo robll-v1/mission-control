@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import atexit
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -10,6 +14,15 @@ import pytest
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
+
+# Isolate the process-wide default AMC_DATA_DIR before any test imports
+# `app.api.app`, so pytest never reads, mutates, or migrates the developer's
+# real application data directory.
+if not os.environ.get('AMC_DATA_DIR'):
+    _PYTEST_DATA_DIR = tempfile.mkdtemp(prefix='amc-pytest-data-')
+    os.environ['AMC_DATA_DIR'] = _PYTEST_DATA_DIR
+    os.environ.setdefault('AMC_NO_LEGACY_IMPORT', '1')
+    atexit.register(shutil.rmtree, _PYTEST_DATA_DIR, True)
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -47,8 +60,12 @@ def git_repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def isolated_config(tmp_path, monkeypatch):
-    """Point global-config lookup at an empty temp dir so the host config cannot leak in."""
+    """Point global-config and app-data lookups at empty temp dirs so host state cannot leak in."""
     monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
+    monkeypatch.setenv('AMC_DATA_DIR', str(tmp_path / 'amc-data'))
+    monkeypatch.delenv('AMC_DB_PATH', raising=False)
+    monkeypatch.delenv('AMC_RUNTIME_DIR', raising=False)
+    monkeypatch.delenv('AMC_WORKTREES_DIR', raising=False)
     monkeypatch.delenv('AMC_BACKEND', raising=False)
     monkeypatch.delenv('AMC_MODEL', raising=False)
     monkeypatch.delenv('AMC_REASONING', raising=False)
