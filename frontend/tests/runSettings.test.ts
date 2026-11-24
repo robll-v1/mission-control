@@ -462,6 +462,59 @@ test('selectDraftModel and late config never leak incompatible reasoning to Code
     model: 'gpt-6-luna',
     reasoning: 'medium',
   })
+
+  // Case 7: OpenCode continuation preserves prior round's explicit variant ('low' or null) under global variant 'high'
+  const openExplicitLowRound = {
+    backend: 'opencode',
+    model: 'openai/gpt-5',
+    reasoning: 'low',
+    language: 'en',
+    settings: {
+      agent: 'opencode',
+      model: 'openai/gpt-5',
+      reasoning: 'low',
+      language: 'en',
+      sources: { agent: 'global', model: 'global', reasoning: 'round', language: 'default' },
+    },
+  }
+  const openExplicitLowMerged = mergeEffectiveIntoDraft(
+    createRunDraft(openTask, openExplicitLowRound, null),
+    openTask,
+    openExplicitLowRound,
+    openSaved,
+    null,
+    [opencodeCap],
+  )
+  assert.deepEqual(buildStartRoundPayload(openExplicitLowMerged), {
+    language: 'en',
+    reasoning: 'low',
+  })
+
+  const openExplicitClearRound = {
+    backend: 'opencode',
+    model: 'openai/gpt-5',
+    reasoning: null,
+    language: 'en',
+    settings: {
+      agent: 'opencode',
+      model: 'openai/gpt-5',
+      reasoning: null,
+      language: 'en',
+      sources: { agent: 'global', model: 'global', reasoning: 'round', language: 'default' },
+    },
+  }
+  const openExplicitClearMerged = mergeEffectiveIntoDraft(
+    createRunDraft(openTask, openExplicitClearRound, null),
+    openTask,
+    openExplicitClearRound,
+    openSaved,
+    null,
+    [opencodeCap],
+  )
+  assert.deepEqual(buildStartRoundPayload(openExplicitClearMerged), {
+    language: 'en',
+    reasoning: null,
+  })
 })
 
 test('formatRoundSettingsLabel formats agent, model, and raw reasoning level', () => {

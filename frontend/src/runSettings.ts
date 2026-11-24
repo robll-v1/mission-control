@@ -379,10 +379,8 @@ export function mergeEffectiveIntoDraft(
     ? prev.explicit.reasoning
     : next.explicit.reasoning
 
-  const cap = backends?.find((b) => b.name === mergedAgent)
-  if (!prev.userEdited.reasoning && cap && !backendHasReasoningSupport(cap)) {
-    mergedReasoningExplicit = false
-  } else if (prev.userEdited.model && !prev.userEdited.reasoning && mergedReasoning) {
+  if (prev.userEdited.model && !prev.userEdited.reasoning && mergedReasoning) {
+    const cap = backends?.find((b) => b.name === mergedAgent)
     if (backendHasReasoningSupport(cap)) {
       const opts = resolveReasoningOptions(cap, mergedModel)
       if (!opts.supported || !opts.levels.includes(mergedReasoning)) {
