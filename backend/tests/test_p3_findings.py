@@ -1053,6 +1053,19 @@ def test_unclosed_trailing_json_and_4301_digit_line_do_not_break_parsing():
     assert res_after.verdict == ReviewVerdict.CONCERNS
     assert res_after.finding_count == 1
 
+    # CRLF (Windows) closed fence and unclosed trailing fence after earlier clear example
+    closed_crlf = '```json\r\n{"verdict":"clear","findings":[]}\r\n```\r\n'
+    res_crlf = ReviewResultService.parse_raw_text(closed_crlf)
+    assert res_crlf.parse_mode == 'json'
+    assert res_crlf.verdict == ReviewVerdict.CLEAR
+    assert res_crlf.finding_count == 0
+
+    unclosed_crlf = closed_crlf + '\r\n```json\r\n{"verdict":"concerns"'
+    res_unclosed_crlf = ReviewResultService.parse_raw_text(unclosed_crlf)
+    assert res_unclosed_crlf.parse_mode == 'markdown'
+    assert res_unclosed_crlf.verdict == ReviewVerdict.INCONCLUSIVE
+    assert '{"verdict":"concerns"' not in ReviewResultService._strip_json_fences(unclosed_crlf)
+
 
 def test_upgrade_preserves_resolved_without_sync_state_and_snapshot_diff_after_head_advances(git_repo, tmp_path):
     import subprocess as _sp

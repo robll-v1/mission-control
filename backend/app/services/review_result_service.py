@@ -36,7 +36,7 @@ JSON_FENCE_OPEN_PATTERN = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 JSON_FENCE_PATTERN = re.compile(
-    r'^[ \t]*```(?:json|amc-review-json)[ \t]*\r?\n(.*?)\r?\n?[ \t]*```[ \t]*$',
+    r'^[ \t]*```(?:json|amc-review-json)[ \t]*\n(.*?)\n?[ \t]*```[ \t]*$',
     re.DOTALL | re.MULTILINE | re.IGNORECASE,
 )
 NOISE_TEXT_PREFIXES = ('[mnemo]',)
@@ -150,6 +150,10 @@ class ReviewResultService:
         )
 
     @staticmethod
+    def _normalize_newlines(text: str) -> str:
+        return text.replace('\r\n', '\n').replace('\r', '\n')
+
+    @staticmethod
     def _parse_structured_result(
         *,
         text: str,
@@ -157,8 +161,9 @@ class ReviewResultService:
         language: str,
         source_event_seq: int | None,
     ) -> ReviewResult:
-        json_parsed, is_raw_json = ReviewResultService._parse_json_payload(text)
-        prose_text = '' if is_raw_json else ReviewResultService._strip_json_fences(text)
+        normalized = ReviewResultService._normalize_newlines(text)
+        json_parsed, is_raw_json = ReviewResultService._parse_json_payload(normalized)
+        prose_text = '' if is_raw_json else ReviewResultService._strip_json_fences(normalized)
 
         if json_parsed is not None:
             json_verdict, json_summary, findings = json_parsed
@@ -194,7 +199,7 @@ class ReviewResultService:
 
     @staticmethod
     def _strip_json_fences(text: str) -> str:
-        cleaned = JSON_FENCE_PATTERN.sub('', text)
+        cleaned = JSON_FENCE_PATTERN.sub('', ReviewResultService._normalize_newlines(text))
         # Also strip any truncated/unclosed trailing ```json fence on its own line
         # so partial JSON never pollutes the fallback summary.
         open_match = JSON_FENCE_OPEN_PATTERN.search(cleaned)
@@ -214,6 +219,7 @@ class ReviewResultService:
         it, so illustrative prose examples can never swallow real findings.
         Returns ``(parsed_or_none, was_raw_standalone_json)``.
         """
+        text = ReviewResultService._normalize_newlines(text)
         stripped = text.strip()
         if stripped.startswith('{') and stripped.endswith('}'):
             try:
