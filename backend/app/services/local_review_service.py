@@ -146,17 +146,18 @@ def capture_local_snapshot(
         if base_sha_result.returncode:
             raise RuntimeError(base_sha_result.stderr.strip() or f'failed to resolve base {base_branch}')
         base_sha = base_sha_result.stdout.strip()
-        merge_base = run_git(repo, ['merge-base', base_sha, head_sha], timeout=20)
-        if merge_base.returncode:
-            raise RuntimeError(merge_base.stderr.strip() or 'failed to find merge base')
-        from_sha = merge_base.stdout.strip()
-        # If `base` is an earlier local snapshot commit (parent == HEAD), diff
-        # directly from that snapshot rather than collapsing back to HEAD so
-        # already-reviewed uncommitted changes are not re-included.
-        if from_sha == head_sha and base_sha != head_sha:
-            subj = run_git(repo, ['show', '-s', '--format=%s', base_sha], timeout=10)
-            if subj.returncode == 0 and subj.stdout.strip() == 'Mission Control local review snapshot':
-                from_sha = base_sha
+        # If `base` is an earlier local snapshot commit, diff directly from that
+        # snapshot tree even if HEAD later moved forward (e.g. the user committed
+        # the already-reviewed working-tree edits) so reviewed code is not
+        # re-included in the incremental diff.
+        subj = run_git(repo, ['show', '-s', '--format=%s', base_sha], timeout=10)
+        if subj.returncode == 0 and subj.stdout.strip() == 'Mission Control local review snapshot':
+            from_sha = base_sha
+        else:
+            merge_base = run_git(repo, ['merge-base', base_sha, head_sha], timeout=20)
+            if merge_base.returncode:
+                raise RuntimeError(merge_base.stderr.strip() or 'failed to find merge base')
+            from_sha = merge_base.stdout.strip()
         names = run_git(repo, ['diff', '--name-only', '-z', from_sha, snapshot_sha], timeout=60)
         patch = run_git(
             repo,

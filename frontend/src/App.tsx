@@ -747,6 +747,10 @@ export function App() {
     } catch (err) {
       if (findingSeqRef.current.get(seqKey) === nextFindingSeq) {
         setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.updateFinding) })
+        // Re-sync if this failed mutation invalidated an in-flight SSE refresh.
+        if (selectedTaskIdRef.current === taskId) {
+          void loadTask(taskId, { silent: true })
+        }
       }
     } finally {
       if (findingSeqRef.current.get(seqKey) === nextFindingSeq) {

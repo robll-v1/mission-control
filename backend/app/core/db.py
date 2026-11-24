@@ -349,7 +349,16 @@ class Database:
                 'SELECT last_synced_round FROM finding_sync_state WHERE task_id = ?',
                 (task_id,),
             ).fetchone()
-        return int(row['last_synced_round']) if row else 0
+            if row is not None:
+                return int(row['last_synced_round'])
+            # Upgrade compatibility: if findings already exist for this task from
+            # a pre-finding_sync_state schema, treat their MAX(last_round) as
+            # already synced so re-reads never replay and overwrite user states.
+            max_row = self.conn.execute(
+                'SELECT MAX(last_round) AS m FROM findings WHERE task_id = ?',
+                (task_id,),
+            ).fetchone()
+        return int(max_row['m']) if (max_row is not None and max_row['m'] is not None) else 0
 
     def set_synced_round(self, task_id: str, round_index: int) -> None:
         with self._lock:

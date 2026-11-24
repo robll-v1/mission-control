@@ -480,6 +480,26 @@ class ExecutionService:
             self.db.save_run(run)
             if task is not None:
                 runs = self.db.list_runs(task_id)
+                if not was_aborted and run.status == 'completed':
+                    # Ensure any legacy pre-P3 completed runs missing review_result
+                    # are extracted from events BEFORE syncing this newer round, so
+                    # their findings are never skipped by last_synced_round.
+                    missing_earlier = [
+                        r
+                        for r in runs
+                        if r.round_index < run.round_index
+                        and r.status == 'completed'
+                        and r.review_result is None
+                    ]
+                    if missing_earlier:
+                        all_events = self.db.list_events(task_id)
+                        for earlier in missing_earlier:
+                            earlier_lang = ReviewResultService._run_language(all_events, earlier.id)
+                            earlier.review_result = ReviewResultService.extract_result(
+                                events=all_events, run=earlier, language=earlier_lang
+                            )
+                            self.db.save_run(earlier)
+                        runs = self.db.list_runs(task_id)
                 task.latest_review_result = ReviewResultService.latest_result(runs)
                 self.db.save_task(task)
                 if not was_aborted:

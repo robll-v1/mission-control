@@ -992,3 +992,80 @@ def test_codex_recorded_jsonl_fixtures_parse_and_track_end_to_end():
     assert r2_res.parse_mode == 'json'
     assert r2_res.verdict == ReviewVerdict.CLEAR
     assert r2_res.finding_count == 0
+
+
+def test_unclosed_trailing_json_and_4301_digit_line_do_not_break_parsing():
+    # Unclosed trailing JSON fence must not fall back to an earlier clear example
+    raw = (
+        'Example clean JSON:\n'
+        '```json\n{"verdict": "clear", "findings": []}\n```\n\n'
+        '## Review Summary\n\nReal bug.\n\n'
+        '## Findings\n\n'
+        '- high: `app/db.py:55` — Unbounded query\n\n'
+        '```json\n{"verdict": "concerns", "findings": [{"severity": "high"'
+    )
+    res = ReviewResultService.parse_raw_text(raw)
+    assert res.parse_mode == 'markdown'
+    assert res.verdict == ReviewVerdict.CONCERNS
+    assert res.finding_count == 1
+    assert res.findings[0].path == 'app/db.py'
+    assert '{"verdict"' not in res.summary
+
+    # 4,301-digit ASCII string must not trigger Python int_max_str_digits ValueError
+    huge_line_json = json.dumps({
+        'verdict': 'concerns',
+        'summary': 'Parsed safely.',
+        'findings': [{
+            'severity': 'medium',
+            'category': 'bounds',
+            'path': 'a.py',
+            'line': '9' * 4301,
+            'title': 'Huge line string',
+        }],
+    })
+    res_huge = ReviewResultService.parse_raw_text(huge_line_json)
+    assert res_huge.parse_mode == 'json'
+    assert res_huge.finding_count == 1
+    assert res_huge.findings[0].line is None
+
+
+def test_upgrade_preserves_resolved_without_sync_state_and_snapshot_diff_after_head_advances(git_repo, tmp_path):
+    import subprocess as _sp
+    from app.core.models import TrackedFinding
+
+    # 1. Pre-finding_sync_state DB with an already-resolved Round 1 finding must not reopen on read
+    db = Database(str(tmp_path / 'pre_sync.db'))
+    mission = MissionEngine(db)
+    task = mission.create_task(title='pre-sync', repo_path=str(git_repo))
+    try:
+        r1 = Run(
+            task_id=task.id, backend='codex', round_index=1, status='completed',
+            started_at=1.0, ended_at=2.0,
+            review_result=ReviewResult(
+                verdict=ReviewVerdict.CONCERNS, parse_mode='json',
+                findings=[ReviewFinding(severity='high', path='a.py', line=10, summary='Bug A')],
+                finding_count=1,
+            ),
+        )
+        db.save_run(r1)
+        # Insert resolved finding directly without writing finding_sync_state (simulating upgrade from 313fafe)
+        db.save_finding(TrackedFinding(
+            id='f_res', task_id=task.id, fingerprint='fp_a', severity='high',
+            path='a.py', line=10, title='Bug A', first_round=1, last_round=1,
+            status=FindingStatus.RESOLVED, system_status=FindingStatus.NEW,
+            user_status=FindingStatus.RESOLVED, created_at=1.0, updated_at=2.0,
+        ))
+        assert db.get_synced_round(task.id) == 1
+        ReviewResultService.backfill_task(db=db, task=task)
+        assert db.get_finding(task.id, 'f_res').status == FindingStatus.RESOLVED
+    finally:
+        db.close()
+
+    # 2. Committing already-reviewed uncommitted edits (HEAD moves forward) must NOT re-review them
+    (git_repo / 'a.txt').write_text('reviewed edit\n', encoding='utf-8')
+    _, snap1, _, files1, _ = capture_local_snapshot(str(git_repo), 'main')
+    assert files1 == ['a.txt']
+    _sp.run(['git', '-C', str(git_repo), 'add', 'a.txt'], check=True, capture_output=True)
+    _sp.run(['git', '-C', str(git_repo), 'commit', '-q', '-m', 'commit reviewed edit'], check=True, capture_output=True)
+    _, _, _, files2, patch2 = capture_local_snapshot(str(git_repo), snap1)
+    assert files2 == [] and patch2 == ''

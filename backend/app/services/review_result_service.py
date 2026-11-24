@@ -187,7 +187,11 @@ class ReviewResultService:
 
     @staticmethod
     def _strip_json_fences(text: str) -> str:
-        return JSON_FENCE_PATTERN.sub('', text).strip()
+        cleaned = JSON_FENCE_PATTERN.sub('', text)
+        # Also strip any truncated/unclosed trailing ```json fence so partial JSON
+        # never pollutes the fallback summary.
+        cleaned = re.sub(r'```(?:json|amc-review-json)\b[\s\S]*$', '', cleaned, flags=re.IGNORECASE)
+        return cleaned.strip()
 
     @staticmethod
     def _parse_json_payload(
@@ -196,8 +200,9 @@ class ReviewResultService:
         """Try JSON-first structured extraction.
 
         Inspects either a standalone raw JSON object (if the entire reply is JSON)
-        or ONLY the final fenced JSON block. Never scans backward past a broken
-        trailing block into an unrelated earlier example JSON block.
+        or ONLY the final fenced JSON block. Rejects an earlier closed fence if
+        an unclosed/truncated trailing ``json`` fence or Markdown findings follow
+        it, so illustrative prose examples can never swallow real findings.
         Returns ``(parsed_or_none, was_raw_standalone_json)``.
         """
         stripped = text.strip()
@@ -212,7 +217,15 @@ class ReviewResultService:
         matches = list(JSON_FENCE_PATTERN.finditer(text))
         if not matches:
             return None, False
-        raw_json = matches[-1].group(1).strip()
+        last_match = matches[-1]
+        trailing = text[last_match.end():]
+        # If an unclosed ```json fence or Markdown findings appear after the last
+        # closed fence, that fence was an earlier example, not the final payload.
+        if re.search(r'```(?:json|amc-review-json)\b', trailing, re.IGNORECASE):
+            return None, False
+        if any(SEVERITY_PATTERN.match(line.rstrip()) for line in trailing.splitlines()):
+            return None, False
+        raw_json = last_match.group(1).strip()
         if not raw_json:
             return None, False
         try:
@@ -262,8 +275,10 @@ class ReviewResultService:
             elif isinstance(raw_line, str):
                 cleaned_line = raw_line.strip()
                 if cleaned_line.isascii() and cleaned_line.isdigit():
-                    val = int(cleaned_line)
-                    line_no = val if 1 <= val <= 2_147_483_647 else None
+                    stripped_zeros = cleaned_line.lstrip('0')
+                    if 1 <= len(stripped_zeros) <= 10:
+                        val = int(stripped_zeros)
+                        line_no = val if 1 <= val <= 2_147_483_647 else None
             category = normalize_category(item.get('category') or item.get('rule_category'))
             findings.append(
                 ReviewFinding(
