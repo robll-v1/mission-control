@@ -234,17 +234,22 @@ export function createRunDraft(
   )
 
   const switchedFromTask = Boolean(latestRound && task && agent && agent !== task.backend)
+  const expectedModel = !switchedFromTask && task?.model ? task.model : baselineModel
+  const expectedReasoning = !switchedFromTask && task?.reasoning ? task.reasoning : baselineReasoning
+  const hasModelBaseline = Boolean(saved !== null || effectiveMatchesAgent || (!switchedFromTask && task?.model))
+  const hasReasoningBaseline = Boolean(
+    saved !== null || effectiveMatchesAgent || (!switchedFromTask && task?.reasoning),
+  )
+
   const roundOverrodeModel = Boolean(
     latestRound &&
       (latestRound.settings?.sources?.model === 'round' ||
-        (model === '' && Boolean(baselineModel)) ||
-        (!switchedFromTask && task?.model && model !== task.model)),
+        (hasModelBaseline && model !== expectedModel)),
   )
   const roundOverrodeReasoning = Boolean(
     latestRound &&
       (latestRound.settings?.sources?.reasoning === 'round' ||
-        (reasoning === '' && Boolean(baselineReasoning)) ||
-        (!switchedFromTask && task?.reasoning && reasoning !== task.reasoning)),
+        (hasReasoningBaseline && reasoning !== expectedReasoning)),
   )
 
   return {
@@ -329,7 +334,42 @@ export function mergeEffectiveIntoDraft(
   effective?: EffectiveSettingsResponse | null,
   backends?: BackendCapability[],
 ): RunDraft {
-  if (prev.userEdited.agent) return prev
+  if (prev.userEdited.agent) {
+    const targetDefaults = savedForAgent(saved, prev.agent)
+    const effectiveMatches = Boolean(effective && effective.backend === prev.agent)
+    const baselineModel = effectiveMatches ? (effective?.model ?? '') : targetDefaults.model
+    const baselineReasoning = effectiveMatches ? (effective?.reasoning ?? '') : targetDefaults.reasoning
+    const cap = backends?.find((b) => b.name === prev.agent)
+    const supportsReasoning = backendHasReasoningSupport(cap)
+
+    const mergedModel = prev.userEdited.model ? prev.model : baselineModel
+    let mergedReasoning = prev.userEdited.reasoning
+      ? prev.reasoning
+      : supportsReasoning
+        ? baselineReasoning
+        : ''
+    let mergedReasoningExplicit = prev.userEdited.reasoning ? prev.explicit.reasoning : false
+
+    if (prev.userEdited.model && !prev.userEdited.reasoning && mergedReasoning && supportsReasoning) {
+      const opts = resolveReasoningOptions(cap, mergedModel)
+      if (!opts.supported || !opts.levels.includes(mergedReasoning)) {
+        mergedReasoning = ''
+        mergedReasoningExplicit = true
+      }
+    }
+
+    return {
+      ...prev,
+      model: mergedModel,
+      reasoning: mergedReasoning,
+      explicit: {
+        ...prev.explicit,
+        model: prev.userEdited.model ? prev.explicit.model : false,
+        reasoning: mergedReasoningExplicit,
+      },
+    }
+  }
+
   const next = createRunDraft(task, latestRound, saved, effective)
   const mergedAgent = next.agent
   const mergedModel = prev.userEdited.model ? prev.model : next.model
@@ -339,8 +379,10 @@ export function mergeEffectiveIntoDraft(
     ? prev.explicit.reasoning
     : next.explicit.reasoning
 
-  if (prev.userEdited.model && !prev.userEdited.reasoning && mergedReasoning) {
-    const cap = backends?.find((b) => b.name === mergedAgent)
+  const cap = backends?.find((b) => b.name === mergedAgent)
+  if (!prev.userEdited.reasoning && cap && !backendHasReasoningSupport(cap)) {
+    mergedReasoningExplicit = false
+  } else if (prev.userEdited.model && !prev.userEdited.reasoning && mergedReasoning) {
     if (backendHasReasoningSupport(cap)) {
       const opts = resolveReasoningOptions(cap, mergedModel)
       if (!opts.supported || !opts.levels.includes(mergedReasoning)) {

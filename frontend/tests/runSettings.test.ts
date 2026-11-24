@@ -405,6 +405,63 @@ test('selectDraftModel and late config never leak incompatible reasoning to Code
     language: 'en',
     model: 'anthropic/claude-sonnet',
   })
+
+  // Case 5: Switch agent (opencode -> codex) THEN select gpt-6-luna BEFORE savedConfig (xhigh) arrives
+  const switchedToCodex = switchDraftAgent(
+    createRunDraft(openTask, undefined, null),
+    'codex',
+    [...BACKENDS, opencodeCap],
+    null,
+  )
+  const switchedThenLuna = selectDraftModel(switchedToCodex, 'gpt-6-luna', CODEX)
+  const agentSwitchedAfterSaved = mergeEffectiveIntoDraft(
+    switchedThenLuna,
+    openTask,
+    undefined,
+    SAVED,
+    null,
+    [...BACKENDS, opencodeCap],
+  )
+  assert.equal(agentSwitchedAfterSaved.agent, 'codex')
+  assert.equal(agentSwitchedAfterSaved.model, 'gpt-6-luna')
+  assert.equal(agentSwitchedAfterSaved.reasoning, '')
+  assert.deepEqual(buildStartRoundPayload(agentSwitchedAfterSaved), {
+    language: 'en',
+    backend: 'codex',
+    model: 'gpt-6-luna',
+    reasoning: null,
+  })
+
+  // Case 6: Continuing round whose prior round inherited 'medium', while current savedConfig changed to 'xhigh'
+  const priorMediumRound = {
+    backend: 'codex',
+    model: 'gpt-6.2-sol',
+    reasoning: 'medium',
+    language: 'en',
+    settings: {
+      agent: 'codex',
+      model: 'gpt-6.2-sol',
+      reasoning: 'medium',
+      language: 'en',
+      sources: { agent: 'global', model: 'global', reasoning: 'global', language: 'default' },
+    },
+  }
+  const contBeforeSaved = selectDraftModel(createRunDraft(task, priorMediumRound, null), 'gpt-6-luna', CODEX)
+  const contAfterSaved = mergeEffectiveIntoDraft(
+    contBeforeSaved,
+    task,
+    priorMediumRound,
+    SAVED,
+    null,
+    BACKENDS,
+  )
+  assert.equal(contAfterSaved.model, 'gpt-6-luna')
+  assert.equal(contAfterSaved.reasoning, 'medium')
+  assert.deepEqual(buildStartRoundPayload(contAfterSaved), {
+    language: 'en',
+    model: 'gpt-6-luna',
+    reasoning: 'medium',
+  })
 })
 
 test('formatRoundSettingsLabel formats agent, model, and raw reasoning level', () => {
