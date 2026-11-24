@@ -8,9 +8,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
-from app.core.models import CheckRun, Event, FindingStatus, Run, Task, TrackedFinding
+from app.core.models import CheckRun, Event, EventLevel, FindingStatus, Run, Task, TrackedFinding
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SEVERITY_RANK = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
 _CLOSED_STATUSES = {FindingStatus.RESOLVED, FindingStatus.DISMISSED}
 _STATUS_RANK = {
@@ -46,8 +46,13 @@ class Database:
         self._is_memory = str(path) == ':memory:'
         if not self._is_memory:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path) if self._is_memory else self.path, check_same_thread=False)
+        self.conn = sqlite3.connect(
+            str(path) if self._is_memory else self.path,
+            timeout=30.0,
+            check_same_thread=False,
+        )
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute('PRAGMA busy_timeout = 30000')
         self._lock = threading.RLock()
         self.last_backup_path: Path | None = None
         self._init_schema()
@@ -210,6 +215,17 @@ class Database:
             )
             '''
         )
+        self.conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_events_task_seq ON events(task_id, seq)'
+        )
+        self.conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS task_event_seq (
+              task_id TEXT PRIMARY KEY,
+              last_seq INTEGER NOT NULL DEFAULT 0
+            )
+            '''
+        )
         if current_version < SCHEMA_VERSION:
             self.conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
         self.conn.commit()
@@ -257,19 +273,154 @@ class Database:
         runs.sort(key=lambda run: run.round_index)
         return runs
 
+    def _current_max_event_seq_locked(self, task_id: str) -> int:
+        # Always query SQLite directly (indexed O(log N) lookup via task_event_seq
+        # PK and idx_events_task_seq) so multiple connections / processes opening
+        # the same DB file never read a stale in-memory sequence cache.
+        seq_row = self.conn.execute(
+            'SELECT last_seq FROM task_event_seq WHERE task_id = ?',
+            (task_id,),
+        ).fetchone()
+        ev_row = self.conn.execute(
+            'SELECT COALESCE(MAX(seq), 0) AS m FROM events WHERE task_id = ?',
+            (task_id,),
+        ).fetchone()
+        seq_val = int(seq_row['last_seq']) if seq_row is not None else 0
+        ev_val = int(ev_row['m']) if (ev_row is not None and ev_row['m'] is not None) else 0
+        return max(seq_val, ev_val)
+
+    def max_event_seq(self, task_id: str) -> int:
+        with self._lock:
+            return self._current_max_event_seq_locked(task_id)
+
     def append_event(self, event: Event) -> None:
         with self._lock:
-            self.conn.execute(
-                'INSERT OR REPLACE INTO events (id, task_id, run_id, seq, data) VALUES (?, ?, ?, ?, ?)',
-                (event.id, event.task_id, event.run_id, event.seq, event.model_dump_json()),
-            )
-            self.conn.commit()
+            nested = self.conn.in_transaction
+            if nested:
+                self.conn.execute('SAVEPOINT amc_append_event')
+            else:
+                self.conn.execute('BEGIN IMMEDIATE')
+            try:
+                self.conn.execute(
+                    'INSERT OR REPLACE INTO events (id, task_id, run_id, seq, data) VALUES (?, ?, ?, ?, ?)',
+                    (event.id, event.task_id, event.run_id, event.seq, event.model_dump_json()),
+                )
+                self.conn.execute(
+                    '''
+                    INSERT INTO task_event_seq (task_id, last_seq) VALUES (?, ?)
+                    ON CONFLICT(task_id) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)
+                    ''',
+                    (event.task_id, int(event.seq)),
+                )
+                if nested:
+                    self.conn.execute('RELEASE SAVEPOINT amc_append_event')
+                self.conn.commit()
+            except Exception:
+                try:
+                    if nested:
+                        self.conn.execute('ROLLBACK TO SAVEPOINT amc_append_event')
+                        self.conn.execute('RELEASE SAVEPOINT amc_append_event')
+                    else:
+                        self.conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def append_event_auto_seq(
+        self,
+        *,
+        task_id: str,
+        kind: str,
+        payload: dict,
+        level: EventLevel = EventLevel.INFO,
+        run_id: str | None = None,
+        touch_task: bool = True,
+        ts: float | None = None,
+    ) -> Event:
+        """Atomically allocate the next monotonic ``seq`` for ``task_id``, persist
+        the event (and optionally bump ``task.updated_at``) in one ``BEGIN IMMEDIATE``
+        transaction so even separate connections/processes sharing the same SQLite
+        file can never allocate duplicate sequence numbers.
+        """
+        with self._lock:
+            nested = self.conn.in_transaction
+            if nested:
+                self.conn.execute('SAVEPOINT amc_append_auto_event')
+            else:
+                self.conn.execute('BEGIN IMMEDIATE')
+            try:
+                next_seq = self._current_max_event_seq_locked(task_id) + 1
+                event_ts = time.time() if ts is None else float(ts)
+                event = Event(
+                    task_id=task_id,
+                    run_id=run_id,
+                    seq=next_seq,
+                    ts=event_ts,
+                    kind=kind,
+                    level=level,
+                    payload=payload,
+                )
+                self.conn.execute(
+                    'INSERT INTO events (id, task_id, run_id, seq, data) VALUES (?, ?, ?, ?, ?)',
+                    (event.id, event.task_id, event.run_id, event.seq, event.model_dump_json()),
+                )
+                self.conn.execute(
+                    '''
+                    INSERT INTO task_event_seq (task_id, last_seq) VALUES (?, ?)
+                    ON CONFLICT(task_id) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)
+                    ''',
+                    (task_id, next_seq),
+                )
+                if touch_task:
+                    row = self.conn.execute('SELECT data FROM tasks WHERE id = ?', (task_id,)).fetchone()
+                    if row is not None:
+                        task = Task.model_validate_json(row['data'])
+                        task.updated_at = event.ts
+                        self.conn.execute(
+                            'INSERT OR REPLACE INTO tasks (id, data) VALUES (?, ?)',
+                            (task.id, task.model_dump_json()),
+                        )
+                if nested:
+                    self.conn.execute('RELEASE SAVEPOINT amc_append_auto_event')
+                self.conn.commit()
+                return event
+            except Exception:
+                try:
+                    if nested:
+                        self.conn.execute('ROLLBACK TO SAVEPOINT amc_append_auto_event')
+                        self.conn.execute('RELEASE SAVEPOINT amc_append_auto_event')
+                    else:
+                        self.conn.rollback()
+                except Exception:
+                    pass
+                raise
 
     def list_events(self, task_id: str) -> list[Event]:
         with self._lock:
             rows = self.conn.execute(
-                'SELECT data FROM events WHERE task_id = ? ORDER BY seq ASC', (task_id,)
+                'SELECT data FROM events WHERE task_id = ? ORDER BY seq ASC, rowid ASC', (task_id,)
             ).fetchall()
+        return [Event.model_validate_json(row['data']) for row in rows]
+
+    def list_events_after(
+        self,
+        task_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+    ) -> list[Event]:
+        """Return events for ``task_id`` with ``seq > after_seq`` in ascending seq order."""
+        with self._lock:
+            if limit is not None and limit > 0:
+                rows = self.conn.execute(
+                    'SELECT data FROM events WHERE task_id = ? AND seq > ? ORDER BY seq ASC, rowid ASC LIMIT ?',
+                    (task_id, int(after_seq), int(limit)),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    'SELECT data FROM events WHERE task_id = ? AND seq > ? ORDER BY seq ASC, rowid ASC',
+                    (task_id, int(after_seq)),
+                ).fetchall()
         return [Event.model_validate_json(row['data']) for row in rows]
 
     def save_check_run(self, check_run: CheckRun) -> None:
