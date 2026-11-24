@@ -704,3 +704,291 @@ def test_execution_service_two_round_tracks_likely_fixed_and_persistent(git_repo
     finally:
         worktrees.cleanup_worktree(task)
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. Adversarial regression tests (P1/P2 review findings) + Codex JSONL fixtures
+# ---------------------------------------------------------------------------
+
+
+def test_earlier_example_json_without_findings_cannot_swallow_markdown_findings():
+    """Earlier illustrative `{"verdict": "clear"}` + real Markdown finding + broken
+    trailing JSON must fall back to Markdown and preserve the real high finding.
+    """
+    raw = (
+        'Example output when clean:\n'
+        '```json\n{"verdict": "clear"}\n```\n\n'
+        '## Review Summary\n\nReal bug found.\n\n'
+        '## Findings\n\n'
+        '- high: `app/auth.py:19` — Missing permission check on admin endpoint\n\n'
+        '```json\n{"verdict": "concerns", "findings": [ BROKEN\n```\n'
+    )
+    res = ReviewResultService.parse_raw_text(raw)
+    assert res.parse_mode == 'markdown'
+    assert res.verdict == ReviewVerdict.CONCERNS
+    assert res.finding_count == 1
+    assert res.findings[0].severity == 'high'
+    assert res.findings[0].path == 'app/auth.py'
+
+
+def test_json_line_validation_handles_unicode_digits_overflow_and_missing_summary():
+    # Unicode superscript '²' must not raise ValueError; 64-bit overflow must not crash SQLite
+    raw = json.dumps({
+        'verdict': 'concerns',
+        'findings': [
+            {
+                'severity': 'high',
+                'category': 'bug',
+                'path': 'x.py',
+                'line': '²',
+                'title': 'Unicode digit line',
+            },
+            {
+                'severity': 'medium',
+                'category': 'overflow',
+                'path': 'y.py',
+                'line': 9223372036854775808,
+                'title': 'Huge line number',
+            },
+        ],
+    })
+    res = ReviewResultService.parse_raw_text(raw)
+    assert res.parse_mode == 'json'
+    assert res.finding_count == 2
+    assert res.findings[0].line is None
+    assert res.findings[1].line is None
+    # Raw JSON without 'summary' must NOT use the raw JSON object as summary
+    assert not res.summary.startswith('{')
+    assert res.summary == 'Unicode digit line'
+
+
+def test_migration_backup_is_excluded_from_local_snapshot(git_repo):
+    db_file = git_repo / 'data' / 'amc.db'
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    # Create legacy v0 DB inside target repo so upgrade generates a .bak file
+    conn = sqlite3.connect(db_file)
+    conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+    conn.commit()
+    conn.close()
+
+    db = Database(str(db_file))
+    try:
+        assert db.last_backup_path is not None and db.last_backup_path.exists()
+        gen = [p.resolve().relative_to(git_repo.resolve()).as_posix() for p in db.generated_paths()]
+        (git_repo / 'a.txt').write_text('real edit\n', encoding='utf-8')
+        _, _, _, changed_files, patch = capture_local_snapshot(str(git_repo), 'main', generated_paths=gen)
+        assert changed_files == ['a.txt']
+        assert '.bak.' not in patch
+    finally:
+        db.close()
+
+
+def test_save_findings_rolls_back_atomically_on_constraint_error(tmp_path):
+    from app.core.models import TrackedFinding
+
+    db = Database(str(tmp_path / 'atomic.db'))
+    mission = MissionEngine(db)
+    task = mission.create_task(title='t', repo_path=str(tmp_path))
+    try:
+        f1 = TrackedFinding(task_id=task.id, fingerprint='dup_fp', severity='high', title='First')
+        f2 = TrackedFinding(task_id=task.id, fingerprint='dup_fp', severity='low', title='Second')
+        with pytest.raises(sqlite3.IntegrityError):
+            db.save_findings([f1, f2])
+        # Subsequent unrelated write must NOT commit the rolled-back first finding
+        task.title = 'updated'
+        db.save_task(task)
+        assert db.list_findings(task.id) == []
+    finally:
+        db.close()
+
+
+def test_upgrade_round2_catches_up_round1_and_replay_is_idempotent(git_repo, tmp_path):
+    db = Database(str(tmp_path / 'upgrade.db'))
+    mission = MissionEngine(db)
+    task = mission.create_task(title='legacy', repo_path=str(git_repo))
+    try:
+        # Round 1 existed before P3 (not synced to findings table yet)
+        r1 = Run(
+            task_id=task.id, backend='codex', round_index=1, status='completed',
+            started_at=1.0, ended_at=2.0,
+            review_result=ReviewResult(
+                verdict=ReviewVerdict.CONCERNS, parse_mode='markdown',
+                findings=[ReviewFinding(severity='high', path='a.py', line=10, summary='Old bug')],
+                finding_count=1,
+            ),
+        )
+        r2 = Run(
+            task_id=task.id, backend='codex', round_index=2, status='completed',
+            started_at=3.0, ended_at=4.0,
+            review_result=ReviewResult(
+                verdict=ReviewVerdict.CONCERNS, parse_mode='json',
+                findings=[ReviewFinding(severity='medium', path='b.py', line=20, summary='New bug')],
+                finding_count=1,
+            ),
+        )
+        db.save_run(r1)
+        db.save_run(r2)
+
+        # Syncing Round 2 first must catch up Round 1 too!
+        findings = FindingTracker.sync_round(db=db, task=task, run=r2)
+        by_title = {f.title: f for f in findings}
+        assert set(by_title) == {'Old bug', 'New bug'}
+        assert by_title['Old bug'].first_round == 1 and by_title['Old bug'].status == FindingStatus.UNVERIFIED
+        assert by_title['New bug'].first_round == 2 and by_title['New bug'].status == FindingStatus.NEW
+
+        # Replaying Round 2 must be strictly idempotent (New bug stays NEW, NOT PERSISTENT)
+        again = FindingTracker.sync_round(db=db, task=task, run=r2)
+        by_title_again = {f.title: f for f in again}
+        assert by_title_again['New bug'].status == FindingStatus.NEW
+    finally:
+        db.close()
+
+
+def test_reordering_duplicate_titles_preserves_line_identity_and_user_status(git_repo, tmp_path):
+    db = Database(str(tmp_path / 'reorder.db'))
+    mission = MissionEngine(db)
+    task = mission.create_task(title='reorder', repo_path=str(git_repo))
+    try:
+        r1 = Run(
+            task_id=task.id, backend='codex', round_index=1, status='completed',
+            started_at=1.0, ended_at=2.0,
+            review_result=ReviewResult(
+                verdict=ReviewVerdict.CONCERNS, parse_mode='json',
+                findings=[
+                    ReviewFinding(severity='medium', category='null-check', path='svc.py', line=10, summary='Missing null check'),
+                    ReviewFinding(severity='medium', category='null-check', path='svc.py', line=90, summary='Missing null check'),
+                ],
+                finding_count=2,
+            ),
+        )
+        db.save_run(r1)
+        f1 = FindingTracker.sync_round(db=db, task=task, run=r1)
+        by_line_1 = {f.line: f for f in f1}
+        FindingTracker.set_user_status(db=db, task_id=task.id, finding_id=by_line_1[10].id, action='dismiss')
+
+        # Round 2 outputs the exact same two findings in REVERSED order (line 90 first, line 10 second)
+        r2 = Run(
+            task_id=task.id, backend='codex', round_index=2, status='completed',
+            started_at=3.0, ended_at=4.0,
+            review_result=ReviewResult(
+                verdict=ReviewVerdict.CONCERNS, parse_mode='json',
+                findings=[
+                    ReviewFinding(severity='medium', category='null-check', path='svc.py', line=90, summary='Missing null check'),
+                    ReviewFinding(severity='medium', category='null-check', path='svc.py', line=10, summary='Missing null check'),
+                ],
+                finding_count=2,
+            ),
+        )
+        db.save_run(r2)
+        f2 = FindingTracker.sync_round(db=db, task=task, run=r2)
+        by_line_2 = {f.line: f for f in f2}
+        # Line 10 MUST remain dismissed; line 90 MUST remain open persistent!
+        assert by_line_2[10].id == by_line_1[10].id
+        assert by_line_2[10].status == FindingStatus.DISMISSED
+        assert by_line_2[90].id == by_line_1[90].id
+        assert by_line_2[90].status == FindingStatus.PERSISTENT
+    finally:
+        db.close()
+
+
+def test_empty_output_round_does_not_mark_likely_fixed_and_rename_tracks_properly(git_repo, tmp_path):
+    _make_notes_repo(git_repo)
+    _, snap1, _, _, _ = capture_local_snapshot(str(git_repo), 'main')
+
+    db = Database(str(tmp_path / 'rename.db'))
+    mission = MissionEngine(db)
+    task = mission.create_task(title='rename', repo_path=str(git_repo), source_type='local_diff')
+    try:
+        r1 = Run(
+            task_id=task.id, backend='codex', round_index=1, review_revision=snap1,
+            status='completed', started_at=1.0, ended_at=2.0,
+            review_result=ReviewResult(
+                verdict=ReviewVerdict.CONCERNS, parse_mode='json',
+                findings=[
+                    ReviewFinding(severity='critical', category='sql-injection', path='notes.py', line=20, summary='SQL injection'),
+                    ReviewFinding(severity='medium', category='resource-leak', path='notes.py', line=5, summary='Conn leak'),
+                ],
+                finding_count=2,
+            ),
+        )
+        db.save_run(r1)
+        FindingTracker.sync_round(db=db, task=task, run=r1)
+
+        # Rename notes.py -> storage.py AND fix line 20 while keeping line 5 unfixed
+        lines = (git_repo / 'notes.py').read_text(encoding='utf-8').splitlines()
+        lines[19] = 'query = "SELECT * FROM notes WHERE title LIKE ?"  # fixed'
+        (git_repo / 'notes.py').unlink()
+        (git_repo / 'storage.py').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        _, snap2, _, _, _ = capture_local_snapshot(str(git_repo), 'main')
+
+        # Empty-output exit-0 round (parse_mode='none', INCONCLUSIVE) must NOT touch tracked findings!
+        r2_empty = Run(
+            task_id=task.id, backend='codex', round_index=2, review_revision=snap2,
+            status='completed', started_at=3.0, ended_at=4.0,
+            review_result=ReviewResult(verdict=ReviewVerdict.INCONCLUSIVE, parse_mode='none', findings=[]),
+        )
+        db.save_run(r2_empty)
+        after_empty = FindingTracker.sync_round(db=db, task=task, run=r2_empty)
+        assert {f.status for f in after_empty} == {FindingStatus.NEW}
+
+        # Real Round 3 reports the remaining leak at the renamed path `storage.py:5`
+        r3 = Run(
+            task_id=task.id, backend='codex', round_index=3, review_revision=snap2,
+            status='completed', started_at=5.0, ended_at=6.0,
+            review_result=ReviewResult(
+                verdict=ReviewVerdict.CONCERNS, parse_mode='json',
+                findings=[
+                    ReviewFinding(severity='medium', category='resource-leak', path='storage.py', line=5, summary='Conn leak'),
+                ],
+                finding_count=1,
+            ),
+        )
+        db.save_run(r3)
+        f3 = FindingTracker.sync_round(db=db, task=task, run=r3)
+        by_cat = {f.category: f for f in f3}
+        # SQLi was fixed during the rename -> LIKELY_FIXED!
+        assert by_cat['sql-injection'].status == FindingStatus.LIKELY_FIXED
+        # Leak moved from notes.py -> storage.py -> PERSISTENT + location_changed!
+        assert by_cat['resource-leak'].status == FindingStatus.PERSISTENT
+        assert by_cat['resource-leak'].location_changed is True
+        assert by_cat['resource-leak'].previous_path == 'notes.py'
+        assert by_cat['resource-leak'].path == 'storage.py'
+    finally:
+        db.close()
+
+
+def test_codex_recorded_jsonl_fixtures_parse_and_track_end_to_end():
+    """Contract test using sanitized JSONL streams captured from live codex-cli 0.169.0."""
+    from app.adapters.codex_adapter import CodexAdapter
+    from app.core.models import Event
+
+    fixtures_dir = Path(__file__).parent / 'fixtures' / 'agents' / 'codex'
+    r1_lines = (fixtures_dir / 'v0.169.0-round1-concerns.jsonl').read_text(encoding='utf-8').splitlines()
+    r2_lines = (fixtures_dir / 'v0.169.0-round2-clear.jsonl').read_text(encoding='utf-8').splitlines()
+
+    adapter = CodexAdapter(model='gpt-6.1-terra', reasoning='low')
+    r1_events = []
+    seq = 0
+    for line in r1_lines:
+        for ev in adapter.parse_stdout_line(line):
+            seq += 1
+            r1_events.append(Event(task_id='fx', run_id='r1', seq=seq, ts=1.0, kind=ev.kind, payload=ev.payload))
+    r1_run = Run(id='r1', task_id='fx', backend='codex', round_index=1, status='completed', started_at=1.0)
+    r1_res = ReviewResultService.extract_result(events=r1_events, run=r1_run, language='en')
+    assert r1_res.parse_mode == 'json'
+    assert r1_res.verdict == ReviewVerdict.CONCERNS
+    assert r1_res.finding_count == 1
+    assert r1_res.findings[0].category == 'sql-injection'
+    assert r1_res.findings[0].path == 'notes.py'
+    assert r1_res.findings[0].line == 24
+
+    r2_events = []
+    for line in r2_lines:
+        for ev in adapter.parse_stdout_line(line):
+            seq += 1
+            r2_events.append(Event(task_id='fx', run_id='r2', seq=seq, ts=2.0, kind=ev.kind, payload=ev.payload))
+    r2_run = Run(id='r2', task_id='fx', backend='codex', round_index=2, status='completed', started_at=2.0)
+    r2_res = ReviewResultService.extract_result(events=r2_events, run=r2_run, language='en')
+    assert r2_res.parse_mode == 'json'
+    assert r2_res.verdict == ReviewVerdict.CLEAR
+    assert r2_res.finding_count == 0

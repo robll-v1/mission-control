@@ -68,6 +68,22 @@ class Database:
             row = self.conn.execute('PRAGMA user_version').fetchone()
             return int(row[0]) if row else 0
 
+    def generated_paths(self) -> list[Path]:
+        """Return all on-disk SQLite files (main, WAL/journal/SHM, and migration backups)."""
+        if self._is_memory:
+            return []
+        paths: list[Path] = [
+            self.path,
+            Path(f'{self.path}-journal'),
+            Path(f'{self.path}-wal'),
+            Path(f'{self.path}-shm'),
+        ]
+        if self.path.parent.exists():
+            paths.extend(sorted(self.path.parent.glob(f'{self.path.name}.bak*')))
+        if self.last_backup_path is not None and self.last_backup_path not in paths:
+            paths.append(self.last_backup_path)
+        return paths
+
     def _init_schema(self) -> None:
         with self._lock:
             self._init_schema_locked()
@@ -185,6 +201,14 @@ class Database:
         )
         self.conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_findings_task_id ON findings(task_id)'
+        )
+        self.conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS finding_sync_state (
+              task_id TEXT PRIMARY KEY,
+              last_synced_round INTEGER NOT NULL DEFAULT 0
+            )
+            '''
         )
         if current_version < SCHEMA_VERSION:
             self.conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
@@ -319,9 +343,34 @@ class Database:
     def save_finding(self, finding: TrackedFinding) -> None:
         self.save_findings([finding])
 
-    def save_findings(self, findings: Iterable[TrackedFinding]) -> None:
+    def get_synced_round(self, task_id: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                'SELECT last_synced_round FROM finding_sync_state WHERE task_id = ?',
+                (task_id,),
+            ).fetchone()
+        return int(row['last_synced_round']) if row else 0
+
+    def set_synced_round(self, task_id: str, round_index: int) -> None:
+        with self._lock:
+            self.conn.execute(
+                '''
+                INSERT INTO finding_sync_state (task_id, last_synced_round) VALUES (?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET last_synced_round = MAX(last_synced_round, excluded.last_synced_round)
+                ''',
+                (task_id, int(round_index)),
+            )
+            self.conn.commit()
+
+    def save_findings(
+        self,
+        findings: Iterable[TrackedFinding],
+        *,
+        task_id: str | None = None,
+        synced_round: int | None = None,
+    ) -> None:
         items = list(findings)
-        if not items:
+        if not items and synced_round is None:
             return
         sql = '''
             INSERT INTO findings (
@@ -351,9 +400,30 @@ class Database:
               updated_at = excluded.updated_at
         '''
         with self._lock:
-            for item in items:
-                self.conn.execute(sql, self._finding_params(item))
-            self.conn.commit()
+            self.conn.execute('SAVEPOINT amc_save_findings')
+            try:
+                for item in items:
+                    self.conn.execute(sql, self._finding_params(item))
+                if synced_round is not None:
+                    target_task = task_id or (items[0].task_id if items else None)
+                    if target_task is not None:
+                        self.conn.execute(
+                            '''
+                            INSERT INTO finding_sync_state (task_id, last_synced_round) VALUES (?, ?)
+                            ON CONFLICT(task_id) DO UPDATE SET
+                              last_synced_round = MAX(last_synced_round, excluded.last_synced_round)
+                            ''',
+                            (target_task, int(synced_round)),
+                        )
+                self.conn.execute('RELEASE SAVEPOINT amc_save_findings')
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.execute('ROLLBACK TO SAVEPOINT amc_save_findings')
+                    self.conn.execute('RELEASE SAVEPOINT amc_save_findings')
+                except Exception:
+                    pass
+                raise
 
     def get_finding(self, task_id: str, finding_id: str) -> TrackedFinding | None:
         with self._lock:
@@ -385,4 +455,5 @@ class Database:
     def delete_findings(self, task_id: str) -> None:
         with self._lock:
             self.conn.execute('DELETE FROM findings WHERE task_id = ?', (task_id,))
+            self.conn.execute('DELETE FROM finding_sync_state WHERE task_id = ?', (task_id,))
             self.conn.commit()

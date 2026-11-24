@@ -40,8 +40,11 @@ def _generated_paths(repo_path: str, mission: MissionEngine, artifacts: Artifact
     worktrees_root = artifacts.runtime_root / 'worktrees'
     if not worktrees_root.is_absolute():
         worktrees_root = repo / worktrees_root
-    paths = [(artifacts.runtime_root / 'tasks').resolve(), mission.db.path.resolve(), worktrees_root.resolve()]
-    paths.extend(Path(f'{mission.db.path}{suffix}').resolve() for suffix in ('-journal', '-wal', '-shm'))
+    paths = [
+        (artifacts.runtime_root / 'tasks').resolve(),
+        worktrees_root.resolve(),
+        *(p.resolve() for p in mission.db.generated_paths()),
+    ]
     excluded = []
     for path in paths:
         try:

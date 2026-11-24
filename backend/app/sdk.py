@@ -863,15 +863,29 @@ class ReviewEngine:
         if local_tasks:
             local_tasks.sort(key=lambda t: (t.updated_at, t.created_at), reverse=True)
             prev_task = local_tasks[0]
+            # Pick the review_revision of the latest COMPLETED (non-aborted,
+            # CLEAR/CONCERNS) run instead of mutable `prev_task.local_snapshot_sha`
+            # (which an aborted round's pre-prepare refresh can overwrite).
             prev_sha = prev_task.local_head_sha
-            if prev_task.local_snapshot_sha:
+            completed_runs = [
+                r
+                for r in self._db.list_runs(prev_task.id)
+                if r.status == 'completed'
+                and r.review_revision
+                and (
+                    r.review_result is None
+                    or r.review_result.verdict in {ReviewVerdict.CLEAR, ReviewVerdict.CONCERNS}
+                )
+            ]
+            if completed_runs:
+                candidate_sha = completed_runs[-1].review_revision
                 check = run_text(
-                    ['git', 'cat-file', '-e', f'{prev_task.local_snapshot_sha}^{{commit}}'],
+                    ['git', 'cat-file', '-e', f'{candidate_sha}^{{commit}}'],
                     cwd=resolved_repo,
                     timeout=5,
                 )
                 if check.returncode == 0:
-                    prev_sha = prev_task.local_snapshot_sha
+                    prev_sha = candidate_sha
             open_statuses = {
                 TrackedFindingStatus.NEW,
                 TrackedFindingStatus.PERSISTENT,
@@ -1008,22 +1022,17 @@ class ReviewEngine:
         return get_commit_messages(repo_path, base)
 
     def _generated_paths_for_repo(self, repo_path: str) -> list[str]:
-        """Get list of generated/runtime paths to exclude from snapshot."""
+        """Get list of generated/runtime paths (including DB backups) to exclude from snapshot."""
         repo = Path(repo_path).resolve()
         paths = [
             (self._artifacts.runtime_root / 'tasks').resolve(),
-            self._db.path.resolve(),
             self._worktrees._worktrees_root_for_repo(str(repo)),
+            *(p.resolve() for p in self._db.generated_paths()),
         ]
         excluded: list[str] = []
         for path in paths:
             try:
                 excluded.append(path.relative_to(repo).as_posix())
-            except ValueError:
-                continue
-        for suffix in ('-journal', '-wal', '-shm'):
-            try:
-                excluded.append(Path(f'{self._db.path}{suffix}').resolve().relative_to(repo).as_posix())
             except ValueError:
                 continue
         return excluded

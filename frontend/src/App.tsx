@@ -709,8 +709,13 @@ export function App() {
 
   const updateFindingStatus = async (taskId: string, findingId: string, action: FindingAction) => {
     const seqKey = `${taskId}:${findingId}`
-    const nextSeq = (findingSeqRef.current.get(seqKey) ?? 0) + 1
-    findingSeqRef.current.set(seqKey, nextSeq)
+    const nextFindingSeq = (findingSeqRef.current.get(seqKey) ?? 0) + 1
+    findingSeqRef.current.set(seqKey, nextFindingSeq)
+    // Advance the task's load sequence so any older in-flight GET /api/tasks/{id}
+    // cannot overwrite this mutation when it returns later.
+    const patchLoadSeq = (loadSeqByTaskRef.current.get(taskId) ?? 0) + 1
+    loadSeqByTaskRef.current.set(taskId, patchLoadSeq)
+
     setUpdatingFindingIds((prev) => (prev.includes(findingId) ? prev : [...prev, findingId]))
     try {
       const res = await api<{ finding: TrackedFinding; counts: FindingCounts }>(
@@ -720,7 +725,16 @@ export function App() {
           body: JSON.stringify({ action }),
         },
       )
-      if (findingSeqRef.current.get(seqKey) !== nextSeq) return
+      if (findingSeqRef.current.get(seqKey) !== nextFindingSeq) return
+      // If a newer GET (e.g., SSE round_finished that auto-reopened a finding)
+      // started after this PATCH was issued, do not overwrite it with our stale
+      // response; trigger a silent refresh to converge to exact server state.
+      if (loadSeqByTaskRef.current.get(taskId) !== patchLoadSeq) {
+        if (selectedTaskIdRef.current === taskId) {
+          void loadTask(taskId, { silent: true })
+        }
+        return
+      }
       setDetail((prev) => {
         if (!prev || prev.task.id !== taskId) return prev
         const nextFindings = applyUpdatedFinding(prev.findings, res.finding)
@@ -731,11 +745,11 @@ export function App() {
         }
       })
     } catch (err) {
-      if (findingSeqRef.current.get(seqKey) === nextSeq) {
+      if (findingSeqRef.current.get(seqKey) === nextFindingSeq) {
         setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.updateFinding) })
       }
     } finally {
-      if (findingSeqRef.current.get(seqKey) === nextSeq) {
+      if (findingSeqRef.current.get(seqKey) === nextFindingSeq) {
         setUpdatingFindingIds((prev) => prev.filter((id) => id !== findingId))
       }
     }

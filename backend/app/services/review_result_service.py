@@ -150,8 +150,8 @@ class ReviewResultService:
         language: str,
         source_event_seq: int | None,
     ) -> ReviewResult:
-        json_parsed = ReviewResultService._parse_json_payload(text)
-        prose_text = ReviewResultService._strip_json_fences(text)
+        json_parsed, is_raw_json = ReviewResultService._parse_json_payload(text)
+        prose_text = '' if is_raw_json else ReviewResultService._strip_json_fences(text)
 
         if json_parsed is not None:
             json_verdict, json_summary, findings = json_parsed
@@ -190,34 +190,44 @@ class ReviewResultService:
         return JSON_FENCE_PATTERN.sub('', text).strip()
 
     @staticmethod
-    def _parse_json_payload(text: str) -> tuple[str | None, str, list[ReviewFinding]] | None:
-        """Try JSON-first structured extraction (last valid fenced block, or raw JSON object)."""
-        candidates: list[str] = [m.group(1).strip() for m in JSON_FENCE_PATTERN.finditer(text)]
-        candidates.reverse()  # Prefer the final structured summary block.
+    def _parse_json_payload(
+        text: str,
+    ) -> tuple[tuple[str | None, str, list[ReviewFinding]] | None, bool]:
+        """Try JSON-first structured extraction.
 
+        Inspects either a standalone raw JSON object (if the entire reply is JSON)
+        or ONLY the final fenced JSON block. Never scans backward past a broken
+        trailing block into an unrelated earlier example JSON block.
+        Returns ``(parsed_or_none, was_raw_standalone_json)``.
+        """
         stripped = text.strip()
         if stripped.startswith('{') and stripped.endswith('}'):
-            candidates.append(stripped)
-
-        for raw_json in candidates:
-            if not raw_json:
-                continue
             try:
-                data = json.loads(raw_json)
+                data = json.loads(stripped)
             except (json.JSONDecodeError, TypeError, ValueError):
-                continue
+                return None, False
             parsed = ReviewResultService._validate_json_object(data)
-            if parsed is not None:
-                return parsed
-        return None
+            return parsed, parsed is not None
+
+        matches = list(JSON_FENCE_PATTERN.finditer(text))
+        if not matches:
+            return None, False
+        raw_json = matches[-1].group(1).strip()
+        if not raw_json:
+            return None, False
+        try:
+            data = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None, False
+        return ReviewResultService._validate_json_object(data), False
 
     @staticmethod
     def _validate_json_object(data: object) -> tuple[str | None, str, list[ReviewFinding]] | None:
         if not isinstance(data, dict):
             return None
-        has_findings = 'findings' in data
-        has_verdict = isinstance(data.get('verdict'), str)
-        if not has_findings and not has_verdict:
+        # Require an explicit "findings" list so illustrative JSON snippets like
+        # {"verdict": "clear"} in prose can never swallow real Markdown findings.
+        if 'findings' not in data or not isinstance(data['findings'], list):
             return None
 
         raw_verdict = data.get('verdict')
@@ -226,13 +236,8 @@ class ReviewResultService:
             norm_v = raw_verdict.strip().lower()
             if norm_v in {'clear', 'concerns', 'failed', 'inconclusive'}:
                 verdict_str = norm_v
-            elif not has_findings:
-                return None
 
-        raw_findings = data.get('findings', [])
-        if not isinstance(raw_findings, list):
-            return None
-
+        raw_findings = data['findings']
         findings: list[ReviewFinding] = []
         for item in raw_findings:
             if not isinstance(item, dict):
@@ -253,10 +258,12 @@ class ReviewResultService:
             if isinstance(raw_line, bool):
                 line_no = None
             elif isinstance(raw_line, int):
-                line_no = raw_line if raw_line > 0 else None
-            elif isinstance(raw_line, str) and raw_line.strip().isdigit():
-                val = int(raw_line.strip())
-                line_no = val if val > 0 else None
+                line_no = raw_line if 1 <= raw_line <= 2_147_483_647 else None
+            elif isinstance(raw_line, str):
+                cleaned_line = raw_line.strip()
+                if cleaned_line.isascii() and cleaned_line.isdigit():
+                    val = int(cleaned_line)
+                    line_no = val if 1 <= val <= 2_147_483_647 else None
             category = normalize_category(item.get('category') or item.get('rule_category'))
             findings.append(
                 ReviewFinding(

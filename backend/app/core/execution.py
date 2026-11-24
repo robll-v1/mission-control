@@ -1051,14 +1051,11 @@ class ExecutionService:
     def _refresh_local_snapshot(self, task: Task) -> Task:
         """Recapture local changes before every review round."""
         repo = Path(task.repo_path).resolve()
-        candidates = (
+        candidates = [
             self.artifacts.runtime_root / 'tasks',
-            self.db.path,
             self.worktrees._worktrees_root_for_repo(task.repo_path),
-            Path(f'{self.db.path}-journal'),
-            Path(f'{self.db.path}-wal'),
-            Path(f'{self.db.path}-shm'),
-        )
+            *self.db.generated_paths(),
+        ]
         generated_paths: list[str] = []
         for path in candidates:
             absolute = path.resolve()

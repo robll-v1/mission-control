@@ -150,6 +150,13 @@ def capture_local_snapshot(
         if merge_base.returncode:
             raise RuntimeError(merge_base.stderr.strip() or 'failed to find merge base')
         from_sha = merge_base.stdout.strip()
+        # If `base` is an earlier local snapshot commit (parent == HEAD), diff
+        # directly from that snapshot rather than collapsing back to HEAD so
+        # already-reviewed uncommitted changes are not re-included.
+        if from_sha == head_sha and base_sha != head_sha:
+            subj = run_git(repo, ['show', '-s', '--format=%s', base_sha], timeout=10)
+            if subj.returncode == 0 and subj.stdout.strip() == 'Mission Control local review snapshot':
+                from_sha = base_sha
         names = run_git(repo, ['diff', '--name-only', '-z', from_sha, snapshot_sha], timeout=60)
         patch = run_git(
             repo,
