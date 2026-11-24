@@ -263,7 +263,7 @@ export function mergeEffectiveIntoDraft(
   prev: RunDraft,
   task: TaskLike,
   saved: SavedConfig | null,
-  effective: EffectiveSettingsResponse,
+  effective?: EffectiveSettingsResponse | null,
 ): RunDraft {
   if (prev.explicit.agent) return prev
   const next = createRunDraft(task, undefined, saved, effective)

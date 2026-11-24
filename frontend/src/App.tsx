@@ -538,12 +538,12 @@ export function App() {
 
   useEffect(() => {
     setRunDraft(createRunDraft(selectedTask, latestRound, savedConfig, activeTaskEffective))
-  }, [selectedTask?.id, latestRound?.id, savedConfig])
+  }, [selectedTask?.id, latestRound?.id])
 
   useEffect(() => {
-    if (!activeTaskEffective || !selectedTask || latestRound) return
+    if (!selectedTask || latestRound) return
     setRunDraft((prev) => mergeEffectiveIntoDraft(prev, selectedTask, savedConfig, activeTaskEffective))
-  }, [activeTaskEffective, selectedTask?.id, latestRound?.id, savedConfig])
+  }, [activeTaskEffective, savedConfig, selectedTask?.id, latestRound?.id])
 
   useEffect(() => {
     if (!selectedTaskId) return
