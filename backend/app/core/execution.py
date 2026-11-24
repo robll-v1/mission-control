@@ -4,6 +4,7 @@ import inspect
 import logging
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -45,11 +46,10 @@ def _strip_embedded_review_focus(description: str, old_focus: str) -> str:
     cleaned_old = old_focus.strip()
     if not description or not cleaned_old:
         return description
-    updated = description.replace(f'\n\n## Review Focus\n{cleaned_old}', '')
-    updated = updated.replace(f'\nReview focus: {cleaned_old}', '')
-    if updated == f'Review focus: {cleaned_old}':
-        updated = ''
-    return updated
+    escaped = re.escape(cleaned_old)
+    updated = re.sub(rf'\n\n## Review Focus\n[ \t]*{escaped}[ \t]*(?=\n|$)', '', description)
+    updated = re.sub(rf'(?:^|\n)Review focus:[ \t]*{escaped}[ \t]*(?=\n|$)', '', updated)
+    return updated.strip('\n') if updated != description else description
 
 
 class IdleTimeoutError(RuntimeError):
