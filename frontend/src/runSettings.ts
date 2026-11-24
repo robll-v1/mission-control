@@ -203,20 +203,24 @@ export function createRunDraft(
   task: TaskLike | null,
   latestRound: RoundLike | undefined,
   saved: SavedConfig | null,
+  effective?: EffectiveSettingsResponse | null,
 ): RunDraft {
   const agent = latestRound?.settings?.agent || latestRound?.backend || task?.backend || saved?.backend || ''
   const fromSaved = savedForAgent(saved, agent)
+  const effectiveMatchesAgent = Boolean(effective && effective.backend === agent)
+  const baselineModel = effectiveMatchesAgent ? (effective?.model ?? '') : fromSaved.model
+  const baselineReasoning = effectiveMatchesAgent ? (effective?.reasoning ?? '') : fromSaved.reasoning
   let model = ''
   let reasoning = ''
   if (latestRound) {
     model = latestRound.settings?.model ?? latestRound.model ?? ''
     reasoning = latestRound.settings?.reasoning ?? latestRound.reasoning ?? ''
   } else if (task) {
-    model = task.model ?? fromSaved.model
-    reasoning = task.reasoning ?? fromSaved.reasoning
+    model = task.model ?? baselineModel
+    reasoning = task.reasoning ?? baselineReasoning
   } else {
-    model = fromSaved.model
-    reasoning = fromSaved.reasoning
+    model = baselineModel
+    reasoning = baselineReasoning
   }
   const language = normalizeReviewLang(
     latestRound?.settings?.language ?? latestRound?.language ?? task?.language ?? 'en',
@@ -226,13 +230,13 @@ export function createRunDraft(
   const roundOverrodeModel = Boolean(
     latestRound &&
       (latestRound.settings?.sources?.model === 'round' ||
-        (model === '' && Boolean(fromSaved.model)) ||
+        (model === '' && Boolean(baselineModel)) ||
         (!switchedFromTask && task?.model && model !== task.model)),
   )
   const roundOverrodeReasoning = Boolean(
     latestRound &&
       (latestRound.settings?.sources?.reasoning === 'round' ||
-        (reasoning === '' && Boolean(fromSaved.reasoning)) ||
+        (reasoning === '' && Boolean(baselineReasoning)) ||
         (!switchedFromTask && task?.reasoning && reasoning !== task.reasoning)),
   )
 

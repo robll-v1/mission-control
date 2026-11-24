@@ -274,6 +274,7 @@ export function Settings({
       if (checkSeqRef.current !== reqId) return
       if (!res.ok) {
         const text = await res.text()
+        if (checkSeqRef.current !== reqId) return
         let detail = ''
         try {
           const parsed = JSON.parse(text) as { detail?: unknown }

@@ -22,6 +22,7 @@ import {
   savedForAgent,
   switchDraftAgent,
   type BackendCapability,
+  type EffectiveSettingsResponse,
   type RunDraft,
   type RunSettings,
   type SavedConfig,
@@ -358,6 +359,7 @@ export function App() {
   const [newLanguage, setNewLanguage] = useState<ReviewLanguage>(DEFAULT_REVIEW_LANGUAGE)
   const [backends, setBackends] = useState<BackendCapability[]>([])
   const [savedConfig, setSavedConfig] = useState<SavedConfig | null>(null)
+  const [taskEffective, setTaskEffective] = useState<{ taskId: string; data: EffectiveSettingsResponse } | null>(null)
   const [runDraft, setRunDraft] = useState<RunDraft>(() => createRunDraft(null, undefined, null))
   const [isCreating, setIsCreating] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
@@ -408,7 +410,8 @@ export function App() {
 
   const selectedTaskIdRef = useRef<string | null>(null)
   selectedTaskIdRef.current = selectedTaskId
-  const loadSeqRef = useRef(0)
+  const loadSeqByTaskRef = useRef<Map<string, number>>(new Map())
+  const effectiveSeqRef = useRef(0)
   const configSeqRef = useRef(0)
   const wasModalOpenRef = useRef(false)
   const activeDetail = detail && detail.task.id === selectedTaskId ? detail : null
@@ -445,13 +448,15 @@ export function App() {
   }, [])
 
   const loadTask = useCallback(async (taskId: string, options?: { silent?: boolean }) => {
-    const reqId = ++loadSeqRef.current
+    if (selectedTaskIdRef.current !== taskId) return
+    const nextSeq = (loadSeqByTaskRef.current.get(taskId) ?? 0) + 1
+    loadSeqByTaskRef.current.set(taskId, nextSeq)
     try {
       const data = normalizeTaskDetail(await api<TaskDetailResponse>(`/api/tasks/${taskId}`))
-      if (selectedTaskIdRef.current !== taskId || loadSeqRef.current !== reqId) return
+      if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
       setDetail(data)
     } catch (err) {
-      if (selectedTaskIdRef.current !== taskId || loadSeqRef.current !== reqId) return
+      if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
       if (!options?.silent) {
         setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.loadReview) })
       }
@@ -506,8 +511,42 @@ export function App() {
   }, [showModal])
 
   useEffect(() => {
-    setRunDraft(createRunDraft(selectedTask, latestRound, savedConfig))
+    if (!selectedTask) {
+      setTaskEffective(null)
+      return
+    }
+    const targetId = selectedTask.id
+    const reqSeq = ++effectiveSeqRef.current
+    const params = new URLSearchParams()
+    if (selectedTask.repo_path) params.set('repo_path', selectedTask.repo_path)
+    if (selectedTask.backend) params.set('backend', selectedTask.backend)
+    fetch(`/api/config/effective?${params.toString()}`)
+      .then(async (res) => {
+        if (!res.ok) return
+        const data = (await res.json()) as EffectiveSettingsResponse
+        if (selectedTaskIdRef.current !== targetId || effectiveSeqRef.current !== reqSeq) return
+        setTaskEffective({ taskId: targetId, data })
+      })
+      .catch(() => {
+        // Non-blocking: falls back to savedConfig defaults.
+      })
+  }, [selectedTask?.id, selectedTask?.repo_path, selectedTask?.backend, savedConfig])
+
+  const activeTaskEffective =
+    selectedTask && taskEffective?.taskId === selectedTask.id ? taskEffective.data : null
+
+  useEffect(() => {
+    setRunDraft(createRunDraft(selectedTask, latestRound, savedConfig, activeTaskEffective))
   }, [selectedTask?.id, latestRound?.id, savedConfig])
+
+  useEffect(() => {
+    if (!activeTaskEffective || !selectedTask || latestRound) return
+    setRunDraft((prev) => {
+      if (prev.explicit.agent || prev.explicit.model || prev.explicit.reasoning) return prev
+      const next = createRunDraft(selectedTask, undefined, savedConfig, activeTaskEffective)
+      return { ...next, note: prev.note, language: prev.explicit.language ? prev.language : next.language, explicit: prev.explicit }
+    })
+  }, [activeTaskEffective, selectedTask?.id, latestRound?.id, savedConfig])
 
   useEffect(() => {
     if (!selectedTaskId) return

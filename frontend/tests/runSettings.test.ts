@@ -220,6 +220,33 @@ test('buildStartRoundPayload sends explicit null when user selects CLI/Model def
   })
 })
 
+test('createRunDraft uses repo effective settings over global config for auto-created tasks', () => {
+  const effectiveForRepo = {
+    settings: {
+      agent: 'codex',
+      model: 'gpt-repo-only',
+      reasoning: 'medium',
+      language: 'en',
+      sources: { agent: 'global', model: 'repo', reasoning: 'repo', language: 'default' },
+    },
+    backend: 'codex',
+    model: 'gpt-repo-only',
+    reasoning: 'medium',
+    sources: { agent: 'global', model: 'repo', reasoning: 'repo', language: 'default' },
+  }
+  const draft = createRunDraft(
+    { backend: 'codex', model: null, reasoning: null, language: 'en' },
+    undefined,
+    SAVED,
+    effectiveForRepo,
+  )
+  assert.equal(draft.agent, 'codex')
+  assert.equal(draft.model, 'gpt-repo-only')
+  assert.equal(draft.reasoning, 'medium')
+  // Still untouched so backend resolves from repo/env cleanly
+  assert.deepEqual(buildStartRoundPayload(draft), { language: 'en' })
+})
+
 test('formatRoundSettingsLabel formats agent, model, and raw reasoning level', () => {
   const labels = { cliDefault: 'CLI default', modelDefault: 'Model default' }
   assert.equal(
