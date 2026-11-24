@@ -218,6 +218,9 @@ def test_start_failure_cleans_started_backend(tmp_path, monkeypatch, capsys):
     identity = _register_fake_identity(monkeypatch, src, 4343)
     running = {'value': True}
     monkeypatch.setattr(cli, '_process_identity', lambda pid: identity.copy() if pid == 4343 and running['value'] else None)
+    monkeypatch.setattr(cli, '_pid_alive', lambda pid: pid == 4343 and running['value'])
+    monkeypatch.setattr(cli, '_process_group_alive', lambda pgid: pgid == 4343 and running['value'])
+    monkeypatch.setattr(cli, '_port_is_free', lambda _port: not running['value'])
     terminated: list[int] = []
 
     def terminate(item):
@@ -262,6 +265,9 @@ def test_frontend_spawn_failure_keeps_both_logs_and_cleans_backend(tmp_path, mon
     identity = _register_fake_identity(monkeypatch, src, 4444)
     running = {'value': True}
     monkeypatch.setattr(cli, '_process_identity', lambda pid: identity.copy() if pid == 4444 and running['value'] else None)
+    monkeypatch.setattr(cli, '_pid_alive', lambda pid: pid == 4444 and running['value'])
+    monkeypatch.setattr(cli, '_process_group_alive', lambda pgid: pgid == 4444 and running['value'])
+    monkeypatch.setattr(cli, '_port_is_free', lambda _port: not running['value'])
 
     def terminate(_item):
         running['value'] = False
@@ -305,6 +311,9 @@ def test_stop_reports_graceful_shutdown(tmp_path, monkeypatch, capsys):
     (run_dir / 'ports.json').write_text('{"backend": 18160, "frontend": null}', encoding='utf-8')
     identity = _register_fake_identity(monkeypatch, src, 12345)
     monkeypatch.setattr(cli, '_process_identity', lambda pid: identity.copy() if pid == 12345 and alive['value'] else None)
+    monkeypatch.setattr(cli, '_pid_alive', lambda pid: pid == 12345 and alive['value'])
+    monkeypatch.setattr(cli, '_process_group_alive', lambda pgid: pgid == 12345 and alive['value'])
+    monkeypatch.setattr(cli, '_port_is_free', lambda _port: not alive['value'])
 
     def graceful():
         alive['value'] = False
@@ -523,6 +532,9 @@ def test_stop_signals_only_verified_record_and_preserves_unrelated_files(tmp_pat
     alive = {'value': True}
     identity = _register_fake_identity(monkeypatch, src, 12345)
     monkeypatch.setattr(cli, '_process_identity', lambda pid: identity.copy() if pid == 12345 and alive['value'] else None)
+    monkeypatch.setattr(cli, '_pid_alive', lambda pid: pid == 12345 and alive['value'])
+    monkeypatch.setattr(cli, '_process_group_alive', lambda pgid: pgid == 12345 and alive['value'])
+    monkeypatch.setattr(cli, '_port_is_free', lambda _port: not alive['value'])
     signalled: list[int] = []
 
     def terminate(item):
@@ -605,6 +617,8 @@ def test_verified_process_gets_term_then_kill_after_rechecks(tmp_path, monkeypat
     state = _write_verified_backend(src / '.run', src)
     identity = _register_fake_identity(monkeypatch, src, state['pid'])
     monkeypatch.setattr(cli, '_process_identity', lambda _pid: identity.copy())
+    monkeypatch.setattr(cli, '_port_is_free', lambda _port: True)
+    monkeypatch.setattr(cli.signal, 'SIGKILL', getattr(cli.signal, 'SIGKILL', 9), raising=False)
     monkeypatch.setattr(cli.time, 'sleep', lambda _seconds: None)
     signals: list[int] = []
     group = {'alive': True}
@@ -649,6 +663,7 @@ def test_dead_service_with_occupied_port_is_kept_unverified(tmp_path, monkeypatc
     _write_verified_backend(run_dir, src)
     monkeypatch.setattr(cli, '_process_identity', lambda _pid: None)
     monkeypatch.setattr(cli, '_pid_alive', lambda _pid: False)
+    monkeypatch.setattr(cli, '_process_group_alive', lambda _pgid: False)
     monkeypatch.setattr(cli, '_port_is_free', lambda _port: False)
     with pytest.raises(SystemExit) as exc_info:
         cli.cmd_stop(SimpleNamespace())

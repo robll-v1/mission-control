@@ -649,6 +649,8 @@ def _service_is_still_same(state: dict) -> bool | None:
 
 
 def _process_group_alive(pgid: int) -> bool | None:
+    if not hasattr(os, 'killpg'):
+        return None
     try:
         os.killpg(pgid, 0)
         return True
