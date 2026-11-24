@@ -219,7 +219,7 @@ def _is_git_repo_dir(resolved_root: Path) -> bool:
             if not target.is_absolute():
                 target = (resolved_root / target).resolve()
             return target.is_dir() and (target / 'HEAD').is_file()
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):
             return False
     return False
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { errorMessage, labelFor, type Localized, type Messages } from './i18n'
 import {
   buildSaveConfigPayload,
@@ -92,7 +92,15 @@ function BackIcon() {
   )
 }
 
-export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
+export function Settings({
+  onBack,
+  onSaved,
+  t,
+}: {
+  onBack: () => void
+  onSaved?: (config: SavedConfig) => void
+  t: Messages
+}) {
   const [backends, setBackends] = useState<BackendCapability[]>([])
   const [saved, setSaved] = useState<SavedConfig | null>(null)
   const [effective, setEffective] = useState<EffectiveSettingsResponse | null>(null)
@@ -107,6 +115,7 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
   const [checkResult, setCheckResult] = useState<CheckAgentResponse | null>(null)
   const [checkError, setCheckError] = useState<Status>(null)
   const [status, setStatus] = useState<Status>(null)
+  const checkSeqRef = useRef(0)
 
   const refreshEffective = useCallback(async () => {
     try {
@@ -164,6 +173,8 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
   }, [currentBackend, query])
 
   const chooseBackend = (name: string) => {
+    checkSeqRef.current += 1
+    setChecking(false)
     setSelectedBackend(name)
     setModelSearch('')
     // Restore this agent's own saved model and reasoning, never leaking another agent's settings.
@@ -178,6 +189,8 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
   }
 
   const chooseModel = (model: string) => {
+    checkSeqRef.current += 1
+    setChecking(false)
     setSelectedModel(model)
     const opts = resolveReasoningOptions(currentBackend, model)
     if (selectedReasoning && (!opts.supported || !opts.levels.includes(selectedReasoning))) {
@@ -194,7 +207,8 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
       const payload = buildSaveConfigPayload(
         selectedBackend,
         selectedModel,
-        reasoningOptions.supported ? selectedReasoning : '',
+        selectedReasoning,
+        reasoningOptions.supported,
       )
       const res = await fetch('/api/config/save', {
         method: 'POST',
@@ -205,21 +219,26 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
         setStatus({ tone: 'error', text: SAVE_FAILED })
         return
       }
+      const preservedReasoning = reasoningOptions.supported
+        ? (payload.reasoning ?? null)
+        : (savedForCurrent.reasoning || null)
       const nextPerBackend = {
         ...(saved?.per_backend ?? {}),
         [selectedBackend]: {
           model: payload.model,
-          reasoning: payload.reasoning,
-          variant: payload.reasoning,
+          reasoning: preservedReasoning,
+          variant: preservedReasoning,
         },
       }
-      setSaved({
+      const nextSaved: SavedConfig = {
         backend: selectedBackend,
         model: payload.model,
-        reasoning: payload.reasoning,
-        variant: payload.reasoning,
+        reasoning: preservedReasoning,
+        variant: preservedReasoning,
         per_backend: nextPerBackend,
-      })
+      }
+      setSaved(nextSaved)
+      onSaved?.(nextSaved)
       await refreshEffective()
       setStatus({
         tone: 'info',
@@ -238,6 +257,7 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
 
   const handleCheckAgent = async () => {
     if (!selectedBackend || checking) return
+    const reqId = ++checkSeqRef.current
     setChecking(true)
     setCheckResult(null)
     setCheckError(null)
@@ -251,6 +271,7 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
           reasoning: reasoningOptions.supported ? (selectedReasoning.trim() || null) : null,
         }),
       })
+      if (checkSeqRef.current !== reqId) return
       if (!res.ok) {
         const text = await res.text()
         let detail = ''
@@ -263,11 +284,14 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
         setCheckError({ tone: 'error', text: detail ? () => detail : (t) => t.settings.checkError })
         return
       }
-      setCheckResult((await res.json()) as CheckAgentResponse)
+      const data = (await res.json()) as CheckAgentResponse
+      if (checkSeqRef.current !== reqId) return
+      setCheckResult(data)
     } catch (err) {
+      if (checkSeqRef.current !== reqId) return
       setCheckError({ tone: 'error', text: errorMessage(err, (t) => t.settings.checkError) })
     } finally {
-      setChecking(false)
+      if (checkSeqRef.current === reqId) setChecking(false)
     }
   }
 
@@ -533,8 +557,11 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
                         value=""
                         checked={selectedReasoning === ''}
                         onChange={() => {
+                          checkSeqRef.current += 1
+                          setChecking(false)
                           setSelectedReasoning('')
                           setCheckResult(null)
+                          setCheckError(null)
                         }}
                       />
                       <span>
@@ -554,8 +581,11 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
                           value={level}
                           checked={selectedReasoning === level}
                           onChange={() => {
+                            checkSeqRef.current += 1
+                            setChecking(false)
                             setSelectedReasoning(level)
                             setCheckResult(null)
+                            setCheckError(null)
                           }}
                         />
                         <span className="mono">{level}</span>

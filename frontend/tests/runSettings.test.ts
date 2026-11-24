@@ -114,16 +114,50 @@ test('savedForAgent isolates saved model and reasoning per backend', () => {
   assert.deepEqual(savedForAgent(SAVED, 'copilot'), { model: '', reasoning: '' })
 })
 
-test('buildSaveConfigPayload sends explicit null to reset model or reasoning', () => {
-  assert.deepEqual(buildSaveConfigPayload('codex', 'gpt-6.2-sol', 'xhigh'), {
+test('buildSaveConfigPayload sends explicit null when supported and omits reasoning when unsupported', () => {
+  assert.deepEqual(buildSaveConfigPayload('codex', 'gpt-6.2-sol', 'xhigh', true), {
     backend: 'codex',
     model: 'gpt-6.2-sol',
     reasoning: 'xhigh',
   })
-  const reset = buildSaveConfigPayload('codex', '', '')
+  const reset = buildSaveConfigPayload('codex', '', '', true)
   assert.deepEqual(reset, { backend: 'codex', model: null, reasoning: null })
   assert.ok(Object.prototype.hasOwnProperty.call(reset, 'reasoning'))
   assert.ok(Object.prototype.hasOwnProperty.call(reset, 'model'))
+
+  // Unsupported backend (e.g. OpenCode with hidden legacy variant) must OMIT reasoning
+  const opencodeSave = buildSaveConfigPayload('opencode', 'openai/gpt-6', '', false)
+  assert.deepEqual(opencodeSave, { backend: 'opencode', model: 'openai/gpt-6' })
+  assert.equal(Object.prototype.hasOwnProperty.call(opencodeSave, 'reasoning'), false)
+})
+
+test('createRunDraft preserves switched agent and explicit CLI/Model default from latestRound', () => {
+  const draft = createRunDraft(
+    { backend: 'codex', model: 'gpt-6.2-sol', reasoning: 'xhigh', language: 'en' },
+    {
+      backend: 'claude-code',
+      model: null,
+      reasoning: null,
+      language: 'en',
+      settings: {
+        agent: 'claude-code',
+        model: null,
+        reasoning: null,
+        language: 'en',
+        sources: { agent: 'round', model: 'round', reasoning: 'round', language: 'round' },
+      },
+    },
+    SAVED,
+  )
+  assert.equal(draft.agent, 'claude-code')
+  assert.equal(draft.model, '')
+  assert.equal(draft.reasoning, '')
+  assert.deepEqual(buildStartRoundPayload(draft), {
+    language: 'en',
+    backend: 'claude-code',
+    model: null,
+    reasoning: null,
+  })
 })
 
 test('switchDraftAgent clears previous agent model/reasoning and explicit flags', () => {

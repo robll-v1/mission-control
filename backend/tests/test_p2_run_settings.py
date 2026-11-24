@@ -819,6 +819,17 @@ def test_check_agent_rejects_unsupported_claude_effort_and_invalid_copilot_reaso
     assert client.get('/api/config/effective', params={'repo_path': str(fake_ptr)}).status_code == 400
     (fake_ptr / '.git').write_text('gitdir: bad\x00path\n', encoding='utf-8')
     assert client.get('/api/config/effective', params={'repo_path': str(fake_ptr)}).status_code == 400
+    (fake_ptr / '.git').write_text('gitdir: loop\n', encoding='utf-8')
+    real_resolve = Path.resolve
+
+    def loop_resolve(self, *args, **kwargs):
+        if self.name == 'loop':
+            raise RuntimeError('Symlink loop from loop')
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'resolve', loop_resolve)
+    assert client.get('/api/config/effective', params={'repo_path': str(fake_ptr)}).status_code == 400
+    monkeypatch.setattr(Path, 'resolve', real_resolve)
 
     fake_repo = tmp_path / 'fake_git'
     (fake_repo / '.git').mkdir(parents=True)

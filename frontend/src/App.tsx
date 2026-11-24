@@ -167,7 +167,7 @@ const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     } catch {
       // Keep a non-JSON response as-is.
     }
-    throw new Error(message || `Request failed: ${response.status}`)
+    throw new Error(message)
   }
   return response.json() as Promise<T>
 }
@@ -406,23 +406,30 @@ export function App() {
     storeLanguage(next)
   }
 
+  const selectedTaskIdRef = useRef<string | null>(null)
+  selectedTaskIdRef.current = selectedTaskId
+  const loadSeqRef = useRef(0)
+  const configSeqRef = useRef(0)
+  const wasModalOpenRef = useRef(false)
+  const activeDetail = detail && detail.task.id === selectedTaskId ? detail : null
+
   const selectedTask = useMemo(
-    () => tasks.find((task) => task.id === selectedTaskId) ?? detail?.task ?? null,
-    [detail?.task, selectedTaskId, tasks],
+    () => tasks.find((task) => task.id === selectedTaskId) ?? activeDetail?.task ?? null,
+    [activeDetail?.task, selectedTaskId, tasks],
   )
 
   const visibleEvents = useMemo(() => {
-    if (!detail) return []
-    const source = showAllEvents ? detail.events : detail.importantEvents
+    if (!activeDetail) return []
+    const source = showAllEvents ? activeDetail.events : activeDetail.importantEvents
     return showAllEvents ? source : source.slice(-EVENT_LIMIT)
-  }, [detail, showAllEvents])
+  }, [activeDetail, showAllEvents])
 
   const orderedRounds = useMemo(
-    () => (detail ? [...detail.reviewRounds].sort((a, b) => a.round_index - b.round_index) : []),
-    [detail],
+    () => (activeDetail ? [...activeDetail.reviewRounds].sort((a, b) => a.round_index - b.round_index) : []),
+    [activeDetail],
   )
   const latestRound = orderedRounds.length ? orderedRounds[orderedRounds.length - 1] : undefined
-  const latestResult = detail?.latestReviewResult ?? selectedTask?.latest_review_result ?? null
+  const latestResult = activeDetail?.latestReviewResult ?? selectedTask?.latest_review_result ?? null
 
   // `refreshTasks` runs on a 4s timer. It must never clear a notice raised by a
   // user action, otherwise failed actions silently look like no-ops.
@@ -438,10 +445,13 @@ export function App() {
   }, [])
 
   const loadTask = useCallback(async (taskId: string, options?: { silent?: boolean }) => {
+    const reqId = ++loadSeqRef.current
     try {
       const data = normalizeTaskDetail(await api<TaskDetailResponse>(`/api/tasks/${taskId}`))
+      if (selectedTaskIdRef.current !== taskId || loadSeqRef.current !== reqId) return
       setDetail(data)
     } catch (err) {
+      if (selectedTaskIdRef.current !== taskId || loadSeqRef.current !== reqId) return
       if (!options?.silent) {
         setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.loadReview) })
       }
@@ -449,18 +459,20 @@ export function App() {
   }, [])
 
   const loadConfigMeta = useCallback(async () => {
+    const seq = ++configSeqRef.current
     try {
       const [detectRes, currentRes] = await Promise.all([
         fetch('/api/config/detect'),
         fetch('/api/config/current'),
       ])
+      if (configSeqRef.current !== seq) return
       if (detectRes.ok) {
         const d = (await detectRes.json()) as { backends: BackendCapability[] }
-        setBackends(d.backends || [])
+        if (configSeqRef.current === seq) setBackends(d.backends || [])
       }
       if (currentRes.ok) {
         const c = (await currentRes.json()) as { config: SavedConfig }
-        setSavedConfig(c.config)
+        if (configSeqRef.current === seq) setSavedConfig(c.config)
       }
     } catch {
       // Non-blocking: UI still works with fallback defaults.
@@ -481,16 +493,17 @@ export function App() {
   }, [showSettings, loadConfigMeta])
 
   useEffect(() => {
-    if (!showModal) return
-    const defaultAgent = savedConfig?.backend || backends[0]?.name || ''
-    const saved = savedForAgent(savedConfig, defaultAgent)
-    const cap = backends.find((b) => b.name === defaultAgent)
-    const opts = resolveReasoningOptions(cap, saved.model)
-    setNewAgent(defaultAgent)
-    setNewModel(saved.model)
-    setNewReasoning(opts.supported ? saved.reasoning : '')
+    const justOpened = showModal && !wasModalOpenRef.current
+    wasModalOpenRef.current = showModal
+    if (!justOpened) return
+    // Start in Auto mode (omitted backend/model/reasoning) so the repository's
+    // .amc.yaml and global config resolve normally unless the user explicitly
+    // overrides the agent for this review.
+    setNewAgent('')
+    setNewModel('')
+    setNewReasoning('')
     setNewLanguage(DEFAULT_REVIEW_LANGUAGE)
-  }, [showModal, savedConfig, backends])
+  }, [showModal])
 
   useEffect(() => {
     setRunDraft(createRunDraft(selectedTask, latestRound, savedConfig))
@@ -537,21 +550,27 @@ export function App() {
     if (isCreating) return
     setIsCreating(true)
     try {
-      const newCap = backends.find((b) => b.name === newAgent)
+      const chosenAgent = newAgent.trim()
+      const newCap = backends.find((b) => b.name === chosenAgent)
       const newOpts = resolveReasoningOptions(newCap, newModel)
+      const body: Record<string, string | null> = {
+        repo_path: repoPath.trim(),
+        source_type: reviewSource,
+        pr_url: reviewSource === 'pull_request' ? prUrl.trim() : null,
+        base: reviewSource === 'local_diff' ? baseBranch.trim() || null : null,
+        review_focus: reviewFocus.trim(),
+        language: newLanguage,
+      }
+      // Only send backend/model/reasoning when the user explicitly picked an
+      // agent; otherwise omit them so repo .amc.yaml & global config apply.
+      if (chosenAgent) {
+        body.backend = chosenAgent
+        if (newModel.trim()) body.model = newModel.trim()
+        if (newOpts.supported && newReasoning.trim()) body.reasoning = newReasoning.trim()
+      }
       const task = await api<Task>('/api/tasks', {
         method: 'POST',
-        body: JSON.stringify({
-          repo_path: repoPath.trim(),
-          source_type: reviewSource,
-          pr_url: reviewSource === 'pull_request' ? prUrl.trim() : null,
-          base: reviewSource === 'local_diff' ? baseBranch.trim() || null : null,
-          review_focus: reviewFocus.trim(),
-          backend: newAgent.trim() || null,
-          model: newModel.trim() || null,
-          reasoning: newOpts.supported ? (newReasoning.trim() || null) : null,
-          language: newLanguage,
-        }),
+        body: JSON.stringify(body),
       })
       setRepoPath(repoPath.trim())
       setPrUrl('')
@@ -571,14 +590,16 @@ export function App() {
   const startReviewRound = async (taskId: string) => {
     const tracker = startTrackerRef.current
     const request = tracker.begin(taskId)
+    const payload = buildStartRoundPayload(runDraft)
     setStartingTaskIds(tracker.pendingTaskIds())
     try {
-      const payload = buildStartRoundPayload(runDraft)
       await api(`/api/tasks/${taskId}/start`, {
         method: 'POST',
         body: JSON.stringify(payload),
       })
-      setRunDraft((prev) => ({ ...prev, note: '' }))
+      if (selectedTaskIdRef.current === taskId) {
+        setRunDraft((prev) => ({ ...prev, note: '' }))
+      }
       setNotice(null)
       await loadTask(taskId)
       await refreshTasks()
@@ -630,9 +651,9 @@ export function App() {
 
   const tabCounts: Record<DetailTab, number> = {
     results: latestResult?.finding_count ?? 0,
-    timeline: detail?.eventStats.important_count ?? 0,
+    timeline: activeDetail?.eventStats.important_count ?? 0,
     rounds: orderedRounds.length,
-    artifacts: detail?.artifacts.length ?? 0,
+    artifacts: activeDetail?.artifacts.length ?? 0,
   }
 
   const roundActive = isRoundActive(selectedTask?.status)
@@ -709,7 +730,14 @@ export function App() {
 
       {showSettings ? (
         <div className="body settings-body">
-          <Settings t={t} onBack={() => setShowSettings(false)} />
+          <Settings
+            t={t}
+            onSaved={(next) => {
+              configSeqRef.current += 1
+              setSavedConfig(next)
+            }}
+            onBack={() => setShowSettings(false)}
+          />
         </div>
       ) : (
       <div className="body">
@@ -766,7 +794,7 @@ export function App() {
               </div>
             )}
 
-            {selectedTask && detail && (
+            {selectedTask && activeDetail && (
               <>
                 <section className="detail-head">
                   <div className="detail-eyebrow">
@@ -1051,12 +1079,12 @@ export function App() {
                     <div className="timeline-bar">
                       <span>
                         {showAllEvents
-                          ? t.timeline.allEvents(detail.eventStats.all_count)
-                          : t.timeline.importantEvents(detail.eventStats.important_count)}
+                          ? t.timeline.allEvents(activeDetail.eventStats.all_count)
+                          : t.timeline.importantEvents(activeDetail.eventStats.important_count)}
                       </span>
-                      {detail.eventStats.hidden_count > 0 && (
+                      {activeDetail.eventStats.hidden_count > 0 && (
                         <button className="btn btn-ghost" onClick={() => setShowAllEvents((v) => !v)}>
-                          {showAllEvents ? t.timeline.importantOnly : t.timeline.showAll(detail.eventStats.all_count)}
+                          {showAllEvents ? t.timeline.importantOnly : t.timeline.showAll(activeDetail.eventStats.all_count)}
                         </button>
                       )}
                     </div>
@@ -1147,9 +1175,9 @@ export function App() {
 
                 {detailTab === 'artifacts' && (
                   <>
-                    {detail.artifacts.length ? (
+                    {activeDetail.artifacts.length ? (
                       <div className="artifacts">
-                        {detail.artifacts.map((artifact) => (
+                        {activeDetail.artifacts.map((artifact) => (
                           <div className="artifact" key={artifact.path}>
                             <span className="artifact-name">{artifact.relative_path}</span>
                             <span className="artifact-path" title={artifact.path}>{artifact.path}</span>
@@ -1235,6 +1263,12 @@ export function App() {
                     value={newAgent}
                     onChange={(event) => {
                       const nextAgent = event.target.value
+                      if (!nextAgent) {
+                        setNewAgent('')
+                        setNewModel('')
+                        setNewReasoning('')
+                        return
+                      }
                       const saved = savedForAgent(savedConfig, nextAgent)
                       const cap = backends.find((b) => b.name === nextAgent)
                       const opts = resolveReasoningOptions(cap, saved.model)
@@ -1243,6 +1277,7 @@ export function App() {
                       setNewReasoning(opts.supported ? saved.reasoning : '')
                     }}
                   >
+                    <option value="">{t.newReview.agentAuto}</option>
                     {backends.map((b) => (
                       <option key={b.name} value={b.name}>{b.name}</option>
                     ))}

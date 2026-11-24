@@ -169,24 +169,35 @@ export function savedForAgent(saved: SavedConfig | null, agent: string): { model
 
 /**
  * Build payload for `POST /api/config/save`.
- * Always sends `reasoning` explicitly (`null` for Model default) so backend
- * clears any previously saved reasoning instead of leaving it stale.
+ * When reasoning is supported for this backend, always sends `reasoning`
+ * explicitly (`null` for Model default) so backend clears any previously saved
+ * reasoning. When reasoning is NOT supported (e.g. OpenCode legacy `variant`),
+ * omits `reasoning` so existing hidden config is preserved.
  */
 export function buildSaveConfigPayload(
   backend: string,
   model: string,
   reasoning: string,
-): { backend: string; model: string | null; reasoning: string | null } {
-  return {
+  reasoningSupported = true,
+): { backend: string; model: string | null; reasoning?: string | null } {
+  const payload: { backend: string; model: string | null; reasoning?: string | null } = {
     backend: backend.trim(),
     model: model.trim() || null,
-    reasoning: reasoning.trim() || null,
   }
+  if (reasoningSupported) {
+    payload.reasoning = reasoning.trim() || null
+  }
+  return payload
 }
 
 /**
  * Initialize a per-round draft from the latest round (if any), falling back to
  * the task's defaults and then the saved config for that agent.
+ *
+ * When the latest round switched agents or explicitly overrode model/reasoning
+ * (including forcing CLI/Model default), mark those fields explicit so clicking
+ * "Run next round" keeps the displayed settings instead of snapping back to the
+ * original task's agent or defaults.
  */
 export function createRunDraft(
   task: TaskLike | null,
@@ -210,6 +221,21 @@ export function createRunDraft(
   const language = normalizeReviewLang(
     latestRound?.settings?.language ?? latestRound?.language ?? task?.language ?? 'en',
   )
+
+  const switchedFromTask = Boolean(latestRound && task && agent && agent !== task.backend)
+  const roundOverrodeModel = Boolean(
+    latestRound &&
+      (latestRound.settings?.sources?.model === 'round' ||
+        (model === '' && Boolean(fromSaved.model)) ||
+        (!switchedFromTask && task?.model && model !== task.model)),
+  )
+  const roundOverrodeReasoning = Boolean(
+    latestRound &&
+      (latestRound.settings?.sources?.reasoning === 'round' ||
+        (reasoning === '' && Boolean(fromSaved.reasoning)) ||
+        (!switchedFromTask && task?.reasoning && reasoning !== task.reasoning)),
+  )
+
   return {
     agent,
     model,
@@ -217,9 +243,9 @@ export function createRunDraft(
     language,
     note: '',
     explicit: {
-      agent: false,
-      model: false,
-      reasoning: false,
+      agent: switchedFromTask,
+      model: roundOverrodeModel,
+      reasoning: roundOverrodeReasoning,
       language: false,
     },
   }
