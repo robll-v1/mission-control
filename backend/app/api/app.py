@@ -25,6 +25,7 @@ from app.core.execution import ExecutionService
 from app.core.mission_engine import MissionEngine
 from app.core.models import TaskStatus
 from app.core.paths import (
+    DataDirLock,
     get_bundled_ui_dir,
     get_data_dir,
     get_db_path,
@@ -103,16 +104,26 @@ def _prune_startup_worktrees() -> None:
             continue
 
 
-# Recovery runs before pruning: worktree pruning treats VALIDATING (and the
-# other mid-flight statuses) as active and skips those tasks, so the stale
-# states must be cleared first for their worktrees to be cleaned up too.
-recover_stale_tasks(db, engine)
-_prune_startup_worktrees()
+_data_dir_lock = DataDirLock(DATA_DIR)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Graceful shutdown: wake open SSE streams on SIGTERM/SIGINT and abort active tasks."""
+    """Startup exclusivity/recovery and graceful shutdown for SSE streams and active tasks."""
+    if not _data_dir_lock.acquire():
+        holder = _data_dir_lock.holder_pid()
+        holder_hint = f' (PID {holder})' if holder else ''
+        raise RuntimeError(
+            f'Another Mission Control backend is already using data directory {DATA_DIR}{holder_hint}. '
+            'Stop it first or set a separate AMC_DATA_DIR.'
+        )
+
+    # Recovery runs after acquiring the data-dir lock and before pruning:
+    # worktree pruning treats VALIDATING (and other mid-flight statuses) as
+    # active and skips them, so stale states must be cleared first.
+    recover_stale_tasks(db, engine)
+    _prune_startup_worktrees()
+
     prev_sig_handlers: dict[int, object] = {}
     prev_loop_handlers: dict[int, tuple] = {}
     if threading.current_thread() is threading.main_thread():
@@ -192,6 +203,7 @@ async def lifespan(app: FastAPI):
                 signal.signal(sig, prev)
             except (OSError, ValueError):
                 pass
+        _data_dir_lock.release()
         logger.info('Shutdown complete.')
 
 

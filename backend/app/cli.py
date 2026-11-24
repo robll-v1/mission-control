@@ -26,6 +26,7 @@ from app.core.paths import (
     get_packaged_run_dir,
     has_bundled_ui,
     maybe_import_legacy_db,
+    probe_data_dir_lock,
 )
 from app.core.proc import run_text
 
@@ -922,6 +923,16 @@ def cmd_start(args: argparse.Namespace) -> None:
     if stale and _ports_file_matches_services(existing):
         _remove_ports_file()
 
+    # Prevent a second backend (e.g. source checkout + packaged install) from
+    # sharing the same AMC_DATA_DIR and clobbering active tasks/worktrees.
+    locked, holder_pid = probe_data_dir_lock(get_data_dir())
+    if locked:
+        holder_hint = f' (PID {holder_pid})' if holder_pid else ''
+        _fail(
+            f'Another Mission Control backend{holder_hint} is already using data directory {get_data_dir()}. '
+            'Stop it first or set a separate AMC_DATA_DIR.'
+        )
+
     # prerequisites
     _info('Checking prerequisites...')
 
@@ -1001,9 +1012,10 @@ def cmd_start(args: argparse.Namespace) -> None:
 
         if packaged:
             backend_cmd = [
-                sys.executable, '-m', 'uvicorn', 'app.api.app:app',
+                sys.executable, '-P', '-m', 'uvicorn', 'app.api.app:app',
                 '--host', '127.0.0.1',
                 '--port', str(backend_port),
+                '--no-proxy-headers',
             ]
         else:
             uvicorn_bin = str(_venv_bin('uvicorn'))
@@ -1012,15 +1024,34 @@ def cmd_start(args: argparse.Namespace) -> None:
                 '--app-dir', str(root / 'backend'),
                 '--host', '127.0.0.1',
                 '--port', str(backend_port),
+                '--no-proxy-headers',
             ]
         # --reload spawns a separate reloader+worker pair, which makes process
         # cleanup unreliable (especially on Windows). Allow opt-in for dev only.
         if os.environ.get('AMC_DEV_RELOAD'):
             backend_cmd.append('--reload')
+        backend_env = os.environ.copy()
+        if frontend_port is not None:
+            vite_origins = ','.join([
+                f'http://127.0.0.1:{frontend_port}',
+                f'http://localhost:{frontend_port}',
+                f'http://[::1]:{frontend_port}',
+            ])
+            existing_origins = backend_env.get('AMC_ALLOWED_ORIGINS', '').strip()
+            backend_env['AMC_ALLOWED_ORIGINS'] = (
+                f'{existing_origins},{vite_origins}' if existing_origins else vite_origins
+            )
+        backend_cwd: str | None = None
+        if packaged:
+            data_dir = get_data_dir()
+            data_dir.mkdir(parents=True, exist_ok=True)
+            backend_cwd = str(data_dir)
         try:
             with open(backend_log, 'a', encoding='utf-8', errors='replace', newline='') as log:
                 backend_proc = subprocess.Popen(
                     backend_cmd,
+                    cwd=backend_cwd,
+                    env=backend_env,
                     stdout=log, stderr=log,
                     start_new_session=not IS_WINDOWS,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0,

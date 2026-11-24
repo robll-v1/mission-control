@@ -17,7 +17,9 @@ if str(BACKEND_ROOT) not in sys.path:
 
 # Isolate the process-wide default AMC_DATA_DIR before any test imports
 # `app.api.app`, so pytest never reads, mutates, or migrates the developer's
-# real application data directory.
+# real application data directory. Also allow FastAPI TestClient's default
+# `testserver` Host strictly inside pytest (never in production code).
+os.environ.setdefault('AMC_ALLOWED_HOSTS', 'testserver')
 if not os.environ.get('AMC_DATA_DIR'):
     _PYTEST_DATA_DIR = tempfile.mkdtemp(prefix='amc-pytest-data-')
     os.environ['AMC_DATA_DIR'] = _PYTEST_DATA_DIR

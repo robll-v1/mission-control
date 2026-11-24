@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -47,7 +48,6 @@ def test_data_dir_platform_defaults_and_overrides(tmp_path, monkeypatch):
     monkeypatch.delenv('APPDATA', raising=False)
     assert paths.get_data_dir() == tmp_path / 'home' / 'AppData' / 'Roaming' / 'amc'
 
-    # Explicit overrides win across all platforms
     monkeypatch.setenv('AMC_DATA_DIR', str(tmp_path / 'custom-data'))
     assert paths.get_data_dir() == (tmp_path / 'custom-data').resolve()
     monkeypatch.setenv('AMC_DB_PATH', str(tmp_path / 'override.db'))
@@ -58,71 +58,145 @@ def test_data_dir_platform_defaults_and_overrides(tmp_path, monkeypatch):
     assert paths.get_worktrees_dir() == (tmp_path / 'short-wt').resolve()
 
 
-# ── 2. Legacy DB atomic import ────────────────────────────────────────────
+# ── 2. Legacy DB atomic import (live WAL, schema check, symlink, no overwrite) ─
 
 
-def test_legacy_db_import_copies_wal_data_without_touching_source(tmp_path, monkeypatch):
+def test_legacy_db_import_reads_live_wal_readonly_without_overwriting_target(tmp_path, monkeypatch):
     monkeypatch.delenv('AMC_NO_LEGACY_IMPORT', raising=False)
     monkeypatch.delenv('AMC_DB_PATH', raising=False)
 
     legacy_dir = tmp_path / 'legacy_repo' / 'data'
     legacy_db_path = legacy_dir / 'amc.db'
     legacy_db = Database(str(legacy_db_path))
-    # Enable WAL and insert a task so we verify sqlite3.backup() captures WAL state cleanly.
     legacy_db.conn.execute('PRAGMA journal_mode=WAL')
-    task = Task(title='Legacy review', repo_path=str(tmp_path / 'legacy_repo'), created_at=1.0, updated_at=1.0)
+    # Keep legacy_db OPEN while importing so WAL frames remain live on disk.
+    task = Task(title='Live WAL legacy review', repo_path=str(tmp_path / 'legacy_repo'), created_at=1.0, updated_at=1.0)
     legacy_db.save_task(task)
-    legacy_db.close()
+    wal_path = Path(f'{legacy_db_path}-wal')
+    assert wal_path.exists() and wal_path.stat().st_size > 0
+    before_bytes = legacy_db_path.read_bytes()
 
     target_db_path = tmp_path / 'app-data' / 'amc.db'
-    imported = paths.maybe_import_legacy_db(target_db_path, candidates=[legacy_db_path])
-    assert imported == legacy_db_path.resolve()
-    assert target_db_path.exists()
-    # Original legacy DB must remain intact
-    assert legacy_db_path.exists()
+    try:
+        imported = paths.maybe_import_legacy_db(target_db_path, candidates=[legacy_db_path])
+        assert imported == legacy_db_path.resolve()
+        # Read-only import must not rewrite or checkpoint the source DB file
+        assert legacy_db_path.read_bytes() == before_bytes
+    finally:
+        legacy_db.close()
 
     migrated = Database(str(target_db_path))
     loaded = migrated.get_task(task.id)
     assert loaded is not None
-    assert loaded.title == 'Legacy review'
+    assert loaded.title == 'Live WAL legacy review'
     migrated.close()
 
-    # Second run must NOT overwrite an existing target DB
-    second_legacy = tmp_path / 'other' / 'data' / 'amc.db'
-    db2 = Database(str(second_legacy))
-    db2.save_task(Task(title='Should not overwrite', repo_path=str(tmp_path), created_at=1.0, updated_at=1.0))
-    db2.close()
-    assert paths.maybe_import_legacy_db(target_db_path, candidates=[second_legacy]) is None
+    # Atomic publish must NEVER overwrite an existing target DB
+    temp_copy = tmp_path / 'app-data' / 'other.tmp'
+    temp_copy.write_bytes(b'new-content')
+    assert paths._publish_no_overwrite(temp_copy, target_db_path) is False
+    migrated2 = Database(str(target_db_path))
+    assert migrated2.get_task(task.id) is not None
+    migrated2.close()
 
 
-def test_legacy_db_import_skips_empty_garbage_and_opt_out(tmp_path, monkeypatch):
+def test_legacy_db_import_rejects_unrelated_db_symlinks_and_non_amc_cwd(tmp_path, monkeypatch):
     monkeypatch.delenv('AMC_NO_LEGACY_IMPORT', raising=False)
     monkeypatch.delenv('AMC_DB_PATH', raising=False)
 
-    # Non-SQLite file is skipped
-    garbage = tmp_path / 'bad.db'
-    garbage.write_text('not a sqlite database', encoding='utf-8')
-    # Empty schema-only AMC DB (0 tasks) is skipped
+    # 1. Unrelated SQLite DB with a non-AMC `tasks` table (no `data` JSON, no `runs`/`events`)
+    unrelated = tmp_path / 'unrelated.db'
+    conn = sqlite3.connect(str(unrelated))
+    conn.execute('CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT)')
+    conn.execute("INSERT INTO tasks (name) VALUES ('buy milk')")
+    conn.commit()
+    conn.close()
+
+    # 2. Empty AMC DB (0 tasks)
     empty_db_path = tmp_path / 'empty.db'
     empty_db = Database(str(empty_db_path))
     empty_db.close()
 
-    target = tmp_path / 'data' / 'amc.db'
-    assert paths.maybe_import_legacy_db(target, candidates=[garbage, empty_db_path]) is None
+    # 3. Symlink pointing to a valid AMC DB (must not be followed)
+    real_amc_path = tmp_path / 'real.db'
+    real_db = Database(str(real_amc_path))
+    real_db.save_task(Task(title='Real task', repo_path=str(tmp_path), created_at=1.0, updated_at=1.0))
+    real_db.close()
+    symlink_path = tmp_path / 'symlink.db'
+    try:
+        symlink_path.symlink_to(real_amc_path)
+        candidates = [unrelated, empty_db_path, symlink_path]
+    except OSError:
+        candidates = [unrelated, empty_db_path]
+
+    target = tmp_path / 'app-data' / 'amc.db'
+    assert paths.maybe_import_legacy_db(target, candidates=candidates) is None
     assert not target.exists()
 
-    # Opt-out flag skips even valid non-empty legacy DB
-    valid_path = tmp_path / 'valid.db'
-    vdb = Database(str(valid_path))
-    vdb.save_task(Task(title='Real task', repo_path=str(tmp_path), created_at=1.0, updated_at=1.0))
-    vdb.close()
+    # 4. find_legacy_db_paths ignores cwd/data/amc.db when cwd is not an AMC checkout
+    random_repo = tmp_path / 'other-project'
+    (random_repo / 'data').mkdir(parents=True)
+    (random_repo / 'data' / 'amc.db').write_bytes(real_amc_path.read_bytes())
+    monkeypatch.chdir(random_repo)
+    assert paths.find_legacy_db_paths() == []
 
+    # 5. Opt-out flag skips even valid direct candidate
     monkeypatch.setenv('AMC_NO_LEGACY_IMPORT', '1')
-    assert paths.maybe_import_legacy_db(target, candidates=[valid_path]) is None
+    assert paths.maybe_import_legacy_db(target, candidates=[real_amc_path]) is None
     assert not target.exists()
 
 
-# ── 3. Worktree short path & bounded cleanup retry ───────────────────────
+# ── 3. DataDirLock mutual exclusion ──────────────────────────────────────
+
+
+def test_data_dir_lock_prevents_concurrent_backends(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / 'shared-data'
+    data_dir.mkdir()
+    # Hold the OS lock in a separate child process so POSIX flock / Windows msvcrt
+    # semantics are tested across real processes.
+    helper = (
+        'import sys, time; from pathlib import Path; '
+        'from app.core.paths import DataDirLock; '
+        'lk = DataDirLock(Path(sys.argv[1])); '
+        'assert lk.acquire(); print("LOCKED", flush=True); '
+        'sys.stdin.read(); lk.release()'
+    )
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(Path(__file__).resolve().parent.parent)
+    proc = subprocess.Popen(
+        [sys.executable, '-c', helper, str(data_dir)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        line = proc.stdout.readline().strip()
+        assert line == 'LOCKED', f'child failed: {proc.stderr.read()}'
+        locked, holder_pid = paths.probe_data_dir_lock(data_dir)
+        assert locked is True
+        assert holder_pid == proc.pid
+
+        # `amc start` refuses cleanly when another backend holds the data dir lock
+        monkeypatch.setenv('AMC_DATA_DIR', str(data_dir))
+        monkeypatch.delenv('AMC_ROOT', raising=False)
+        monkeypatch.setattr(cli, '_USE_COLOR', False)
+        monkeypatch.setattr(cli, '_root_dir', lambda: data_dir)
+        with pytest.raises(SystemExit) as exc_info:
+            cli.cmd_start(SimpleNamespace(no_ui=True, bundled_ui=False, no_browser=True, port=18270, ui_port=18271))
+        assert exc_info.value.code == 1
+        assert 'already using data directory' in capsys.readouterr().err
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait(timeout=10)
+
+    locked_after, _ = paths.probe_data_dir_lock(data_dir)
+    assert locked_after is False
+
+
+# ── 4. Worktree short path & bounded cleanup retry ───────────────────────
 
 
 def test_worktree_custom_short_root_and_cleanup_retry(git_repo, tmp_path, monkeypatch):
@@ -133,7 +207,6 @@ def test_worktree_custom_short_root_and_cleanup_retry(git_repo, tmp_path, monkey
     assert Path(wt_path) == wt_root / task.id
     assert Path(wt_path).is_dir()
 
-    # Simulate transient Windows lock on first `git worktree remove` call, succeeding on retry
     original_run_git = WorktreeManager._run_git
     remove_attempts = {'count': 0}
 
@@ -155,10 +228,13 @@ def test_worktree_custom_short_root_and_cleanup_retry(git_repo, tmp_path, monkey
     assert len(sleeps) == 1
 
 
-# ── 4. Local Host / Origin security middleware ───────────────────────────
+# ── 5. Local Host / Origin security middleware ───────────────────────────
 
 
-def test_host_and_origin_parsers_reject_spoofing_and_allow_loopback():
+def test_host_and_origin_parsers_have_no_prod_testserver_backdoor(monkeypatch):
+    monkeypatch.delenv('AMC_ALLOWED_HOSTS', raising=False)
+    monkeypatch.delenv('AMC_ALLOWED_ORIGINS', raising=False)
+
     assert parse_host_header('127.0.0.1:8000') == '127.0.0.1'
     assert parse_host_header('localhost') == 'localhost'
     assert parse_host_header('[::1]:8000') == '::1'
@@ -167,27 +243,34 @@ def test_host_and_origin_parsers_reject_spoofing_and_allow_loopback():
     assert parse_host_header('127.0.0.1:notaport') is None
     assert parse_host_header('') is None
 
-    assert is_allowed_host('127.0.0.1:8000', client_host='127.0.0.1')
-    assert is_allowed_host('localhost:5173', client_host='127.0.0.1')
-    assert is_allowed_host('[::1]:8000', client_host='::1')
-    assert is_allowed_host('testserver', client_host='testclient')
-    # Real non-TestClient connection must NOT be allowed to spoof Host: testserver
-    assert not is_allowed_host('testserver', client_host='127.0.0.1')
-    assert not is_allowed_host('evil.com', client_host='127.0.0.1')
-    assert not is_allowed_host('127.0.0.1.evil.com', client_host='127.0.0.1')
-    assert not is_allowed_host('192.168.1.5:8000', client_host='192.168.1.5')
+    assert is_allowed_host('127.0.0.1:8000')
+    assert is_allowed_host('localhost:5173')
+    assert is_allowed_host('[::1]:8000')
+    # Zero hardcoded `testserver` backdoor when AMC_ALLOWED_HOSTS is unset!
+    assert not is_allowed_host('testserver')
+    assert not is_allowed_host('evil.com')
+    assert not is_allowed_host('127.0.0.1.evil.com')
+    assert not is_allowed_host('192.168.1.5:8000')
 
-    assert is_allowed_origin('http://127.0.0.1:8000')
-    assert is_allowed_origin('http://localhost:5173')
-    assert is_allowed_origin('http://[::1]:5173')
-    assert not is_allowed_origin('null')
-    assert not is_allowed_origin('https://evil.com')
-    assert not is_allowed_origin('http://localhost.evil.com')
-    assert not is_allowed_origin('file:///etc/passwd')
-    assert not is_allowed_origin('http://user@127.0.0.1:8000')
+    # Exact-origin match against server Host prevents cross-port localhost attacks
+    assert is_allowed_origin('http://127.0.0.1:8000', expected_host=('127.0.0.1', 8000))
+    assert not is_allowed_origin('http://127.0.0.1:9999', expected_host=('127.0.0.1', 8000))
+    assert not is_allowed_origin('http://localhost:8000', expected_host=('127.0.0.1', 8000))
+    assert not is_allowed_origin('null', expected_host=('127.0.0.1', 8000))
+    assert not is_allowed_origin('https://evil.com', expected_host=('127.0.0.1', 8000))
+    assert not is_allowed_origin('file:///etc/passwd', expected_host=('127.0.0.1', 8000))
+    assert not is_allowed_origin('http://user@127.0.0.1:8000', expected_host=('127.0.0.1', 8000))
+
+    # Explicit Vite dev origin in AMC_ALLOWED_ORIGINS is honored
+    monkeypatch.setenv('AMC_ALLOWED_ORIGINS', 'http://localhost:5173')
+    assert is_allowed_origin('http://localhost:5173', expected_host=('127.0.0.1', 8000))
+    assert not is_allowed_origin('http://localhost:9999', expected_host=('127.0.0.1', 8000))
 
 
-def test_local_security_middleware_blocks_dns_rebinding_and_csrf():
+def test_local_security_middleware_blocks_dns_rebinding_and_cross_port_csrf(monkeypatch):
+    monkeypatch.delenv('AMC_ALLOWED_HOSTS', raising=False)
+    monkeypatch.delenv('AMC_ALLOWED_ORIGINS', raising=False)
+
     mini = FastAPI()
     mini.add_middleware(LocalSecurityMiddleware)
 
@@ -201,37 +284,53 @@ def test_local_security_middleware_blocks_dns_rebinding_and_csrf():
 
     client = TestClient(mini)
 
-    # Valid loopback Host & Origin
+    # Host: testserver is REJECTED in production (when AMC_ALLOWED_HOSTS is unset),
+    # even if X-Forwarded-For tries to spoof client host.
+    assert client.get(
+        '/api/health',
+        headers={'host': 'testserver', 'x-forwarded-for': 'testclient'},
+    ).status_code == 403
+
+    # Valid loopback Host & same-origin POST
     assert client.get('/api/health', headers={'host': '127.0.0.1:8000'}).status_code == 200
     assert client.get('/api/health', headers={'host': 'localhost:8000'}).status_code == 200
     assert client.get('/api/health', headers={'host': '[::1]:8000'}).status_code == 200
     assert client.post(
         '/api/admin/shutdown',
-        headers={'host': '127.0.0.1:8000', 'origin': 'http://localhost:5173'},
+        headers={'host': '127.0.0.1:8000', 'origin': 'http://127.0.0.1:8000', 'sec-fetch-site': 'same-origin'},
     ).status_code == 200
     # CLI call without Origin/Referer/Sec-Fetch-Site is allowed
     assert client.post('/api/admin/shutdown', headers={'host': '127.0.0.1:8000'}).status_code == 200
 
-    # DNS rebinding blocked on GET & POST
-    r_bad_host = client.get('/api/health', headers={'host': 'rebind.evil.com:8000'})
-    assert r_bad_host.status_code == 403
-    assert 'Host' in r_bad_host.json()['detail']
+    # Cross-port localhost POST (e.g. rogue app on port 9999) is BLOCKED
+    assert client.post(
+        '/api/admin/shutdown',
+        headers={'host': '127.0.0.1:8000', 'origin': 'http://127.0.0.1:9999'},
+    ).status_code == 403
+    assert client.post(
+        '/api/admin/shutdown',
+        headers={'host': '127.0.0.1:8000', 'sec-fetch-site': 'same-site'},
+    ).status_code == 403
+    assert client.post(
+        '/api/admin/shutdown',
+        headers={'host': '127.0.0.1:8000', 'referer': 'http://127.0.0.1:9999/attack'},
+    ).status_code == 403
 
-    # Cross-origin Origin blocked on GET & POST (including Origin: null)
+    # Explicitly allowed Vite origin passes
+    monkeypatch.setenv('AMC_ALLOWED_ORIGINS', 'http://localhost:5173')
+    assert client.post(
+        '/api/admin/shutdown',
+        headers={'host': '127.0.0.1:8000', 'origin': 'http://localhost:5173', 'sec-fetch-site': 'same-site'},
+    ).status_code == 200
+
+    # DNS rebinding & cross-site blocked
+    assert client.get('/api/health', headers={'host': 'rebind.evil.com:8000'}).status_code == 403
     assert client.get('/api/health', headers={'host': '127.0.0.1:8000', 'origin': 'https://evil.com'}).status_code == 403
     assert client.post('/api/admin/shutdown', headers={'host': '127.0.0.1:8000', 'origin': 'null'}).status_code == 403
     assert client.post(
         '/api/admin/shutdown',
-        headers={'host': '127.0.0.1:8000', 'origin': 'https://evil.com'},
-    ).status_code == 403
-
-    # Sec-Fetch-Site: cross-site blocked on POST even without Origin
-    assert client.post(
-        '/api/admin/shutdown',
         headers={'host': '127.0.0.1:8000', 'sec-fetch-site': 'cross-site'},
     ).status_code == 403
-
-    # Cross-origin Referer blocked on POST when Origin is omitted
     assert client.post(
         '/api/admin/shutdown',
         headers={'host': '127.0.0.1:8000', 'referer': 'https://evil.com/csrf.html'},
@@ -242,7 +341,7 @@ def test_local_security_middleware_blocks_dns_rebinding_and_csrf():
     ).status_code == 200
 
 
-# ── 5. Bundled UI serving in FastAPI app ─────────────────────────────────
+# ── 6. Bundled UI serving in FastAPI app ─────────────────────────────────
 
 
 def test_bundled_ui_served_by_fastapi_and_blocks_traversal():
@@ -261,7 +360,6 @@ def test_bundled_ui_served_by_fastapi_and_blocks_traversal():
     assert '<div id="root">' in html
     assert '/assets/' in html
 
-    # Verify bundled JS/CSS assets load with 200
     assets_dir = paths.get_bundled_ui_dir() / 'assets'
     js_files = list(assets_dir.glob('*.js'))
     css_files = list(assets_dir.glob('*.css'))
@@ -269,22 +367,19 @@ def test_bundled_ui_served_by_fastapi_and_blocks_traversal():
     assert client.get(f'/assets/{js_files[0].name}', headers={'host': '127.0.0.1:8000'}).status_code == 200
     assert client.get(f'/assets/{css_files[0].name}', headers={'host': '127.0.0.1:8000'}).status_code == 200
 
-    # Unknown /api/* still returns 404 (not index.html)
     assert client.get('/api/does-not-exist', headers={'host': '127.0.0.1:8000'}).status_code == 404
-    # Security middleware is active on the real app
     assert client.get('/api/health', headers={'host': 'evil.com'}).status_code == 403
 
 
-# ── 6. Packaged CLI mode (no Node, no .venv, no pyproject.toml) ──────────
+# ── 7. Packaged CLI mode (no Node, no .venv, safe sys.path -P, trusted cwd) ─
 
 
-def test_cli_packaged_mode_starts_without_node_or_venv(tmp_path, monkeypatch, capsys):
+def test_cli_packaged_mode_starts_safely_without_node_or_venv(tmp_path, monkeypatch, capsys):
     data_dir = tmp_path / 'pkg-data'
     monkeypatch.setenv('AMC_DATA_DIR', str(data_dir))
     monkeypatch.delenv('AMC_ROOT', raising=False)
     monkeypatch.setattr(cli, '_USE_COLOR', False)
     monkeypatch.setattr(cli, 'IS_WINDOWS', False)
-    # Simulate running from site-packages (no pyproject.toml anywhere above cli.py)
     monkeypatch.setattr(cli, '_root_dir', lambda: data_dir)
     monkeypatch.setattr(cli, '_ensure_venv', lambda: pytest.fail('packaged mode must not bootstrap .venv'))
     monkeypatch.setattr(cli, '_ensure_frontend_deps', lambda: pytest.fail('packaged mode must not run npm'))
@@ -300,7 +395,7 @@ def test_cli_packaged_mode_starts_without_node_or_venv(tmp_path, monkeypatch, ca
     identity = {
         'pid': pid,
         'start_time': 'Tue Nov 24 14:00:00 2026',
-        'command': f'{sys.executable} -m uvicorn app.api.app:app --host 127.0.0.1 --port {port}',
+        'command': f'{sys.executable} -P -m uvicorn app.api.app:app --host 127.0.0.1 --port {port} --no-proxy-headers',
         'session_id': pid,
         'pgid': pid,
         'source': 'ps',
@@ -315,8 +410,12 @@ def test_cli_packaged_mode_starts_without_node_or_venv(tmp_path, monkeypatch, ca
         def poll(self):
             return 0
 
-    spawned: list[list[str]] = []
-    monkeypatch.setattr(cli.subprocess, 'Popen', lambda cmd, **_kwargs: spawned.append(cmd) or FakeProc())
+    spawned: list[tuple[list[str], str | None]] = []
+    monkeypatch.setattr(
+        cli.subprocess,
+        'Popen',
+        lambda cmd, **kwargs: spawned.append((cmd, kwargs.get('cwd'))) or FakeProc(),
+    )
 
     args = SimpleNamespace(no_ui=False, bundled_ui=False, no_browser=True, port=port, ui_port=18261)
     cli.cmd_start(args)
@@ -325,8 +424,12 @@ def test_cli_packaged_mode_starts_without_node_or_venv(tmp_path, monkeypatch, ca
     assert 'Node.js not found' not in captured.err
     assert f'http://127.0.0.1:{port}' in captured.out
     assert len(spawned) == 1
-    assert spawned[0][:4] == [sys.executable, '-m', 'uvicorn', 'app.api.app:app']
-    assert '--app-dir' not in spawned[0]
+    cmd, cwd = spawned[0]
+    assert cmd == [
+        sys.executable, '-P', '-m', 'uvicorn', 'app.api.app:app',
+        '--host', '127.0.0.1', '--port', str(port), '--no-proxy-headers',
+    ]
+    assert cwd == str(data_dir.resolve())
     assert (data_dir / 'run' / 'ports.json').is_file()
     state = json.loads((data_dir / 'run' / 'backend.json').read_text(encoding='utf-8'))
     assert cli._verify_service_state(state)[0] is True

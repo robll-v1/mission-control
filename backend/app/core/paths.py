@@ -1,4 +1,4 @@
-"""Platform-standard application data paths and legacy DB migration (P5).
+"""Platform-standard application data paths, legacy DB migration, and data-dir lock (P5).
 
 Default storage layout (overridable via ``AMC_DATA_DIR``):
   - macOS:   ``~/Library/Application Support/amc``
@@ -11,17 +11,25 @@ Global user config remains at ``~/.config/amc/config.yaml`` (honoring
 """
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import sqlite3
 import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable
+
+from app.core.models import Task
 
 logger = logging.getLogger(__name__)
 
 _SQLITE_MAGIC = b'SQLite format 3\x00'
+_REQUIRED_AMC_TABLES = frozenset({'tasks', 'runs', 'events'})
+_REQUIRED_TASK_COLUMNS = frozenset({'id', 'data'})
+_REQUIRED_RUN_COLUMNS = frozenset({'id', 'task_id', 'data'})
+_REQUIRED_EVENT_COLUMNS = frozenset({'id', 'task_id', 'seq', 'data'})
 
 
 def get_data_dir() -> Path:
@@ -81,10 +89,100 @@ def has_bundled_ui() -> bool:
     return (get_bundled_ui_dir() / 'index.html').is_file()
 
 
-def _is_nonempty_sqlite_file(path: Path) -> bool:
+class DataDirLock:
+    """Cross-platform non-blocking OS file lock preventing two backends from sharing one data dir."""
+
+    def __init__(self, data_dir: Path | str):
+        self.data_dir = Path(data_dir)
+        self.lock_path = self.data_dir / 'amc.lock'
+        self._fd: int | None = None
+
+    def acquire(self) -> bool:
+        """Attempt to acquire an exclusive non-blocking lock. Returns False if already held."""
+        if self._fd is not None:
+            return True
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if sys.platform == 'win32':
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, f'{os.getpid()}\n'.encode('ascii'))
+            os.fsync(fd)
+        except OSError:
+            pass
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        fd = self._fd
+        self._fd = None
+        try:
+            if sys.platform == 'win32':
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def holder_pid(self) -> int | None:
+        try:
+            text = self.lock_path.read_text(encoding='ascii', errors='ignore').strip()
+            return int(text) if text.isdigit() else None
+        except OSError:
+            return None
+
+
+def probe_data_dir_lock(data_dir: Path | str) -> tuple[bool, int | None]:
+    """Return ``(is_locked, holder_pid)`` without holding the lock after returning."""
+    lock = DataDirLock(data_dir)
+    if lock.acquire():
+        lock.release()
+        return False, None
+    return True, lock.holder_pid()
+
+
+def _is_amc_checkout_root(root: Path) -> bool:
+    """Return True when ``root`` looks like a Mission Control source checkout."""
+    pyproject = root / 'pyproject.toml'
     try:
-        st = path.stat()
-        if not stat.S_ISREG(st.st_mode) or st.st_size < len(_SQLITE_MAGIC):
+        lst = pyproject.lstat()
+        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+            return False
+        text = pyproject.read_text(encoding='utf-8', errors='ignore')[:4096]
+    except OSError:
+        return False
+    return 'agent-mission-control' in text
+
+
+def _is_nonempty_regular_sqlite_file(path: Path) -> bool:
+    """Verify ``path`` is a regular non-symlink file starting with the SQLite magic header."""
+    try:
+        lst = path.lstat()
+        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+            return False
+        if lst.st_size < len(_SQLITE_MAGIC):
             return False
         with path.open('rb') as handle:
             return handle.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
@@ -92,21 +190,41 @@ def _is_nonempty_sqlite_file(path: Path) -> bool:
         return False
 
 
-def _legacy_db_has_data(path: Path) -> bool:
-    """Return True when ``path`` is a readable AMC SQLite DB containing at least one task."""
-    if not _is_nonempty_sqlite_file(path):
+def _open_readonly_sqlite(path: Path) -> sqlite3.Connection:
+    """Open ``path`` strictly read-only so probing/importing never mutates or checkpoints it."""
+    uri = f'{path.resolve().as_uri()}?mode=ro'
+    return sqlite3.connect(uri, uri=True, timeout=5.0)
+
+
+def _legacy_db_has_valid_amc_data(path: Path) -> bool:
+    """Return True iff ``path`` is a genuine AMC SQLite database containing >=1 valid Task."""
+    if not _is_nonempty_regular_sqlite_file(path):
         return False
     conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(str(path), timeout=5.0)
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"
-        ).fetchone()
-        if row is None:
+        conn = _open_readonly_sqlite(path)
+        conn.row_factory = sqlite3.Row
+        tables = {
+            row['name']
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if not _REQUIRED_AMC_TABLES.issubset(tables):
             return False
-        has_row = conn.execute('SELECT 1 FROM tasks LIMIT 1').fetchone()
-        return has_row is not None
-    except sqlite3.Error:
+        cols = {row['name'] for row in conn.execute('PRAGMA table_info(tasks)').fetchall()}
+        if not _REQUIRED_TASK_COLUMNS.issubset(cols):
+            return False
+        run_cols = {row['name'] for row in conn.execute('PRAGMA table_info(runs)').fetchall()}
+        if not _REQUIRED_RUN_COLUMNS.issubset(run_cols):
+            return False
+        event_cols = {row['name'] for row in conn.execute('PRAGMA table_info(events)').fetchall()}
+        if not _REQUIRED_EVENT_COLUMNS.issubset(event_cols):
+            return False
+        row = conn.execute('SELECT data FROM tasks LIMIT 1').fetchone()
+        if row is None or not isinstance(row['data'], str):
+            return False
+        Task.model_validate_json(row['data'])
+        return True
+    except (sqlite3.Error, ValueError):
         return False
     finally:
         if conn is not None:
@@ -117,21 +235,64 @@ def _legacy_db_has_data(path: Path) -> bool:
 
 
 def find_legacy_db_paths(*, extra_roots: Iterable[Path] = ()) -> list[Path]:
-    """Locate existing legacy ``./data/amc.db`` databases from CWD or source checkouts."""
+    """Locate existing legacy ``./data/amc.db`` databases from verified AMC source checkouts."""
     candidates: list[Path] = []
     seen: set[Path] = set()
     roots = [Path.cwd(), *extra_roots]
     for root in roots:
+        if not _is_amc_checkout_root(root):
+            continue
+        raw_cand = root / 'data' / 'amc.db'
+        if not _is_nonempty_regular_sqlite_file(raw_cand):
+            continue
         try:
-            cand = (root / 'data' / 'amc.db').resolve()
+            cand = raw_cand.resolve()
         except OSError:
             continue
         if cand in seen:
             continue
         seen.add(cand)
-        if _is_nonempty_sqlite_file(cand):
-            candidates.append(cand)
+        candidates.append(cand)
     return candidates
+
+
+def _publish_no_overwrite(temp_path: Path, target: Path) -> bool:
+    """Atomically publish ``temp_path`` to ``target`` ONLY if ``target`` does not exist.
+
+    Uses ``os.link()`` (kernel-atomic create-if-absent) with an exclusive
+    lockfile fallback on filesystems that do not support hard links.
+    Returns True if published, False if ``target`` already exists.
+    """
+    try:
+        os.link(temp_path, target)
+        return True
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        # Filesystems without hard-link support (e.g., FAT/exFAT/network mounts)
+        if exc.errno not in {errno.EPERM, errno.EXDEV, errno.ENOTSUP, getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP), errno.EINVAL}:
+            raise
+        lock_path = target.parent / f'.{target.name}.import.lock'
+        lock_fd: int | None = None
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            if target.exists():
+                return False
+            os.replace(temp_path, target)
+            return True
+        finally:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
 
 
 def maybe_import_legacy_db(
@@ -143,12 +304,11 @@ def maybe_import_legacy_db(
     """Atomically import a legacy ``./data/amc.db`` on first run into the app data dir.
 
     Safety guarantees:
-    - Never overwrites an existing non-empty ``target_db``.
-    - Never modifies or deletes the legacy source database (kept as backup).
-    - Skips when ``AMC_DB_PATH`` explicitly overrides the DB path (unless
-      ``target_db`` is explicitly passed) or ``AMC_NO_LEGACY_IMPORT=1`` is set.
-    - Uses SQLite's online ``backup()`` API into a temp file + ``os.replace()``
-      so WAL/journal changes are captured cleanly and partial copies cannot occur.
+    - Never overwrites an existing ``target_db`` (kernel-atomic ``os.link`` publication).
+    - Never follows symlinks or imports non-AMC databases (verifies schema & Task JSON).
+    - Opens legacy source strictly read-only (``mode=ro``) so the source DB is untouched.
+    - Uses a unique temporary file (safe across threads and processes) and SQLite's
+      online ``backup()`` API to capture live WAL data consistently.
     """
     if os.environ.get('AMC_NO_LEGACY_IMPORT', '').strip().lower() in {'1', 'true', 'yes'}:
         return None
@@ -157,7 +317,7 @@ def maybe_import_legacy_db(
 
     target = (target_db if target_db is not None else get_db_path()).resolve()
     try:
-        if target.exists() and target.stat().st_size > 0:
+        if target.exists():
             return None
     except OSError:
         return None
@@ -169,21 +329,28 @@ def maybe_import_legacy_db(
     )
 
     for raw_cand in search_list:
+        cand_path = Path(raw_cand)
+        if not _legacy_db_has_valid_amc_data(cand_path):
+            continue
         try:
-            cand = Path(raw_cand).resolve()
+            cand = cand_path.resolve()
         except OSError:
             continue
         if cand == target:
             continue
-        if not _legacy_db_has_data(cand):
-            continue
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = target.parent / f'.{target.name}.{os.getpid()}.import.tmp'
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=str(target.parent),
+            prefix=f'.{target.name}.',
+            suffix='.import.tmp',
+        )
+        os.close(tmp_fd)
+        temp_path = Path(tmp_name)
         src_conn: sqlite3.Connection | None = None
         dst_conn: sqlite3.Connection | None = None
         try:
-            src_conn = sqlite3.connect(str(cand), timeout=5.0)
+            src_conn = _open_readonly_sqlite(cand)
             dst_conn = sqlite3.connect(str(temp_path), timeout=5.0)
             src_conn.backup(dst_conn)
             dst_conn.close()
@@ -191,10 +358,8 @@ def maybe_import_legacy_db(
             src_conn.close()
             src_conn = None
 
-            # Re-check immediately before publishing so a concurrent startup cannot be clobbered.
-            if target.exists() and target.stat().st_size > 0:
+            if not _publish_no_overwrite(temp_path, target):
                 return None
-            os.replace(temp_path, target)
             logger.info('Imported legacy database from %s to %s', cand, target)
             return cand
         except (OSError, sqlite3.Error) as exc:
