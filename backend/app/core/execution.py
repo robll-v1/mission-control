@@ -23,6 +23,7 @@ from app.core.context_compiler import (
     normalize_review_language,
 )
 from app.core.db import Database
+from app.core.finding_tracker import FindingTracker
 from app.core.github_ingest import fetch_pull_request
 from app.core.mission_engine import MissionEngine
 from app.core.models import EventLevel, Run, RunSettings, Task, TaskStatus
@@ -478,10 +479,18 @@ class ExecutionService:
                 )
             self.db.save_run(run)
             if task is not None:
-                task.latest_review_result = ReviewResultService.latest_result(self.db.list_runs(task_id))
+                runs = self.db.list_runs(task_id)
+                task.latest_review_result = ReviewResultService.latest_result(runs)
                 self.db.save_task(task)
                 if not was_aborted:
                     completed = run.status == 'completed'
+                    if completed:
+                        FindingTracker.sync_round(
+                            db=self.db,
+                            task=task,
+                            run=run,
+                            all_runs=runs,
+                        )
                     self.mission.set_stage(
                         task_id,
                         status=TaskStatus.WAITING_HUMAN if completed else TaskStatus.FAILED,
@@ -675,6 +684,7 @@ class ExecutionService:
                         'verdict': run.review_result.verdict,
                         'finding_count': run.review_result.finding_count,
                         'severity_counts': run.review_result.severity_counts,
+                        'parse_mode': run.review_result.parse_mode,
                         'summary': run.review_result.summary,
                     },
                 )

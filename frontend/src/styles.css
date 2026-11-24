@@ -616,6 +616,42 @@ code, .mono { font-family: var(--font-mono); }
 
 /* ── Findings ───────────────────────────────────────────── */
 
+.finding-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+.filter-pill:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.filter-pill.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.filter-pill .n {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  opacity: 0.85;
+}
+
 .findings { display: flex; flex-direction: column; gap: 10px; }
 
 .finding {
@@ -633,11 +669,15 @@ code, .mono { font-family: var(--font-mono); }
 .finding.sev-high     { --sev: var(--sev-high); }
 .finding.sev-medium   { --sev: var(--sev-medium); }
 .finding.sev-low      { --sev: var(--sev-low); }
+.finding.is-closed {
+  opacity: 0.78;
+  background: var(--surface-sunken);
+}
 
 .finding-top {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 .sev-tag {
@@ -646,6 +686,37 @@ code, .mono { font-family: var(--font-mono); }
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--sev);
+}
+.finding-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--neutral-soft);
+  color: var(--text-secondary);
+}
+.finding-status.st-new          { background: var(--accent-soft); color: var(--accent); }
+.finding-status.st-persistent   { background: var(--danger-soft); color: var(--danger); }
+.finding-status.st-likely_fixed { background: var(--success-soft, #e6f4ea); color: var(--success, #1e7e34); }
+.finding-status.st-unverified   { background: var(--warn-soft); color: var(--warn); }
+.finding-status.st-resolved     { background: var(--neutral-soft); color: var(--text-muted); }
+.finding-status.st-dismissed    { background: var(--neutral-soft); color: var(--text-muted); }
+
+.finding-chip {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+.finding-chip.is-warn {
+  background: var(--warn-soft);
+  border-color: transparent;
+  color: var(--warn);
 }
 .finding-loc {
   font-family: var(--font-mono);
@@ -668,6 +739,26 @@ code, .mono { font-family: var(--font-mono); }
   line-height: 1.68;
   color: var(--text-secondary);
   max-width: 74ch;
+  white-space: pre-wrap;
+}
+.finding-note {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.finding-note.is-warn {
+  color: var(--warn);
+}
+.finding-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+.btn-xs {
+  padding: 4px 10px;
+  font-size: 12px;
+  min-height: 28px;
 }
 
 /* ── Timeline ───────────────────────────────────────────── */

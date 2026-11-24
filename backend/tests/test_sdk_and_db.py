@@ -157,19 +157,28 @@ def test_incremental_clear_keeps_unmatched_prior_finding(git_repo, tmp_path, iso
     assert not report.passed
     assert report.unverified_findings[0].summary == 'validate input'
     assert 'remain unverified' in report.summary
-    assert history.get_previous_findings()[0].summary == 'validate input'
+    # Imported into SQLite findings as the sole source of truth.
+    tracked_1 = engine.get_tracked_findings(report.task_id)
+    assert [f.title for f in tracked_1] == ['validate input']
+    assert tracked_1[0].status == 'unverified'
 
     second_incremental = engine.review(str(git_repo), base='main')
     assert second_incremental.is_incremental
     assert len(second_incremental.unverified_findings) == 1
-    assert history.get_previous_findings()[0].summary == 'validate input'
+    assert [f.title for f in engine.get_tracked_findings(second_incremental.task_id)] == ['validate input']
 
     full_review = engine.review(str(git_repo), base='main', incremental=False)
 
     assert not full_review.is_incremental
     assert full_review.passed
     assert full_review.unverified_findings == []
-    assert history.get_previous_findings() == []
+    assert engine.get_tracked_findings(full_review.task_id) == []
+
+    # Next incremental review reads from SQLite (the clean full_review), not stale legacy files.
+    after_full = engine.review(str(git_repo), base='main')
+    assert after_full.is_incremental
+    assert after_full.passed
+    assert after_full.unverified_findings == []
 
 
 def test_pr_history_does_not_seed_local_incremental_review(git_repo, tmp_path, isolated_config, monkeypatch):
@@ -208,11 +217,10 @@ def test_pr_history_does_not_seed_local_incremental_review(git_repo, tmp_path, i
     assert summaries == ['local issue']
     assert 'PR-only issue' not in summaries
 
-    # The just-finished local review is now latest; its record must carry the
-    # retained local finding forward, but never the PR one.
-    saved = history.get_latest()
-    assert saved.mode == 'local_diff'
-    assert [f.summary for f in saved.findings] == ['local issue']
+    # SQLite carries forward the retained local finding without leaking the PR one
+    # and without rewriting the legacy `.amc/reviews/latest.json` file.
+    tracked = engine.get_tracked_findings(report.task_id)
+    assert [f.title for f in tracked] == ['local issue']
     assert [f.summary for f in history.get_previous_findings(mode='local_diff')] == ['local issue']
 
 
@@ -325,8 +333,12 @@ def test_review_inline_persists_run_and_latest_result(tmp_path, git_repo, isolat
     assert len(runs) == 1 and runs[0].status == 'completed'
     assert runs[0].metrics.get('llm_wall_time_ms') is not None
 
-    # And review history is written, so incremental mode works on this path.
-    assert (git_repo / '.amc' / 'reviews' / 'latest.json').exists()
+    # Findings are persisted in SQLite as the sole source of truth without
+    # creating `.amc/reviews/` junk inside the reviewed repository.
+    tracked = engine.get_tracked_findings(report.task_id)
+    assert len(tracked) == 1
+    assert tracked[0].title == 'value is never validated'
+    assert not (git_repo / '.amc' / 'reviews').exists()
 
 
 def test_mode_lookup_searches_all_retained_history(tmp_path):

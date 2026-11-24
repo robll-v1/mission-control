@@ -1,16 +1,23 @@
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from app.core.context_compiler import ContextCompiler
 from app.core.config import resolve_backend_config
+from app.core.finding_tracker import FindingTracker
 from app.core.github_ingest import fetch_pull_request, is_github_pr_url
 from app.core.mission_engine import MissionEngine
-from app.core.models import TaskStatus
+from app.core.models import FindingStatus, TaskStatus
 from app.schemas.task import CreateTaskRequest
 from app.services.artifact_store import ArtifactStore
 from app.services.local_review_service import build_local_review_source
 from app.services.review_result_service import ReviewResultService
+
+
+class UpdateFindingStatusRequest(BaseModel):
+    action: str | None = None
+    status: str | None = None
 
 
 def get_engine() -> MissionEngine:
@@ -186,6 +193,7 @@ def get_task(
     task = ReviewResultService.backfill_task(db=mission.db, task=task)
     events = mission.db.list_events(task_id)
     rounds = mission.db.list_runs(task_id)
+    tracked_findings = mission.db.list_findings(task_id)
     important_events = ReviewResultService.important_events(events)
     return {
         'task': task.model_dump(),
@@ -197,8 +205,93 @@ def get_task(
             'hidden_count': max(len(events) - len(important_events), 0),
         },
         'latest_review_result': task.latest_review_result.model_dump() if task.latest_review_result is not None else None,
+        'findings': [finding.model_dump() for finding in tracked_findings],
+        'finding_counts': FindingTracker.counts(tracked_findings),
         'review_rounds': [run.model_dump() for run in rounds],
         'runs': [run.model_dump() for run in rounds],
         'checks': [check.model_dump() for check in mission.db.list_check_runs(task_id)],
         'artifacts': artifact_store.list_files(task_id),
+    }
+
+
+@router.get('/{task_id}/findings')
+def list_task_findings(
+    task_id: str,
+    status: str | None = Query(default=None),
+    severity: str | None = Query(default=None),
+    mission: MissionEngine = Depends(get_engine),
+):
+    task = mission.db.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail='task not found')
+    ReviewResultService.backfill_task(db=mission.db, task=task)
+    all_findings = mission.db.list_findings(task_id)
+    filtered = all_findings
+    if status:
+        wanted = {s.strip().lower() for s in status.split(',') if s.strip()}
+        if 'open' in wanted:
+            wanted.discard('open')
+            wanted.update({'new', 'persistent', 'unverified', 'likely_fixed'})
+        filtered = [f for f in filtered if f.status.value in wanted]
+    if severity:
+        wanted_sev = {s.strip().lower() for s in severity.split(',') if s.strip()}
+        filtered = [f for f in filtered if f.severity.lower() in wanted_sev]
+    return {
+        'findings': [f.model_dump() for f in filtered],
+        'counts': FindingTracker.counts(all_findings),
+    }
+
+
+@router.patch('/{task_id}/findings/{finding_id}')
+def update_task_finding(
+    task_id: str,
+    finding_id: str,
+    request: UpdateFindingStatusRequest,
+    mission: MissionEngine = Depends(get_engine),
+):
+    task = mission.db.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail='task not found')
+    ReviewResultService.backfill_task(db=mission.db, task=task)
+
+    raw_action = request.action if request.action is not None else request.status
+    if raw_action is None:
+        # Explicit {"status": null} also acts as undo/reopen.
+        if 'status' in request.model_fields_set and request.status is None:
+            raw_action = 'reopen'
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="action or status is required ('resolve', 'dismiss', or 'reopen')",
+            )
+
+    try:
+        updated = FindingTracker.set_user_status(
+            db=mission.db,
+            task_id=task_id,
+            finding_id=finding_id,
+            action=raw_action,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    mission.append_event(
+        task_id=task_id,
+        kind='finding.status_changed',
+        payload={
+            'finding_id': updated.id,
+            'status': updated.status.value,
+            'system_status': updated.system_status.value,
+            'user_status': updated.user_status.value if updated.user_status is not None else None,
+            'path': updated.path,
+            'line': updated.line,
+            'title': updated.title,
+        },
+    )
+    all_findings = mission.db.list_findings(task_id)
+    return {
+        'finding': updated.model_dump(),
+        'counts': FindingTracker.counts(all_findings),
     }
