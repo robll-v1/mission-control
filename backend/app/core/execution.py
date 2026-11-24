@@ -14,11 +14,21 @@ from pathlib import Path
 
 from app.adapters.base import RunnerAdapter, resolve_executable
 from app.core.config import load_repo_config, resolve_backend_config
-from app.core.context_compiler import ContextCompiler
+from app.core.context_compiler import (
+    DEFAULT_REVIEW_LANGUAGE,
+    ContextCompiler,
+    normalize_review_language,
+)
 from app.core.db import Database
 from app.core.github_ingest import fetch_pull_request
 from app.core.mission_engine import MissionEngine
 from app.core.models import EventLevel, Run, Task, TaskStatus
+from app.core.proc import (
+    mark_termination_requested,
+    spawn_managed_process,
+    terminate_process_tree,
+    wait_for_process_exit,
+)
 from app.core.review_policy import prepare_static_review_env
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
@@ -99,7 +109,14 @@ class ExecutionService:
         with self._lock:
             return task_id in self._active
 
-    def start_task(self, task_id: str, prompt: str | None = None, review_note: str | None = None, language: str = 'zh') -> Run:
+    def start_task(
+        self,
+        task_id: str,
+        prompt: str | None = None,
+        review_note: str | None = None,
+        language: str | None = DEFAULT_REVIEW_LANGUAGE,
+    ) -> Run:
+        resolved_language = normalize_review_language(language)
         task = self.db.get_task(task_id)
         if task is None:
             raise KeyError(f'task not found: {task_id}')
@@ -118,7 +135,7 @@ class ExecutionService:
             placeholder = ActiveProcess(task_id=task_id, run_id=None, process=None, worker=None)
             self._active[task_id] = placeholder
         try:
-            return self._launch_round(task, prompt, review_note, language, placeholder)
+            return self._launch_round(task, prompt, review_note, resolved_language, placeholder)
         except BaseException as exc:
             try:
                 # Settle the task while the slot is still held: once it is
@@ -331,6 +348,12 @@ class ExecutionService:
                         # already completed cannot accept a late abort while
                         # its worktree is being cleaned up.
                         return False
+                # Claim teardown ownership BEFORE publishing ABORTED / control.accepted
+                # so a concurrent wait_for_process_exit cannot reap a fast-exiting
+                # leader between publishing the cancel and calling _terminate_process.
+                process = active.process
+                if process is not None:
+                    mark_termination_requested(process)
                 # The flag and ABORTED are published together. Every stage
                 # change on the starting thread checks the flag under this
                 # lock, and the worker checks it before launching the agent.
@@ -342,9 +365,6 @@ class ExecutionService:
                     kind='control.accepted',
                     payload={'action': 'abort', 'phase': active.phase},
                 )
-            # The preflight probe or the review agent. With neither running
-            # yet, whichever thread is about to spawn one sees the flag first.
-            process = active.process
         if process is not None:
             self._terminate_process(process)
         return True
@@ -429,6 +449,7 @@ class ExecutionService:
                     # config that silently drops the selected model shows up
                     # in the event stream. No variant: most CLIs never get it.
                     'model': getattr(adapter, 'model', None),
+                    'language': language,
                     'worktree_path': task.worktree_path,
                     'idle_timeout_sec': idle_timeout_sec,
                     'round_index': round_index,
@@ -436,7 +457,7 @@ class ExecutionService:
                     'pr_head_sha': task.pr_head_sha,
                 },
             )
-            proc = subprocess.Popen(
+            proc = spawn_managed_process(
                 cmd,
                 cwd=task.worktree_path or task.repo_path,
                 # The prompt is an argument, but every CLI also reads a
@@ -450,8 +471,6 @@ class ExecutionService:
                 encoding='utf-8',
                 errors='replace',
                 bufsize=1,
-                start_new_session=(sys.platform != 'win32'),
-                **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {}),
                 env=prepare_static_review_env(self.worktrees.runtime_root),
             )
             with self._lock:
@@ -464,6 +483,8 @@ class ExecutionService:
                 slot.process = proc
                 slot.worker = threading.current_thread()
                 cancelled_while_spawning = slot.cancel_requested
+                if cancelled_while_spawning:
+                    mark_termination_requested(proc)
             if cancelled_while_spawning:
                 # abort_task had no process to kill. Stopping it here lets the
                 # normal exit path below finalise the round as aborted.
@@ -488,7 +509,10 @@ class ExecutionService:
                 try:
                     stream_name, line = line_queue.get(timeout=0.5)
                 except queue.Empty:
-                    if proc.poll() is not None and line_queue.empty() and not stdout_thread.is_alive() and not stderr_thread.is_alive():
+                    # Do NOT call proc.poll() while reader threads are alive:
+                    # reaping the leader before pipes hit EOF would release its
+                    # PID/PGID and hide any grandchild still holding the pipes.
+                    if line_queue.empty() and not stdout_thread.is_alive() and not stderr_thread.is_alive():
                         break
                     if time.time() - last_activity_at >= idle_timeout_sec:
                         self.mission.append_event(
@@ -524,7 +548,7 @@ class ExecutionService:
                         payload=event.payload,
                     )
 
-            exit_code = proc.wait(timeout=5)
+            exit_code = wait_for_process_exit(proc, timeout=5)
             run.ended_at = time.time()
             run.exit_code = exit_code
             run.status = 'completed' if exit_code == 0 else 'failed'
@@ -579,7 +603,7 @@ class ExecutionService:
                 },
             )
         except Exception as exc:
-            if proc is not None and proc.poll() is None:
+            if proc is not None and proc.returncode is None:
                 self._terminate_process(proc)
             run.ended_at = time.time()
             run.exit_code = -2 if isinstance(exc, IdleTimeoutError) else -1
@@ -643,46 +667,7 @@ class ExecutionService:
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen[str]) -> None:
-        if proc.returncode is not None:
-            # Already reaped (abort and the probe wait can both stop the
-            # probe). Its pid, and so its process group id, may now belong
-            # to an unrelated process.
-            return
-        if sys.platform == 'win32':
-            # Windows: no process groups via os.killpg
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
-            return
-
-        # Unix: terminate the whole process group
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        except Exception:
-            try:
-                proc.terminate()
-            except OSError:
-                return
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+        terminate_process_tree(proc)
 
     def _preflight_check(
         self,
@@ -725,11 +710,10 @@ class ExecutionService:
             if active is not None:
                 self._raise_if_cancelled(active)
             try:
-                # Popen (not subprocess.run) so the probe is visible in the
-                # active slot and an abort during the up-to-150s wait can
-                # terminate exactly this subprocess. Same process-group
-                # treatment as the review agent itself.
-                probe_proc = subprocess.Popen(
+                # Managed spawn (not subprocess.run) so the probe is visible in
+                # the active slot, bound to its own process group / Windows Job
+                # Object before executing, and cleanly cancellable.
+                probe_proc = spawn_managed_process(
                     probe,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
@@ -738,19 +722,22 @@ class ExecutionService:
                     encoding='utf-8',
                     errors='replace',
                     cwd=task.repo_path,
-                    start_new_session=(sys.platform != 'win32'),
-                    **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {}),
                 )
             except FileNotFoundError:
                 raise PreflightError(f'{executable} executable not found.')
+            cancelled_before_register = False
             with self._lock:
                 if active is not None:
                     if active.cancel_requested:
-                        # Abort landed while we were spawning: kill the probe
-                        # ourselves; abort_task saw process=None.
-                        self._terminate_process(probe_proc)
-                        raise RoundCancelledError('review round was cancelled before the preflight probe started')
-                    active.process = probe_proc
+                        # Abort landed while we were spawning: claim ownership
+                        # under self._lock, then tear down outside the lock.
+                        mark_termination_requested(probe_proc)
+                        cancelled_before_register = True
+                    else:
+                        active.process = probe_proc
+            if cancelled_before_register:
+                self._terminate_process(probe_proc)
+                raise RoundCancelledError('review round was cancelled before the preflight probe started')
             try:
                 stdout_text, stderr_text = self._await_probe(
                     probe_proc,
@@ -792,31 +779,60 @@ class ExecutionService:
     ) -> tuple[str, str]:
         """Wait for the probe while watching for cancellation and timeout.
 
-        The poll interval bounds both the abort latency and the timeout
-        overshoot. On cancellation or timeout the probe process is terminated
-        and reaped before raising, so nothing leaks.
+        Reads stdout/stderr on daemon threads and reaps via
+        ``wait_for_process_exit`` instead of ``Popen.communicate``, so a
+        concurrent ``abort_task`` termination retains exclusive reap ownership
+        until the entire process group has been torn down.
         """
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        def drain(stream, target: list[str]) -> None:
+            if stream is None:
+                return
+            try:
+                data = stream.read()
+                if data:
+                    target.append(data)
+            except Exception:
+                pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        stdout_thread = threading.Thread(target=drain, args=(probe_proc.stdout, stdout_chunks), daemon=True)
+        stderr_thread = threading.Thread(target=drain, args=(probe_proc.stderr, stderr_chunks), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
         deadline = time.monotonic() + probe_timeout_sec
         while True:
-            try:
-                stdout_text, stderr_text = probe_proc.communicate(timeout=0.25)
-                return stdout_text or '', stderr_text or ''
-            except subprocess.TimeoutExpired:
-                cancelled = active is not None and active.cancel_requested
-                if cancelled or time.monotonic() >= deadline:
-                    self._terminate_process(probe_proc)
-                    try:
-                        probe_proc.communicate(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    if cancelled:
-                        raise RoundCancelledError(
-                            'review round was cancelled while the preflight probe was running'
-                        ) from None
-                    raise PreflightError(
-                        f'{executable} preflight test timed out after {probe_timeout_sec}s. '
-                        f'The LLM backend may be unreachable or still cold-starting.'
+            cancelled = active is not None and active.cancel_requested
+            if cancelled or time.monotonic() >= deadline:
+                self._terminate_process(probe_proc)
+                stdout_thread.join(timeout=2)
+                stderr_thread.join(timeout=2)
+                if cancelled:
+                    raise RoundCancelledError(
+                        'review round was cancelled while the preflight probe was running'
                     ) from None
+                raise PreflightError(
+                    f'{executable} preflight test timed out after {probe_timeout_sec}s. '
+                    f'The LLM backend may be unreachable or still cold-starting.'
+                ) from None
+
+            if not stdout_thread.is_alive() and not stderr_thread.is_alive():
+                try:
+                    wait_for_process_exit(probe_proc, timeout=0.25)
+                    return ''.join(stdout_chunks), ''.join(stderr_chunks)
+                except subprocess.TimeoutExpired:
+                    continue
+
+            stdout_thread.join(timeout=0.05)
+            if not stdout_thread.is_alive():
+                stderr_thread.join(timeout=0.05)
 
     @staticmethod
     def _idle_timeout_seconds(repo_path: str) -> int:

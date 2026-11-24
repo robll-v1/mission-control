@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { errorMessage, labelFor, type Localized, type Messages } from './i18n'
 
 type Backend = {
   name: string
@@ -21,7 +22,13 @@ type CurrentConfig = {
   config: SavedConfig
 }
 
-type Status = { tone: 'info' | 'error'; text: string } | null
+// Text is resolved when rendered, so a banner on screen follows a language
+// switch. It stays inside an object: React calls a bare function passed to a
+// state setter as an updater.
+type Status = { tone: 'info' | 'error'; text: Localized } | null
+
+const LOAD_FAILED: Localized = (t) => t.settings.loadFailed
+const SAVE_FAILED: Localized = (t) => t.settings.saveFailed
 
 const DISPLAY_NAMES: Record<string, string> = {
   opencode: 'OpenCode',
@@ -40,23 +47,21 @@ const INSTALL_HINTS: { name: string; command: string }[] = [
 const SEARCH_THRESHOLD = 8
 
 function displayName(name: string) {
-  return DISPLAY_NAMES[name] ?? name
+  return labelFor(DISPLAY_NAMES, name)
 }
 
-function modelSourceDescription(source: Backend['models_source'], modelCount: number) {
+function modelSourceDescription(t: Messages, source: Backend['models_source'], modelCount: number) {
   switch (source) {
     case 'cli':
-      return '模型列表来自本机 CLI。'
+      return t.settings.modelSource.cli
     case 'catalog_cache':
-      return '模型列表来自本机模型目录缓存。'
+      return t.settings.modelSource.catalog_cache
     case 'cache':
-      return '模型列表来自本机缓存。'
+      return t.settings.modelSource.cache
     case 'config':
-      return '模型列表来自本机配置。'
+      return t.settings.modelSource.config
     default:
-      return modelCount > 0
-        ? '模型列表来源未知。'
-        : '未能读取模型列表；仍可选择后端默认模型或保留已配置的模型。'
+      return modelCount > 0 ? t.settings.modelSource.unknown : t.settings.modelSource.unreadable
   }
 }
 
@@ -76,28 +81,31 @@ function BackIcon() {
   )
 }
 
-export function Settings({ onBack }: { onBack: () => void }) {
+export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
   const [backends, setBackends] = useState<Backend[]>([])
   const [saved, setSaved] = useState<SavedConfig | null>(null)
   const [selectedBackend, setSelectedBackend] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
   const [modelSearch, setModelSearch] = useState('')
   const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState('')
+  const [loadError, setLoadError] = useState<Status>(null)
   const [saving, setSaving] = useState(false)
   const [status, setStatus] = useState<Status>(null)
 
   useEffect(() => {
     Promise.all([fetch('/api/config/detect'), fetch('/api/config/current')])
       .then(async ([detectRes, currentRes]) => {
-        if (!detectRes.ok || !currentRes.ok) throw new Error('无法读取配置，请确认后端服务正在运行')
+        if (!detectRes.ok || !currentRes.ok) {
+          setLoadError({ tone: 'error', text: LOAD_FAILED })
+          return
+        }
         const [data, current]: [DetectResponse, CurrentConfig] = await Promise.all([detectRes.json(), currentRes.json()])
         setBackends(data.backends)
         setSaved(current.config)
         setSelectedBackend(current.config.backend || data.backends[0]?.name || '')
         setSelectedModel(current.config.model || '')
       })
-      .catch((err) => setLoadError(err instanceof Error ? err.message : String(err)))
+      .catch((err) => setLoadError({ tone: 'error', text: errorMessage(err, LOAD_FAILED) }))
       .finally(() => setLoading(false))
   }, [])
 
@@ -131,14 +139,17 @@ export function Settings({ onBack }: { onBack: () => void }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ backend: selectedBackend, model: selectedModel }),
       })
-      if (!res.ok) throw new Error('保存失败，请稍后重试')
+      if (!res.ok) {
+        setStatus({ tone: 'error', text: SAVE_FAILED })
+        return
+      }
       setSaved({ backend: selectedBackend, model: selectedModel || null, variant: saved?.variant ?? null })
       setStatus({
         tone: 'info',
-        text: `已保存。之后发起的审查会使用 ${displayName(selectedBackend)} · ${selectedModel || '后端默认模型'}。`,
+        text: (t) => t.settings.saved(displayName(selectedBackend), selectedModel || t.settings.agentDefault),
       })
     } catch (err) {
-      setStatus({ tone: 'error', text: err instanceof Error ? err.message : String(err) })
+      setStatus({ tone: 'error', text: errorMessage(err, SAVE_FAILED) })
     } finally {
       setSaving(false)
     }
@@ -149,15 +160,16 @@ export function Settings({ onBack }: { onBack: () => void }) {
       <div className="detail-eyebrow">
         <button className="link-back" onClick={onBack}>
           <BackIcon />
-          返回审查
+          {t.settings.backToReviews}
         </button>
         <span aria-hidden="true">·</span>
-        <span>设置</span>
+        <span>{t.settings.eyebrow}</span>
       </div>
-      <h1 className="detail-title">模型选择</h1>
+      <h1 className="detail-title">{t.settings.title}</h1>
       <p className="settings-lede">
-        Mission Control 通过你本机已安装的 Agent CLI 执行审查。在这里选择默认使用的后端和模型，网页中发起的审查都会使用这份配置；仓库内的
-        <code>.amc.yaml</code> 仍然优先。
+        {t.settings.ledeBeforeFile}
+        <code>.amc.yaml</code>
+        {t.settings.ledeAfterFile}
       </p>
     </div>
   )
@@ -168,8 +180,8 @@ export function Settings({ onBack }: { onBack: () => void }) {
         <div className="main-inner settings-inner">
           {header}
           <div className="section-label">
-            <span>后端</span>
-            <span className="count">正在检测本机的 Agent CLI…</span>
+            <span>{t.settings.agentHeading}</span>
+            <span className="count">{t.settings.detecting}</span>
           </div>
           <div className="backend-grid" aria-busy="true">
             {[0, 1].map((i) => (
@@ -189,7 +201,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
       <main className="main settings-main">
         <div className="main-inner settings-inner">
           {header}
-          <div className="banner is-error" role="alert">{loadError}</div>
+          <div className="banner is-error" role="alert">{loadError.text(t)}</div>
         </div>
       </main>
     )
@@ -201,8 +213,12 @@ export function Settings({ onBack }: { onBack: () => void }) {
         <div className="main-inner settings-inner">
           {header}
           <section className="settings-card install-card">
-            <h2>没有检测到可用的 Agent CLI</h2>
-            <p>安装下面任意一个，并确认它在 <code>PATH</code> 中，然后重新打开此页面。</p>
+            <h2>{t.settings.noneDetected}</h2>
+            <p>
+              {t.settings.installBeforePath}
+              <code>PATH</code>
+              {t.settings.installAfterPath}
+            </p>
             <ul className="install-list">
               {INSTALL_HINTS.map((hint) => (
                 <li key={hint.name}>
@@ -224,15 +240,15 @@ export function Settings({ onBack }: { onBack: () => void }) {
 
         {status && (
           <div className={`banner ${status.tone === 'error' ? 'is-error' : 'is-info'}`} role="status">
-            <span>{status.text}</span>
-            <button onClick={() => setStatus(null)} aria-label="关闭提示">✕</button>
+            <span>{status.text(t)}</span>
+            <button onClick={() => setStatus(null)} aria-label={t.common.dismiss}>✕</button>
           </div>
         )}
 
         <section aria-labelledby="backend-heading">
           <div className="section-label">
-            <span id="backend-heading">后端</span>
-            <span className="count">检测到 {backends.length} 个</span>
+            <span id="backend-heading">{t.settings.agentHeading}</span>
+            <span className="count">{t.settings.detected(backends.length)}</span>
           </div>
           <div className="backend-grid" role="radiogroup" aria-labelledby="backend-heading">
             {backends.map((backend) => {
@@ -241,7 +257,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 <label
                   key={backend.name}
                   className={`backend-option ${active ? 'selected' : ''}`}
-                  title={`命令：${backend.command}`}
+                  title={t.settings.command(backend.command)}
                 >
                   <input
                     type="radio"
@@ -252,13 +268,13 @@ export function Settings({ onBack }: { onBack: () => void }) {
                   />
                   <span className="backend-top">
                     <span className="backend-title">{displayName(backend.name)}</span>
-                    {saved?.backend === backend.name && <span className="pill">当前</span>}
+                    {saved?.backend === backend.name && <span className="pill">{t.settings.current}</span>}
                     <span className="backend-check" aria-hidden="true">{active && <CheckIcon />}</span>
                   </span>
                   <span className="backend-meta">
-                    {backend.model_count ? `已发现 ${backend.model_count} 个模型` : '使用后端默认模型'}
+                    {backend.model_count ? t.settings.modelsFound(backend.model_count) : t.settings.usesAgentDefault}
                   </span>
-                  <span className="backend-version mono">{backend.version || '版本未知'}</span>
+                  <span className="backend-version mono">{backend.version || t.settings.versionUnknown}</span>
                 </label>
               )
             })}
@@ -267,34 +283,34 @@ export function Settings({ onBack }: { onBack: () => void }) {
 
         {selectedBackend && !currentBackend && (
           <div className="banner is-error" role="alert">
-            已保存的后端「{displayName(selectedBackend)}」当前没有检测到。请先安装它，或在上方改选其他后端。
+            {t.settings.savedAgentMissing(displayName(selectedBackend))}
           </div>
         )}
 
         {currentBackend && (
           <section aria-labelledby="model-heading">
             <div className="section-label">
-              <span id="model-heading">模型</span>
+              <span id="model-heading">{t.settings.modelHeading}</span>
               {currentBackend.model_count > currentBackend.models.length && (
                 <span className="count">
-                  显示 {currentBackend.models.length} / {currentBackend.model_count}，已隐藏测试版和弃用模型
+                  {t.settings.showingModels(currentBackend.models.length, currentBackend.model_count)}
                 </span>
               )}
             </div>
 
             <div className="settings-card model-card">
               <p className="model-hint">
-                {modelSourceDescription(currentBackend.models_source, currentBackend.models.length)} {currentBackend.models_note}
-                {' '}列表不代表账号调用权限，能否调用请以实际请求结果为准。
+                {modelSourceDescription(t, currentBackend.models_source, currentBackend.models.length)} {currentBackend.models_note}
+                {' '}{t.settings.notCallable}
               </p>
               {currentBackend.models.length > SEARCH_THRESHOLD && (
                 <div className="model-search">
                   <input
                     type="search"
-                    placeholder="搜索模型"
+                    placeholder={t.settings.searchModels}
                     value={modelSearch}
                     onChange={(e) => setModelSearch(e.target.value)}
-                    aria-label="搜索模型"
+                    aria-label={t.settings.searchModels}
                   />
                 </div>
               )}
@@ -303,8 +319,8 @@ export function Settings({ onBack }: { onBack: () => void }) {
                 {!query && (
                   <ModelOption
                     value=""
-                    label="后端默认模型"
-                    hint={currentBackend.models.length ? '不指定，由后端自己决定' : '这个后端没有提供可读取的模型列表'}
+                    label={t.settings.agentDefault}
+                    hint={currentBackend.models.length ? t.settings.agentDefaultHint : t.settings.noModelList}
                     checked={selectedModel === ''}
                     onSelect={setSelectedModel}
                   />
@@ -313,7 +329,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                   <ModelOption
                     value={selectedModel}
                     label={selectedModel}
-                    hint="当前配置，不在检测列表中"
+                    hint={t.settings.customModelHint}
                     checked
                     onSelect={setSelectedModel}
                   />
@@ -338,7 +354,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
                   </div>
                 ))}
                 {query && modelGroups.length === 0 && (
-                  <div className="model-empty">没有匹配「{modelSearch.trim()}」的模型</div>
+                  <div className="model-empty">{t.settings.noMatch(modelSearch.trim())}</div>
                 )}
               </div>
             </div>
@@ -347,22 +363,22 @@ export function Settings({ onBack }: { onBack: () => void }) {
 
         <div className="settings-savebar">
           <div className="savebar-summary">
-            <span className="meta-key">{dirty ? '将保存为' : '当前配置'}</span>
+            <span className="meta-key">{dirty ? t.settings.willSave : t.settings.currentConfig}</span>
             <span className="savebar-value">
               {displayName(selectedBackend)}
               <span aria-hidden="true"> · </span>
-              <span className="mono">{selectedModel || '后端默认模型'}</span>
+              <span className="mono">{selectedModel || t.settings.agentDefault}</span>
             </span>
           </div>
           <button className="btn btn-ghost" onClick={onBack}>
-            返回
+            {t.common.back}
           </button>
           <button
             className="btn btn-primary"
             onClick={handleSave}
             disabled={saving || !currentBackend || !dirty}
           >
-            {saving ? '保存中…' : '保存配置'}
+            {saving ? t.settings.saving : t.settings.save}
           </button>
         </div>
       </div>
