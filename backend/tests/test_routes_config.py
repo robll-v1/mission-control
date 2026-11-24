@@ -107,7 +107,18 @@ def test_current_config_exposes_only_selected_backend_fields(tmp_path, monkeypat
     )
 
     result = routes_config.get_current_config()
-    assert result == {'config': {'backend': 'codex', 'model': 'm', 'variant': 'high'}}
+    assert result == {
+        'config': {
+            'backend': 'codex',
+            'model': 'm',
+            'reasoning': 'high',
+            'variant': 'high',
+            'per_backend': {
+                'codex': {'model': 'm', 'reasoning': 'high', 'variant': 'high'},
+            },
+        }
+    }
+    assert 'secret' not in str(result)
 
 
 def test_detect_does_not_block_event_loop(monkeypatch):

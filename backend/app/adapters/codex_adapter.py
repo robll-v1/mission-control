@@ -7,7 +7,13 @@ import os
 import shlex
 from typing import Any
 
-from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable
+from app.adapters.base import (
+    AdapterEvent,
+    RunnerAdapter,
+    resolve_executable,
+    validate_model_name,
+    validate_reasoning_level,
+)
 from app.core.models import Task
 from app.core.review_policy import BLOCKED_MARKER, forbidden_command_reason
 
@@ -32,10 +38,13 @@ def _shell_script(command: str) -> str:
 class CodexAdapter(RunnerAdapter):
     name = 'codex'
     executable = 'codex'
+    supports_reasoning = True
 
-    def __init__(self, model: str | None = None, variant: str | None = None):
-        self.model = model
-        self.variant = variant
+    def __init__(self, model: str | None = None, variant: str | None = None, reasoning: str | None = None):
+        self.model = validate_model_name(model)
+        eff = validate_reasoning_level(reasoning if reasoning is not None else variant)
+        self.reasoning = eff
+        self.variant = eff
 
     def _exec_args(self, work_dir: str) -> list[str]:
         # codex-cli 0.169 rejects --full-auto (deprecated in 0.128, since
@@ -53,12 +62,25 @@ class CodexAdapter(RunnerAdapter):
         ]
         if self.model:
             args.extend(['--model', self.model])
+        if self.reasoning:
+            args.extend(['-c', f'model_reasoning_effort={self.reasoning}'])
         return args
 
     def probe_command(self) -> list[str] | None:
         # Parses the same flags as a round without starting a session, so a
         # CLI update that drops one fails preflight instead of the round.
         return [*self._exec_args('.'), '--version']
+
+    def doctor_command(self) -> list[str]:
+        # Fixed arguments only: never pass untrusted HTTP strings to Windows
+        # .cmd/.bat wrappers during a static CLI probe. Model & reasoning are
+        # validated in-process against safe regex + detected capabilities.
+        return [
+            resolve_executable('codex'), 'exec', '--json',
+            '--sandbox', 'read-only',
+            '--cd', '.',
+            '--version',
+        ]
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         return [*self._exec_args(task.worktree_path or task.repo_path), prompt]

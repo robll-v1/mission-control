@@ -26,21 +26,31 @@ def register(name: str, cls: type[RunnerAdapter]) -> None:
     _rebuild_list()
 
 
-def get_adapter(name: str, *, model: str | None = None, variant: str | None = None) -> RunnerAdapter:
+def get_adapter(
+    name: str,
+    *,
+    model: str | None = None,
+    variant: str | None = None,
+    reasoning: str | None = None,
+) -> RunnerAdapter:
     """Instantiate an adapter by backend name.
 
-    Raises KeyError if name is not registered.
+    ``reasoning`` is the preferred parameter; ``variant`` remains a
+    backward-compatible alias. Raises KeyError if name is not registered.
     """
     cls = _REGISTRY.get(name)
     if cls is None:
         raise KeyError(f'Unknown backend: {name!r}. Available: {AVAILABLE_BACKENDS}')
     import inspect
     sig = inspect.signature(cls.__init__)
+    eff_reasoning = reasoning if reasoning is not None else variant
     kwargs: dict = {}
     if 'model' in sig.parameters:
         kwargs['model'] = model
+    if 'reasoning' in sig.parameters:
+        kwargs['reasoning'] = eff_reasoning
     if 'variant' in sig.parameters:
-        kwargs['variant'] = variant
+        kwargs['variant'] = variant if variant is not None else eff_reasoning
     return cls(**kwargs)
 
 

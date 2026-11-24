@@ -4,19 +4,41 @@ from __future__ import annotations
 
 import json
 
-from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable
+from app.adapters.base import (
+    AdapterEvent,
+    RunnerAdapter,
+    resolve_executable,
+    validate_model_name,
+    validate_reasoning_level,
+)
 from app.core.models import Task
 
 
 class ClaudeCodeAdapter(RunnerAdapter):
     name = 'claude-code'
     executable = 'claude'
+    supports_reasoning = True
 
-    def __init__(self, model: str | None = None, variant: str | None = None):
-        self.model = model
-        self.variant = variant
+    def __init__(self, model: str | None = None, variant: str | None = None, reasoning: str | None = None):
+        self.model = validate_model_name(model)
+        eff = validate_reasoning_level(reasoning if reasoning is not None else variant)
+        self.reasoning = eff
+        self.variant = eff
+
+    def _selection_args(self) -> list[str]:
+        args: list[str] = []
+        if self.model:
+            args.extend(['--model', self.model])
+        if self.reasoning:
+            args.extend(['--effort', self.reasoning])
+        return args
 
     def probe_command(self) -> list[str] | None:
+        return [resolve_executable('claude'), *self._selection_args(), '--version']
+
+    def doctor_command(self) -> list[str]:
+        # Fixed arguments only: avoids passing HTTP parameters into Windows
+        # .cmd/.bat wrappers; model and reasoning are validated in-process.
         return [resolve_executable('claude'), '--version']
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
@@ -27,9 +49,8 @@ class ClaudeCodeAdapter(RunnerAdapter):
             '--verbose',
             '--permission-mode', 'bypassPermissions',
             '--add-dir', work_dir,
+            *self._selection_args(),
         ]
-        if self.model:
-            cmd.extend(['--model', self.model])
         return cmd
 
     def parse_stdout_line(self, line: str) -> list[AdapterEvent]:

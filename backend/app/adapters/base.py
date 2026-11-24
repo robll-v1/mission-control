@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 from abc import ABC, abstractmethod
@@ -9,6 +10,33 @@ from typing import Any
 
 from app.core.review_policy import BLOCKED_MARKER, forbidden_command_reason
 from app.core.models import Task
+
+# Strictly reject whitespace, control chars, and shell metacharacters
+# (especially Windows cmd.exe `& | < > ^ % ! " ' ; ( )` for .cmd/.bat shims).
+_SAFE_MODEL_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_./:@#+-]{0,127}$')
+_SAFE_REASONING_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$')
+
+
+def validate_model_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if not _SAFE_MODEL_RE.fullmatch(cleaned):
+        raise ValueError(f'invalid model name: {value!r}')
+    return cleaned
+
+
+def validate_reasoning_level(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if not _SAFE_REASONING_RE.fullmatch(cleaned):
+        raise ValueError(f'invalid reasoning effort value: {value!r}')
+    return cleaned
 
 
 def resolve_executable(name: str) -> str:
@@ -44,6 +72,8 @@ class RunnerAdapter(ABC):
     #: ``claude-code`` runs ``claude``, ``copilot`` runs ``gh``. Preflight must
     #: probe *this*, not :attr:`name`.
     executable: str = ''
+    #: Whether this adapter forwards a reasoning effort level to its CLI.
+    supports_reasoning: bool = False
 
     @abstractmethod
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
@@ -63,6 +93,14 @@ class RunnerAdapter(ABC):
         credentials problem.
         """
         return None
+
+    def doctor_command(self) -> list[str]:
+        """Strictly non-LLM static command for `Check agent` / `amc doctor`.
+
+        Validates executable and CLI flag parsing (including selected model and
+        reasoning flags when supported) without making any model/network call.
+        """
+        return [resolve_executable(self.executable_name()), '--version']
 
     def parse_stdout_line(self, line: str) -> list[AdapterEvent]:
         stripped = line.strip()

@@ -969,6 +969,7 @@ def cmd_review(args: argparse.Namespace) -> None:
     max_rounds = args.rounds
     timeout = args.timeout
     model = args.model if getattr(args, 'model', None) else None
+    reasoning = args.reasoning if getattr(args, 'reasoning', None) else None
 
     _eprint('Starting review...')
     if pr_url:
@@ -980,9 +981,11 @@ def cmd_review(args: argparse.Namespace) -> None:
     _eprint(f'   Max rounds: {max_rounds}')
 
     try:
-        engine = ReviewEngine(language='en', backend=backend_name, model=model)
+        engine = ReviewEngine(language='en', backend=backend_name, model=model, reasoning=reasoning)
         if engine.model:
             _eprint(f'   Model: {engine.model}')
+        if engine.reasoning:
+            _eprint(f'   Reasoning: {engine.reasoning}')
         report = engine.review(
             repo_path,
             pr_url=pr_url,
@@ -1207,6 +1210,7 @@ def main() -> None:
     review_p.add_argument('--base', '-b', default=None, help='Base branch for local diff (default: auto-detect)')
     review_p.add_argument('--backend', default=None, help='Backend agent (opencode, claude-code, copilot, codex)')
     review_p.add_argument('--model', '-m', default=None, help='Model override (priority: --model > $AMC_MODEL > .amc.yaml)')
+    review_p.add_argument('--reasoning', default=None, help='Reasoning effort override (priority: --reasoning > $AMC_REASONING > .amc.yaml)')
     review_p.add_argument('--rounds', type=int, default=1,
                           help='Positive integer, max review rounds (default: 1)')
     review_p.add_argument('--format', choices=['markdown', 'json'], default='markdown',

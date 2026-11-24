@@ -994,7 +994,7 @@ code, .mono { font-family: var(--font-mono); }
 
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field-label { font-size: 12.5px; font-weight: 500; color: var(--text-secondary); }
-.field input, .field textarea {
+.field input, .field textarea, .field select {
   width: 100%;
   border: 1px solid var(--border-strong);
   background: var(--bg);
@@ -1005,7 +1005,7 @@ code, .mono { font-family: var(--font-mono); }
   transition: border-color 0.14s ease, box-shadow 0.14s ease;
 }
 .field input::placeholder, .field textarea::placeholder { color: var(--text-muted); }
-.field input:focus, .field textarea:focus {
+.field input:focus, .field textarea:focus, .field select:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-ring);
@@ -1296,6 +1296,7 @@ code, .mono { font-family: var(--font-mono); }
 .settings-savebar {
   position: sticky;
   bottom: 16px;
+  z-index: 10;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1354,4 +1355,131 @@ code, .mono { font-family: var(--font-mono); }
   .settings-savebar { flex-wrap: wrap; }
   .savebar-summary { flex-basis: 100%; }
   .settings-savebar .btn { flex: 1 1 auto; }
+}
+
+/* ── P2: Reasoning effort, effective preview, per-round settings ── */
+
+.card-note { padding: 12px 14px 4px; margin: 0; }
+
+.effective-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+.effective-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.source-badge {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.reasoning-card {
+  margin-top: 8px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.reasoning-card .model-hint { margin: 0; }
+.reasoning-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.reasoning-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease, color 0.14s ease;
+}
+.reasoning-chip:hover { border-color: var(--accent); color: var(--text); }
+.reasoning-chip.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+  font-weight: 500;
+}
+.reasoning-chip input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.reasoning-chip:has(input:focus-visible) {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 2px;
+}
+
+.check-result-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.check-result-cmd {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  opacity: 0.85;
+  word-break: break-all;
+}
+
+.modal-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.round-config-card {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.round-config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.field-compact { gap: 4px; }
+.field-compact .field-label { font-size: 11.5px; }
+.field-compact input,
+.field-compact select {
+  padding: 6px 9px;
+  font-size: 13px;
+}
+.round-settings-pill {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 560px) {
+  .modal-grid { grid-template-columns: minmax(0, 1fr); }
+  .round-config-grid { grid-template-columns: minmax(0, 1fr); }
 }

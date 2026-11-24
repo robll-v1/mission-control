@@ -50,6 +50,19 @@ class ReviewResult(BaseModel):
     supersedes_round_index: int | None = None
 
 
+class RunSettings(BaseModel):
+    """Resolved per-round execution settings and where each field came from."""
+    agent: str
+    model: str | None = None
+    reasoning: str | None = None
+    # Reserved optional speed tier (not exposed in UI in v1).
+    speed: str | None = None
+    language: str = 'en'
+    focus: str = ''
+    note: str = ''
+    sources: dict[str, str] = Field(default_factory=dict)
+
+
 class Task(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     title: str
@@ -58,6 +71,9 @@ class Task(BaseModel):
     source_url: str | None = None
     repo_path: str
     backend: str = 'opencode'
+    model: str | None = None
+    reasoning: str | None = None
+    language: str | None = None
     review_focus: str = ''
     pr_owner: str | None = None
     pr_repo: str | None = None
@@ -82,6 +98,10 @@ class Run(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     task_id: str
     backend: str
+    model: str | None = None
+    reasoning: str | None = None
+    language: str = 'en'
+    settings: RunSettings | None = None
     round_index: int = 1
     review_note: str = ''
     review_revision: str | None = None

@@ -68,6 +68,9 @@ def create_task(
 
     review_focus = request.review_focus.strip()
     backend = resolve_backend_config(repo_path, backend=request.backend)['backend']
+    task_model = (request.model or '').strip() or None
+    task_reasoning = (request.reasoning or '').strip() or None
+    task_language = request.language
     if request.source_type == 'pull_request':
         pr_url = (request.pr_url or '').strip()
         if not pr_url:
@@ -90,6 +93,9 @@ def create_task(
             source_type='pull_request',
             source_url=pr_url,
             backend=backend,
+            model=task_model,
+            reasoning=task_reasoning,
+            language=task_language,
             review_focus=review_focus,
             pr_owner=pull_request.owner,
             pr_repo=pull_request.repo,
@@ -129,6 +135,9 @@ def create_task(
             source_type='local_diff',
             source_url=None,
             backend=backend,
+            model=task_model,
+            reasoning=task_reasoning,
+            language=task_language,
             review_focus=review_focus,
             pr_base_ref=local.base_branch,
             review_paths=local.changed_files,

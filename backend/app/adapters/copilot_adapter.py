@@ -4,22 +4,37 @@ from __future__ import annotations
 
 import json
 
-from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable
+from app.adapters.base import (
+    AdapterEvent,
+    RunnerAdapter,
+    resolve_executable,
+    validate_model_name,
+    validate_reasoning_level,
+)
 from app.core.models import Task
 
 
 class CopilotAdapter(RunnerAdapter):
     name = 'copilot'
     executable = 'gh'
+    supports_reasoning = False
 
-    def __init__(self, model: str | None = None, variant: str | None = None):
-        self.model = model
-        self.variant = variant
+    def __init__(self, model: str | None = None, variant: str | None = None, reasoning: str | None = None):
+        self.model = validate_model_name(model)
+        # Validate format consistently across all adapters before degrading.
+        validate_reasoning_level(reasoning if reasoning is not None else variant)
+        # Copilot CLI does not expose reasoning effort; degrade cleanly to CLI default.
+        self.variant = None
+        self.reasoning = None
 
     def probe_command(self) -> list[str] | None:
         # `gh copilot --version` would need the extension installed; checking gh
         # itself is the most we can assert cheaply and without side effects.
         return [resolve_executable('gh'), '--version']
+
+    def doctor_command(self) -> list[str]:
+        # Static check verifies the `gh copilot` extension is actually installed.
+        return [resolve_executable('gh'), 'copilot', '--help']
 
     def make_command(self, *, task: Task, prompt: str) -> list[str]:
         work_dir = task.worktree_path or task.repo_path

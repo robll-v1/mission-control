@@ -1,22 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { errorMessage, labelFor, type Localized, type Messages } from './i18n'
-
-type Backend = {
-  name: string
-  version: string
-  models: string[]
-  command: string
-  model_count: number
-  grouped_models?: Record<string, string[]>
-  models_source?: 'cli' | 'catalog_cache' | 'cache' | 'config' | 'unknown' | string
-  models_note?: string | null
-}
+import {
+  buildSaveConfigPayload,
+  resolveReasoningOptions,
+  savedForAgent,
+  type BackendCapability,
+  type CheckAgentResponse,
+  type EffectiveSettingsResponse,
+  type SavedConfig,
+} from './runSettings'
 
 type DetectResponse = {
-  backends: Backend[]
+  backends: BackendCapability[]
 }
-
-type SavedConfig = { backend: string; model: string | null; variant: string | null }
 
 type CurrentConfig = {
   config: SavedConfig
@@ -50,7 +46,7 @@ function displayName(name: string) {
   return labelFor(DISPLAY_NAMES, name)
 }
 
-function modelSourceDescription(t: Messages, source: Backend['models_source'], modelCount: number) {
+function modelSourceDescription(t: Messages, source: BackendCapability['models_source'], modelCount: number) {
   switch (source) {
     case 'cli':
       return t.settings.modelSource.cli
@@ -62,6 +58,21 @@ function modelSourceDescription(t: Messages, source: Backend['models_source'], m
       return t.settings.modelSource.config
     default:
       return modelCount > 0 ? t.settings.modelSource.unknown : t.settings.modelSource.unreadable
+  }
+}
+
+function reasoningSourceDescription(t: Messages, source?: string) {
+  switch (source) {
+    case 'cache':
+      return t.settings.reasoningSource.cache
+    case 'cli_help':
+      return t.settings.reasoningSource.cli_help
+    case 'config':
+      return t.settings.reasoningSource.config
+    case 'unsupported':
+      return t.settings.reasoningSource.unsupported
+    default:
+      return t.settings.reasoningSource.unknown
   }
 }
 
@@ -81,16 +92,41 @@ function BackIcon() {
   )
 }
 
-export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
-  const [backends, setBackends] = useState<Backend[]>([])
+export function Settings({
+  onBack,
+  onSaved,
+  t,
+}: {
+  onBack: () => void
+  onSaved?: (config: SavedConfig) => void
+  t: Messages
+}) {
+  const [backends, setBackends] = useState<BackendCapability[]>([])
   const [saved, setSaved] = useState<SavedConfig | null>(null)
+  const [effective, setEffective] = useState<EffectiveSettingsResponse | null>(null)
   const [selectedBackend, setSelectedBackend] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
+  const [selectedReasoning, setSelectedReasoning] = useState('')
   const [modelSearch, setModelSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<Status>(null)
   const [saving, setSaving] = useState(false)
+  const [checking, setChecking] = useState(false)
+  const [checkResult, setCheckResult] = useState<CheckAgentResponse | null>(null)
+  const [checkError, setCheckError] = useState<Status>(null)
   const [status, setStatus] = useState<Status>(null)
+  const checkSeqRef = useRef(0)
+
+  const refreshEffective = useCallback(async () => {
+    try {
+      const res = await fetch('/api/config/effective')
+      if (res.ok) {
+        setEffective((await res.json()) as EffectiveSettingsResponse)
+      }
+    } catch {
+      // Optional preview; keep page usable if unavailable.
+    }
+  }, [])
 
   useEffect(() => {
     Promise.all([fetch('/api/config/detect'), fetch('/api/config/current')])
@@ -102,17 +138,31 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
         const [data, current]: [DetectResponse, CurrentConfig] = await Promise.all([detectRes.json(), currentRes.json()])
         setBackends(data.backends)
         setSaved(current.config)
-        setSelectedBackend(current.config.backend || data.backends[0]?.name || '')
-        setSelectedModel(current.config.model || '')
+        const initialBackend = current.config.backend || data.backends[0]?.name || ''
+        const initialSaved = savedForAgent(current.config, initialBackend)
+        setSelectedBackend(initialBackend)
+        setSelectedModel(initialSaved.model)
+        setSelectedReasoning(initialSaved.reasoning)
+        void refreshEffective()
       })
       .catch((err) => setLoadError({ tone: 'error', text: errorMessage(err, LOAD_FAILED) }))
       .finally(() => setLoading(false))
-  }, [])
+  }, [refreshEffective])
 
   const currentBackend = backends.find((b) => b.name === selectedBackend)
+  const reasoningOptions = useMemo(
+    () => resolveReasoningOptions(currentBackend, selectedModel),
+    [currentBackend, selectedModel],
+  )
   const query = modelSearch.trim().toLowerCase()
   const customModel = Boolean(selectedModel && currentBackend && !currentBackend.models.includes(selectedModel))
-  const dirty = !saved || saved.backend !== selectedBackend || (saved.model || '') !== selectedModel
+  const savedForCurrent = savedForAgent(saved, selectedBackend)
+  const effectiveSelectedReasoning = reasoningOptions.supported ? selectedReasoning : ''
+  const dirty =
+    !saved ||
+    saved.backend !== selectedBackend ||
+    savedForCurrent.model !== selectedModel ||
+    (reasoningOptions.supported && savedForCurrent.reasoning !== effectiveSelectedReasoning)
 
   const modelGroups = useMemo(() => {
     if (!currentBackend) return []
@@ -123,35 +173,126 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
   }, [currentBackend, query])
 
   const chooseBackend = (name: string) => {
+    checkSeqRef.current += 1
+    setChecking(false)
     setSelectedBackend(name)
     setModelSearch('')
-    // Coming back to the saved backend restores its saved model instead of wiping it.
-    setSelectedModel(saved?.backend === name ? saved.model || '' : '')
+    // Restore this agent's own saved model and reasoning, never leaking another agent's settings.
+    const nextSaved = savedForAgent(saved, name)
+    const cap = backends.find((b) => b.name === name)
+    const opts = resolveReasoningOptions(cap, nextSaved.model)
+    setSelectedModel(nextSaved.model)
+    setSelectedReasoning(opts.supported ? nextSaved.reasoning : '')
     setStatus(null)
+    setCheckResult(null)
+    setCheckError(null)
+  }
+
+  const chooseModel = (model: string) => {
+    checkSeqRef.current += 1
+    setChecking(false)
+    setSelectedModel(model)
+    const opts = resolveReasoningOptions(currentBackend, model)
+    if (selectedReasoning && (!opts.supported || !opts.levels.includes(selectedReasoning))) {
+      setSelectedReasoning('')
+    }
+    setCheckResult(null)
+    setCheckError(null)
   }
 
   const handleSave = async () => {
     setSaving(true)
     setStatus(null)
     try {
+      const payload = buildSaveConfigPayload(
+        selectedBackend,
+        selectedModel,
+        selectedReasoning,
+        reasoningOptions.supported,
+      )
       const res = await fetch('/api/config/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ backend: selectedBackend, model: selectedModel }),
+        body: JSON.stringify(payload),
       })
       if (!res.ok) {
         setStatus({ tone: 'error', text: SAVE_FAILED })
         return
       }
-      setSaved({ backend: selectedBackend, model: selectedModel || null, variant: saved?.variant ?? null })
+      const preservedReasoning = reasoningOptions.supported
+        ? (payload.reasoning ?? null)
+        : (savedForCurrent.reasoning || null)
+      const nextPerBackend = {
+        ...(saved?.per_backend ?? {}),
+        [selectedBackend]: {
+          model: payload.model,
+          reasoning: preservedReasoning,
+          variant: preservedReasoning,
+        },
+      }
+      const nextSaved: SavedConfig = {
+        backend: selectedBackend,
+        model: payload.model,
+        reasoning: preservedReasoning,
+        variant: preservedReasoning,
+        per_backend: nextPerBackend,
+      }
+      setSaved(nextSaved)
+      onSaved?.(nextSaved)
+      await refreshEffective()
       setStatus({
         tone: 'info',
-        text: (t) => t.settings.saved(displayName(selectedBackend), selectedModel || t.settings.agentDefault),
+        text: (t) => {
+          const modelLabel = payload.model || t.settings.agentDefault
+          const suffix = payload.reasoning ? `${modelLabel} · ${payload.reasoning}` : modelLabel
+          return t.settings.saved(displayName(selectedBackend), suffix)
+        },
       })
     } catch (err) {
       setStatus({ tone: 'error', text: errorMessage(err, SAVE_FAILED) })
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleCheckAgent = async () => {
+    if (!selectedBackend || checking) return
+    const reqId = ++checkSeqRef.current
+    setChecking(true)
+    setCheckResult(null)
+    setCheckError(null)
+    try {
+      const res = await fetch('/api/config/check-agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          backend: selectedBackend,
+          model: selectedModel.trim() || null,
+          reasoning: reasoningOptions.supported ? (selectedReasoning.trim() || null) : null,
+        }),
+      })
+      if (checkSeqRef.current !== reqId) return
+      if (!res.ok) {
+        const text = await res.text()
+        if (checkSeqRef.current !== reqId) return
+        let detail = ''
+        try {
+          const parsed = JSON.parse(text) as { detail?: unknown }
+          if (typeof parsed.detail === 'string') detail = parsed.detail
+        } catch {
+          detail = text
+        }
+        setCheckError({ tone: 'error', text: detail ? () => detail : (t) => t.settings.checkError })
+        return
+      }
+      const data = (await res.json()) as CheckAgentResponse
+      if (checkSeqRef.current !== reqId) return
+      setCheckResult(data)
+    } catch (err) {
+      if (checkSeqRef.current !== reqId) return
+      setCheckError({ tone: 'error', text: errorMessage(err, (t) => t.settings.checkError) })
+    } finally {
+      if (checkSeqRef.current === reqId) setChecking(false)
     }
   }
 
@@ -171,6 +312,25 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
         <code>.amc.yaml</code>
         {t.settings.ledeAfterFile}
       </p>
+      {effective && (
+        <div className="effective-strip" aria-label={t.settings.effectiveLabel}>
+          <span className="meta-key">{t.settings.effectiveLabel}</span>
+          <span className="effective-item">
+            <span className="mono">{effective.backend}</span>
+            <span className="source-badge">{labelFor(t.settings.sourceLayer, effective.sources.agent || 'default')}</span>
+          </span>
+          <span aria-hidden="true">·</span>
+          <span className="effective-item">
+            <span className="mono">{effective.model || t.settings.agentDefault}</span>
+            <span className="source-badge">{labelFor(t.settings.sourceLayer, effective.sources.model || 'default')}</span>
+          </span>
+          <span aria-hidden="true">·</span>
+          <span className="effective-item">
+            <span className="mono">{effective.reasoning || t.settings.modelDefault}</span>
+            <span className="source-badge">{labelFor(t.settings.sourceLayer, effective.sources.reasoning || 'default')}</span>
+          </span>
+        </div>
+      )}
     </div>
   )
 
@@ -245,6 +405,24 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
           </div>
         )}
 
+        {checkError && (
+          <div className="banner is-error" role="alert">
+            <span>{checkError.text(t)}</span>
+            <button onClick={() => setCheckError(null)} aria-label={t.common.dismiss}>✕</button>
+          </div>
+        )}
+
+        {checkResult && (
+          <div className={`banner check-result ${checkResult.ok ? 'is-info' : 'is-error'}`} role="status">
+            <div className="check-result-body">
+              <strong>{checkResult.ok ? t.settings.checkPassed : t.settings.checkFailed}</strong>
+              <span>{checkResult.message}</span>
+              <code className="check-result-cmd">{checkResult.command.join(' ')}</code>
+            </div>
+            <button onClick={() => setCheckResult(null)} aria-label={t.common.dismiss}>✕</button>
+          </div>
+        )}
+
         <section aria-labelledby="backend-heading">
           <div className="section-label">
             <span id="backend-heading">{t.settings.agentHeading}</span>
@@ -299,7 +477,7 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
             </div>
 
             <div className="settings-card model-card">
-              <p className="model-hint">
+              <p className="model-hint card-note">
                 {modelSourceDescription(t, currentBackend.models_source, currentBackend.models.length)} {currentBackend.models_note}
                 {' '}{t.settings.notCallable}
               </p>
@@ -322,7 +500,7 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
                     label={t.settings.agentDefault}
                     hint={currentBackend.models.length ? t.settings.agentDefaultHint : t.settings.noModelList}
                     checked={selectedModel === ''}
-                    onSelect={setSelectedModel}
+                    onSelect={chooseModel}
                   />
                 )}
                 {customModel && (
@@ -331,7 +509,7 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
                     label={selectedModel}
                     hint={t.settings.customModelHint}
                     checked
-                    onSelect={setSelectedModel}
+                    onSelect={chooseModel}
                   />
                 )}
                 {modelGroups.map(([group, models]) => (
@@ -348,7 +526,7 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
                         value={model}
                         label={model}
                         checked={selectedModel === model}
-                        onSelect={setSelectedModel}
+                        onSelect={chooseModel}
                       />
                     ))}
                   </div>
@@ -361,6 +539,74 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
           </section>
         )}
 
+        {currentBackend && (
+          <section aria-labelledby="reasoning-heading">
+            <div className="section-label">
+              <span id="reasoning-heading">{t.settings.reasoningHeading}</span>
+            </div>
+            <div className="settings-card reasoning-card">
+              {reasoningOptions.supported ? (
+                <>
+                  <div className="reasoning-grid" role="radiogroup" aria-labelledby="reasoning-heading">
+                    <label
+                      className={`reasoning-chip ${selectedReasoning === '' ? 'selected' : ''}`}
+                      title={t.settings.modelDefaultHint}
+                    >
+                      <input
+                        type="radio"
+                        name="reasoning"
+                        value=""
+                        checked={selectedReasoning === ''}
+                        onChange={() => {
+                          checkSeqRef.current += 1
+                          setChecking(false)
+                          setSelectedReasoning('')
+                          setCheckResult(null)
+                          setCheckError(null)
+                        }}
+                      />
+                      <span>
+                        {reasoningOptions.defaultLevel
+                          ? t.settings.modelDefaultWithLevel(reasoningOptions.defaultLevel)
+                          : t.settings.modelDefault}
+                      </span>
+                    </label>
+                    {reasoningOptions.levels.map((level) => (
+                      <label
+                        key={level}
+                        className={`reasoning-chip ${selectedReasoning === level ? 'selected' : ''}`}
+                      >
+                        <input
+                          type="radio"
+                          name="reasoning"
+                          value={level}
+                          checked={selectedReasoning === level}
+                          onChange={() => {
+                            checkSeqRef.current += 1
+                            setChecking(false)
+                            setSelectedReasoning(level)
+                            setCheckResult(null)
+                            setCheckError(null)
+                          }}
+                        />
+                        <span className="mono">{level}</span>
+                      </label>
+                    ))}
+                  </div>
+                  <p className="model-hint">
+                    {reasoningSourceDescription(t, currentBackend.reasoning_source)}{' '}
+                    {currentBackend.reasoning_note || ''}
+                  </p>
+                </>
+              ) : (
+                <p className="model-hint">
+                  {currentBackend.reasoning_note || t.settings.reasoningUnavailable}
+                </p>
+              )}
+            </div>
+          </section>
+        )}
+
         <div className="settings-savebar">
           <div className="savebar-summary">
             <span className="meta-key">{dirty ? t.settings.willSave : t.settings.currentConfig}</span>
@@ -368,8 +614,21 @@ export function Settings({ onBack, t }: { onBack: () => void; t: Messages }) {
               {displayName(selectedBackend)}
               <span aria-hidden="true"> · </span>
               <span className="mono">{selectedModel || t.settings.agentDefault}</span>
+              {reasoningOptions.supported && (
+                <>
+                  <span aria-hidden="true"> · </span>
+                  <span className="mono">{selectedReasoning || t.settings.modelDefault}</span>
+                </>
+              )}
             </span>
           </div>
+          <button
+            className="btn btn-ghost"
+            onClick={handleCheckAgent}
+            disabled={checking || !currentBackend}
+          >
+            {checking ? t.settings.checkingAgent : t.settings.checkAgent}
+          </button>
           <button className="btn btn-ghost" onClick={onBack}>
             {t.common.back}
           </button>

@@ -12,7 +12,23 @@ import {
   type Language,
   type Localized,
   type Messages,
+  type ReviewLanguage,
 } from './i18n'
+import {
+  buildStartRoundPayload,
+  createRunDraft,
+  formatRoundSettingsLabel,
+  mergeEffectiveIntoDraft,
+  resolveReasoningOptions,
+  savedForAgent,
+  selectDraftModel,
+  switchDraftAgent,
+  type BackendCapability,
+  type EffectiveSettingsResponse,
+  type RunDraft,
+  type RunSettings,
+  type SavedConfig,
+} from './runSettings'
 
 type TaskStatus =
   | 'created'
@@ -52,6 +68,9 @@ type Task = {
   description: string
   repo_path: string
   backend: string
+  model?: string | null
+  reasoning?: string | null
+  language?: string | null
   source_type: ReviewSource
   status: TaskStatus
   current_stage: string
@@ -84,6 +103,10 @@ type ArtifactRecord = {
 type ReviewRound = {
   id: string
   backend: string
+  model?: string | null
+  reasoning?: string | null
+  language?: string
+  settings?: RunSettings | null
   round_index: number
   review_note: string
   review_revision?: string | null
@@ -147,7 +170,7 @@ const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     } catch {
       // Keep a non-JSON response as-is.
     }
-    throw new Error(message || `Request failed: ${response.status}`)
+    throw new Error(message)
   }
   return response.json() as Promise<T>
 }
@@ -332,6 +355,14 @@ export function App() {
   const [prUrl, setPrUrl] = useState('')
   const [baseBranch, setBaseBranch] = useState('')
   const [reviewFocus, setReviewFocus] = useState('')
+  const [newAgent, setNewAgent] = useState('')
+  const [newModel, setNewModel] = useState('')
+  const [newReasoning, setNewReasoning] = useState('')
+  const [newLanguage, setNewLanguage] = useState<ReviewLanguage>(DEFAULT_REVIEW_LANGUAGE)
+  const [backends, setBackends] = useState<BackendCapability[]>([])
+  const [savedConfig, setSavedConfig] = useState<SavedConfig | null>(null)
+  const [taskEffective, setTaskEffective] = useState<{ taskId: string; data: EffectiveSettingsResponse } | null>(null)
+  const [runDraft, setRunDraft] = useState<RunDraft>(() => createRunDraft(null, undefined, null))
   const [isCreating, setIsCreating] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
   const [detailTab, setDetailTab] = useState<DetailTab>('results')
@@ -379,23 +410,31 @@ export function App() {
     storeLanguage(next)
   }
 
+  const selectedTaskIdRef = useRef<string | null>(null)
+  selectedTaskIdRef.current = selectedTaskId
+  const loadSeqByTaskRef = useRef<Map<string, number>>(new Map())
+  const effectiveSeqRef = useRef(0)
+  const configSeqRef = useRef(0)
+  const wasModalOpenRef = useRef(false)
+  const activeDetail = detail && detail.task.id === selectedTaskId ? detail : null
+
   const selectedTask = useMemo(
-    () => tasks.find((task) => task.id === selectedTaskId) ?? detail?.task ?? null,
-    [detail?.task, selectedTaskId, tasks],
+    () => tasks.find((task) => task.id === selectedTaskId) ?? activeDetail?.task ?? null,
+    [activeDetail?.task, selectedTaskId, tasks],
   )
 
   const visibleEvents = useMemo(() => {
-    if (!detail) return []
-    const source = showAllEvents ? detail.events : detail.importantEvents
+    if (!activeDetail) return []
+    const source = showAllEvents ? activeDetail.events : activeDetail.importantEvents
     return showAllEvents ? source : source.slice(-EVENT_LIMIT)
-  }, [detail, showAllEvents])
+  }, [activeDetail, showAllEvents])
 
   const orderedRounds = useMemo(
-    () => (detail ? [...detail.reviewRounds].sort((a, b) => a.round_index - b.round_index) : []),
-    [detail],
+    () => (activeDetail ? [...activeDetail.reviewRounds].sort((a, b) => a.round_index - b.round_index) : []),
+    [activeDetail],
   )
   const latestRound = orderedRounds.length ? orderedRounds[orderedRounds.length - 1] : undefined
-  const latestResult = detail?.latestReviewResult ?? selectedTask?.latest_review_result ?? null
+  const latestResult = activeDetail?.latestReviewResult ?? selectedTask?.latest_review_result ?? null
 
   // `refreshTasks` runs on a 4s timer. It must never clear a notice raised by a
   // user action, otherwise failed actions silently look like no-ops.
@@ -411,21 +450,103 @@ export function App() {
   }, [])
 
   const loadTask = useCallback(async (taskId: string, options?: { silent?: boolean }) => {
+    if (selectedTaskIdRef.current !== taskId) return
+    const nextSeq = (loadSeqByTaskRef.current.get(taskId) ?? 0) + 1
+    loadSeqByTaskRef.current.set(taskId, nextSeq)
     try {
       const data = normalizeTaskDetail(await api<TaskDetailResponse>(`/api/tasks/${taskId}`))
+      if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
       setDetail(data)
     } catch (err) {
+      if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
       if (!options?.silent) {
         setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.loadReview) })
       }
     }
   }, [])
 
+  const loadConfigMeta = useCallback(async () => {
+    const seq = ++configSeqRef.current
+    try {
+      const [detectRes, currentRes] = await Promise.all([
+        fetch('/api/config/detect'),
+        fetch('/api/config/current'),
+      ])
+      if (configSeqRef.current !== seq) return
+      if (detectRes.ok) {
+        const d = (await detectRes.json()) as { backends: BackendCapability[] }
+        if (configSeqRef.current === seq) setBackends(d.backends || [])
+      }
+      if (currentRes.ok) {
+        const c = (await currentRes.json()) as { config: SavedConfig }
+        if (configSeqRef.current === seq) setSavedConfig(c.config)
+      }
+    } catch {
+      // Non-blocking: UI still works with fallback defaults.
+    }
+  }, [])
+
   useEffect(() => {
     void refreshTasks()
+    void loadConfigMeta()
     const timer = window.setInterval(() => void refreshTasks({ silent: true }), 4000)
     return () => window.clearInterval(timer)
-  }, [refreshTasks])
+  }, [refreshTasks, loadConfigMeta])
+
+  useEffect(() => {
+    if (!showSettings) {
+      void loadConfigMeta()
+    }
+  }, [showSettings, loadConfigMeta])
+
+  useEffect(() => {
+    const justOpened = showModal && !wasModalOpenRef.current
+    wasModalOpenRef.current = showModal
+    if (!justOpened) return
+    // Start in Auto mode (omitted backend/model/reasoning) so the repository's
+    // .amc.yaml and global config resolve normally unless the user explicitly
+    // overrides the agent for this review.
+    setNewAgent('')
+    setNewModel('')
+    setNewReasoning('')
+    setNewLanguage(DEFAULT_REVIEW_LANGUAGE)
+  }, [showModal])
+
+  useEffect(() => {
+    if (!selectedTask) {
+      setTaskEffective(null)
+      return
+    }
+    const targetId = selectedTask.id
+    const reqSeq = ++effectiveSeqRef.current
+    const params = new URLSearchParams()
+    if (selectedTask.repo_path) params.set('repo_path', selectedTask.repo_path)
+    if (selectedTask.backend) params.set('backend', selectedTask.backend)
+    fetch(`/api/config/effective?${params.toString()}`)
+      .then(async (res) => {
+        if (!res.ok) return
+        const data = (await res.json()) as EffectiveSettingsResponse
+        if (selectedTaskIdRef.current !== targetId || effectiveSeqRef.current !== reqSeq) return
+        setTaskEffective({ taskId: targetId, data })
+      })
+      .catch(() => {
+        // Non-blocking: falls back to savedConfig defaults.
+      })
+  }, [selectedTask?.id, selectedTask?.repo_path, selectedTask?.backend, savedConfig])
+
+  const activeTaskEffective =
+    selectedTask && taskEffective?.taskId === selectedTask.id ? taskEffective.data : null
+
+  useEffect(() => {
+    setRunDraft(createRunDraft(selectedTask, latestRound, savedConfig, activeTaskEffective))
+  }, [selectedTask?.id, latestRound?.id])
+
+  useEffect(() => {
+    if (!selectedTask) return
+    setRunDraft((prev) =>
+      mergeEffectiveIntoDraft(prev, selectedTask, latestRound, savedConfig, activeTaskEffective, backends),
+    )
+  }, [activeTaskEffective, savedConfig, backends, selectedTask?.id, latestRound?.id])
 
   useEffect(() => {
     if (!selectedTaskId) return
@@ -468,15 +589,27 @@ export function App() {
     if (isCreating) return
     setIsCreating(true)
     try {
+      const chosenAgent = newAgent.trim()
+      const newCap = backends.find((b) => b.name === chosenAgent)
+      const newOpts = resolveReasoningOptions(newCap, newModel)
+      const body: Record<string, string | null> = {
+        repo_path: repoPath.trim(),
+        source_type: reviewSource,
+        pr_url: reviewSource === 'pull_request' ? prUrl.trim() : null,
+        base: reviewSource === 'local_diff' ? baseBranch.trim() || null : null,
+        review_focus: reviewFocus.trim(),
+        language: newLanguage,
+      }
+      // Only send backend/model/reasoning when the user explicitly picked an
+      // agent; otherwise omit them so repo .amc.yaml & global config apply.
+      if (chosenAgent) {
+        body.backend = chosenAgent
+        if (newModel.trim()) body.model = newModel.trim()
+        if (newOpts.supported && newReasoning.trim()) body.reasoning = newReasoning.trim()
+      }
       const task = await api<Task>('/api/tasks', {
         method: 'POST',
-        body: JSON.stringify({
-          repo_path: repoPath.trim(),
-          source_type: reviewSource,
-          pr_url: reviewSource === 'pull_request' ? prUrl.trim() : null,
-          base: reviewSource === 'local_diff' ? baseBranch.trim() || null : null,
-          review_focus: reviewFocus.trim(),
-        }),
+        body: JSON.stringify(body),
       })
       setRepoPath(repoPath.trim())
       setPrUrl('')
@@ -496,15 +629,16 @@ export function App() {
   const startReviewRound = async (taskId: string) => {
     const tracker = startTrackerRef.current
     const request = tracker.begin(taskId)
+    const payload = buildStartRoundPayload(runDraft)
     setStartingTaskIds(tracker.pendingTaskIds())
     try {
-      // The review output language is its own setting, not the interface
-      // language. The current backend ignores the field (pydantic drops
-      // unknown keys) and keeps its own default until it reads it.
       await api(`/api/tasks/${taskId}/start`, {
         method: 'POST',
-        body: JSON.stringify({ language: DEFAULT_REVIEW_LANGUAGE }),
+        body: JSON.stringify(payload),
       })
+      if (selectedTaskIdRef.current === taskId) {
+        setRunDraft((prev) => ({ ...prev, note: '' }))
+      }
       setNotice(null)
       await loadTask(taskId)
       await refreshTasks()
@@ -556,14 +690,24 @@ export function App() {
 
   const tabCounts: Record<DetailTab, number> = {
     results: latestResult?.finding_count ?? 0,
-    timeline: detail?.eventStats.important_count ?? 0,
+    timeline: activeDetail?.eventStats.important_count ?? 0,
     rounds: orderedRounds.length,
-    artifacts: detail?.artifacts.length ?? 0,
+    artifacts: activeDetail?.artifacts.length ?? 0,
   }
 
   const roundActive = isRoundActive(selectedTask?.status)
   const isStarting = selectedTask !== null && startingTaskIds.includes(selectedTask.id)
   const startLabel = latestRound ? t.detail.runNextRound : t.detail.runFirstRound
+  const runAgentCap = backends.find((b) => b.name === runDraft.agent)
+  const runReasoningOptions = resolveReasoningOptions(runAgentCap, runDraft.model)
+  const newAgentCap = backends.find((b) => b.name === newAgent)
+  const newReasoningOptions = resolveReasoningOptions(newAgentCap, newModel)
+  const roundLabels = { cliDefault: t.settings.agentDefault, modelDefault: t.settings.modelDefault }
+  const agentOptions = useMemo(() => {
+    const names = backends.map((b) => b.name)
+    if (runDraft.agent && !names.includes(runDraft.agent)) names.unshift(runDraft.agent)
+    return names
+  }, [backends, runDraft.agent])
 
   return (
     <div className="layout">
@@ -625,7 +769,14 @@ export function App() {
 
       {showSettings ? (
         <div className="body settings-body">
-          <Settings t={t} onBack={() => setShowSettings(false)} />
+          <Settings
+            t={t}
+            onSaved={(next) => {
+              configSeqRef.current += 1
+              setSavedConfig(next)
+            }}
+            onBack={() => setShowSettings(false)}
+          />
         </div>
       ) : (
       <div className="body">
@@ -682,7 +833,7 @@ export function App() {
               </div>
             )}
 
-            {selectedTask && detail && (
+            {selectedTask && activeDetail && (
               <>
                 <section className="detail-head">
                   <div className="detail-eyebrow">
@@ -729,6 +880,106 @@ export function App() {
                     </button>
                   </div>
 
+                  <div className="round-config-card" aria-label={t.detail.roundSettings}>
+                    <div className="round-config-grid">
+                      <label className="field field-compact">
+                        <span className="field-label">{t.detail.roundAgent}</span>
+                        <select
+                          value={runDraft.agent}
+                          disabled={roundActive || isStarting}
+                          onChange={(e) => setRunDraft((prev) => switchDraftAgent(prev, e.target.value, backends, savedConfig))}
+                        >
+                          {agentOptions.map((name) => (
+                            <option key={name} value={name}>{name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="field field-compact">
+                        <span className="field-label">{t.detail.roundModel}</span>
+                        {runAgentCap && runAgentCap.models.length > 0 ? (
+                          <select
+                            value={runDraft.model}
+                            disabled={roundActive || isStarting}
+                            onChange={(e) => {
+                              const nextModel = e.target.value
+                              setRunDraft((prev) => selectDraftModel(prev, nextModel, runAgentCap))
+                            }}
+                          >
+                            <option value="">{t.settings.agentDefault}</option>
+                            {runDraft.model && !runAgentCap.models.includes(runDraft.model) && (
+                              <option value={runDraft.model}>{runDraft.model}</option>
+                            )}
+                            {runAgentCap.models.map((m) => (
+                              <option key={m} value={m}>{m}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            value={runDraft.model}
+                            disabled={roundActive || isStarting}
+                            placeholder={t.settings.agentDefault}
+                            onChange={(e) => {
+                              const nextModel = e.target.value
+                              setRunDraft((prev) => selectDraftModel(prev, nextModel, runAgentCap))
+                            }}
+                          />
+                        )}
+                      </label>
+                      {runReasoningOptions.supported && (
+                        <label className="field field-compact">
+                          <span className="field-label">{t.detail.roundReasoning}</span>
+                          <select
+                            value={runDraft.reasoning}
+                            disabled={roundActive || isStarting}
+                            onChange={(e) => setRunDraft((prev) => ({
+                              ...prev,
+                              reasoning: e.target.value,
+                              explicit: { ...prev.explicit, reasoning: true },
+                              userEdited: { ...prev.userEdited, reasoning: true },
+                            }))}
+                          >
+                            <option value="">
+                              {runReasoningOptions.defaultLevel
+                                ? t.settings.modelDefaultWithLevel(runReasoningOptions.defaultLevel)
+                                : t.settings.modelDefault}
+                            </option>
+                            {runDraft.reasoning && !runReasoningOptions.levels.includes(runDraft.reasoning) && (
+                              <option value={runDraft.reasoning}>{runDraft.reasoning}</option>
+                            )}
+                            {runReasoningOptions.levels.map((lvl) => (
+                              <option key={lvl} value={lvl}>{lvl}</option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                      <label className="field field-compact">
+                        <span className="field-label">{t.detail.roundLanguage}</span>
+                        <select
+                          value={runDraft.language}
+                          disabled={roundActive || isStarting}
+                          onChange={(e) => setRunDraft((prev) => ({
+                            ...prev,
+                            language: (e.target.value === 'zh' ? 'zh' : 'en'),
+                            explicit: { ...prev.explicit, language: true },
+                            userEdited: { ...prev.userEdited, language: true },
+                          }))}
+                        >
+                          <option value="en">{t.detail.reviewLangEn}</option>
+                          <option value="zh">{t.detail.reviewLangZh}</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label className="field field-compact round-note-field">
+                      <span className="field-label">{t.detail.roundNote}</span>
+                      <input
+                        value={runDraft.note}
+                        disabled={roundActive || isStarting}
+                        placeholder={t.detail.roundNotePlaceholder}
+                        onChange={(e) => setRunDraft((prev) => ({ ...prev, note: e.target.value }))}
+                      />
+                    </label>
+                  </div>
+
                   <div className="meta-row">
                     <span className="meta-item">
                       <span className="meta-key">{t.detail.repository}</span>
@@ -736,7 +987,19 @@ export function App() {
                     </span>
                     <span className="meta-item">
                       <span className="meta-key">{t.detail.agent}</span>
-                      <span className="meta-val">{selectedTask.backend}</span>
+                      <span className="meta-val mono">
+                        {latestRound
+                          ? formatRoundSettingsLabel(latestRound, backends, roundLabels)
+                          : formatRoundSettingsLabel(
+                              {
+                                backend: selectedTask.backend,
+                                model: selectedTask.model,
+                                reasoning: selectedTask.reasoning,
+                              },
+                              backends,
+                              roundLabels,
+                            )}
+                      </span>
                     </span>
                     <span className="meta-item">
                       <span className="meta-key">{t.detail.rounds}</span>
@@ -850,12 +1113,12 @@ export function App() {
                     <div className="timeline-bar">
                       <span>
                         {showAllEvents
-                          ? t.timeline.allEvents(detail.eventStats.all_count)
-                          : t.timeline.importantEvents(detail.eventStats.important_count)}
+                          ? t.timeline.allEvents(activeDetail.eventStats.all_count)
+                          : t.timeline.importantEvents(activeDetail.eventStats.important_count)}
                       </span>
-                      {detail.eventStats.hidden_count > 0 && (
+                      {activeDetail.eventStats.hidden_count > 0 && (
                         <button className="btn btn-ghost" onClick={() => setShowAllEvents((v) => !v)}>
-                          {showAllEvents ? t.timeline.importantOnly : t.timeline.showAll(detail.eventStats.all_count)}
+                          {showAllEvents ? t.timeline.importantOnly : t.timeline.showAll(activeDetail.eventStats.all_count)}
                         </button>
                       )}
                     </div>
@@ -877,6 +1140,9 @@ export function App() {
                           <article className="round" key={round.id}>
                             <div className="round-top">
                               <span className="round-n">{t.rounds.title(round.round_index)}</span>
+                              <span className="pill mono round-settings-pill">
+                                {formatRoundSettingsLabel(round, backends, roundLabels)}
+                              </span>
                               <span className={`pill tone-${verdictTone(round.review_result?.verdict)}`}>
                                 {verdictLabel(t, round.review_result?.verdict)}
                               </span>
@@ -893,7 +1159,23 @@ export function App() {
                             <div className="kv-grid">
                               <div className="kv">
                                 <span className="kv-k">{t.rounds.agent}</span>
-                                <span className="kv-v">{round.backend}</span>
+                                <span className="kv-v mono">{round.settings?.agent || round.backend}</span>
+                              </div>
+                              <div className="kv">
+                                <span className="kv-k">{t.rounds.model}</span>
+                                <span className="kv-v mono">
+                                  {(round.settings?.model ?? round.model) || t.settings.agentDefault}
+                                </span>
+                              </div>
+                              <div className="kv">
+                                <span className="kv-k">{t.rounds.reasoning}</span>
+                                <span className="kv-v mono">
+                                  {(round.settings?.reasoning ?? round.reasoning) || t.settings.modelDefault}
+                                </span>
+                              </div>
+                              <div className="kv">
+                                <span className="kv-k">{t.rounds.language}</span>
+                                <span className="kv-v mono">{round.settings?.language || round.language || DEFAULT_REVIEW_LANGUAGE}</span>
                               </div>
                               <div className="kv">
                                 <span className="kv-k">{t.rounds.status}</span>
@@ -927,9 +1209,9 @@ export function App() {
 
                 {detailTab === 'artifacts' && (
                   <>
-                    {detail.artifacts.length ? (
+                    {activeDetail.artifacts.length ? (
                       <div className="artifacts">
-                        {detail.artifacts.map((artifact) => (
+                        {activeDetail.artifacts.map((artifact) => (
                           <div className="artifact" key={artifact.path}>
                             <span className="artifact-name">{artifact.relative_path}</span>
                             <span className="artifact-path" title={artifact.path}>{artifact.path}</span>
@@ -984,7 +1266,7 @@ export function App() {
               <input
                 value={repoPath}
                 onChange={(event) => setRepoPath(event.target.value)}
-                placeholder="C:\\path\\to\\repo"
+                placeholder="/path/to/repo"
                 autoFocus
               />
             </label>
@@ -1007,6 +1289,96 @@ export function App() {
                 />
               </label>
             )}
+            <div className="modal-grid">
+              {backends.length > 0 && (
+                <label className="field">
+                  <span className="field-label">{t.newReview.agent}</span>
+                  <select
+                    value={newAgent}
+                    onChange={(event) => {
+                      const nextAgent = event.target.value
+                      if (!nextAgent) {
+                        setNewAgent('')
+                        setNewModel('')
+                        setNewReasoning('')
+                        return
+                      }
+                      const saved = savedForAgent(savedConfig, nextAgent)
+                      const cap = backends.find((b) => b.name === nextAgent)
+                      const opts = resolveReasoningOptions(cap, saved.model)
+                      setNewAgent(nextAgent)
+                      setNewModel(saved.model)
+                      setNewReasoning(opts.supported ? saved.reasoning : '')
+                    }}
+                  >
+                    <option value="">{t.newReview.agentAuto}</option>
+                    {backends.map((b) => (
+                      <option key={b.name} value={b.name}>{b.name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {newAgentCap && (
+                <label className="field">
+                  <span className="field-label">{t.newReview.model}</span>
+                  {newAgentCap.models.length > 0 ? (
+                    <select
+                      value={newModel}
+                      onChange={(event) => {
+                        const nextModel = event.target.value
+                        const opts = resolveReasoningOptions(newAgentCap, nextModel)
+                        setNewModel(nextModel)
+                        if (newReasoning && (!opts.supported || !opts.levels.includes(newReasoning))) {
+                          setNewReasoning('')
+                        }
+                      }}
+                    >
+                      <option value="">{t.settings.agentDefault}</option>
+                      {newModel && !newAgentCap.models.includes(newModel) && (
+                        <option value={newModel}>{newModel}</option>
+                      )}
+                      {newAgentCap.models.map((m) => (
+                        <option key={m} value={m}>{m}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      value={newModel}
+                      placeholder={t.settings.agentDefault}
+                      onChange={(event) => setNewModel(event.target.value)}
+                    />
+                  )}
+                </label>
+              )}
+              {newReasoningOptions.supported && (
+                <label className="field">
+                  <span className="field-label">{t.newReview.reasoning}</span>
+                  <select
+                    value={newReasoning}
+                    onChange={(event) => setNewReasoning(event.target.value)}
+                  >
+                    <option value="">
+                      {newReasoningOptions.defaultLevel
+                        ? t.settings.modelDefaultWithLevel(newReasoningOptions.defaultLevel)
+                        : t.settings.modelDefault}
+                    </option>
+                    {newReasoningOptions.levels.map((lvl) => (
+                      <option key={lvl} value={lvl}>{lvl}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <label className="field">
+                <span className="field-label">{t.newReview.language}</span>
+                <select
+                  value={newLanguage}
+                  onChange={(event) => setNewLanguage(event.target.value === 'zh' ? 'zh' : 'en')}
+                >
+                  <option value="en">{t.detail.reviewLangEn}</option>
+                  <option value="zh">{t.detail.reviewLangZh}</option>
+                </select>
+              </label>
+            </div>
             <label className="field">
               <span className="field-label">{t.newReview.focus}</span>
               <textarea

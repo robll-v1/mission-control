@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -28,6 +29,12 @@ class BackendInfo:
     SOURCE_CONFIG = 'config'          # model explicitly set in backend config
     SOURCE_UNKNOWN = 'unknown'        # no reliable enumeration available
 
+    REASONING_SOURCE_CACHE = 'cache'
+    REASONING_SOURCE_CLI_HELP = 'cli_help'
+    REASONING_SOURCE_CONFIG = 'config'
+    REASONING_SOURCE_UNSUPPORTED = 'unsupported'
+    REASONING_SOURCE_UNKNOWN = 'unknown'
+
     def __init__(
         self,
         name: str,
@@ -37,6 +44,12 @@ class BackendInfo:
         models_source: str = SOURCE_UNKNOWN,
         models_note: str | None = None,
         models_call_verified: bool = False,
+        reasoning_supported: bool = False,
+        reasoning_levels: list[str] | None = None,
+        reasoning_default: str | None = None,
+        reasoning_source: str = REASONING_SOURCE_UNSUPPORTED,
+        reasoning_note: str | None = None,
+        model_reasoning: dict[str, dict[str, Any]] | None = None,
     ):
         self.name = name
         self.command = command
@@ -45,6 +58,12 @@ class BackendInfo:
         self.models_source = models_source
         self.models_note = models_note
         self.models_call_verified = models_call_verified
+        self.reasoning_supported = reasoning_supported
+        self.reasoning_levels = list(reasoning_levels or [])
+        self.reasoning_default = reasoning_default
+        self.reasoning_source = reasoning_source
+        self.reasoning_note = reasoning_note
+        self.model_reasoning = dict(model_reasoning or {})
 
     def __repr__(self) -> str:
         return (
@@ -208,11 +227,16 @@ class BackendDetector:
     @staticmethod
     def _run_command(cmd: list[str], timeout: int = 5) -> tuple[bool, str]:
         """Run a command and return (success, output)."""
+        from app.adapters.base import resolve_executable
+
+        resolved_cmd = [resolve_executable(cmd[0]), *cmd[1:]] if cmd else cmd
         try:
             result = subprocess.run(
-                cmd,
+                resolved_cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=timeout,
             )
             return result.returncode == 0, result.stdout.strip()
@@ -235,6 +259,9 @@ class BackendDetector:
         # current configuration, not that this account may call each one.
         # No hardcoded fallback — if we cannot enumerate, we say so instead
         # of inventing model names.
+        opencode_reasoning_note = (
+            'OpenCode does not expose reasoning effort levels; legacy model#variant syntax in config remains supported.'
+        )
         models, note = BackendDetector._probe_opencode_models_cli()
         if models:
             return BackendInfo(
@@ -244,6 +271,9 @@ class BackendDetector:
                     'IDs enumerated by `opencode models`; per-model call '
                     'availability for this account is not verified.'
                 ),
+                reasoning_supported=False,
+                reasoning_source=BackendInfo.REASONING_SOURCE_CONFIG,
+                reasoning_note=opencode_reasoning_note,
             )
 
         # Secondary: the models-dev catalog cache in opencode.db. This lists
@@ -259,6 +289,9 @@ class BackendDetector:
                     'List from the local models-dev catalog cache; account '
                     'permissions and per-model call availability are not verified.'
                 ),
+                reasoning_supported=False,
+                reasoning_source=BackendInfo.REASONING_SOURCE_CONFIG,
+                reasoning_note=opencode_reasoning_note,
             )
 
         return BackendInfo(
@@ -270,6 +303,9 @@ class BackendDetector:
                 f' ({catalog_note or "not found"}).'
                 ' The backend still runs with its own default or configured model.'
             ),
+            reasoning_supported=False,
+            reasoning_source=BackendInfo.REASONING_SOURCE_CONFIG,
+            reasoning_note=opencode_reasoning_note,
         )
 
     @staticmethod
@@ -358,6 +394,35 @@ class BackendDetector:
             return [], 'catalog cache is corrupt or unreadable'
 
     @staticmethod
+    def _parse_claude_effort_levels(help_output: str) -> tuple[bool, list[str]]:
+        """Parse `--effort <level>` options from `claude --help` output."""
+        if not help_output or '--effort' not in help_output:
+            return False, []
+        lines = help_output.splitlines()
+        block_lines: list[str] = []
+        capturing = False
+        for line in lines:
+            if '--effort' in line:
+                capturing = True
+                block_lines.append(line)
+                continue
+            if capturing:
+                if line.lstrip().startswith('-'):
+                    break
+                block_lines.append(line)
+                if len(block_lines) >= 4:
+                    break
+        block = ' '.join(part.strip() for part in block_lines)
+        match = re.search(r'\(([a-zA-Z0-9_.,\s-]+)\)', block)
+        levels: list[str] = []
+        if match:
+            for item in match.group(1).split(','):
+                cleaned = item.strip()
+                if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,31}', cleaned) and cleaned not in levels:
+                    levels.append(cleaned)
+        return True, levels
+
+    @staticmethod
     def _detect_claude_code() -> BackendInfo | None:
         """Detect Claude Code installation."""
         success, output = BackendDetector._run_command(['claude', '--version'])
@@ -365,6 +430,28 @@ class BackendDetector:
             return None
 
         version = output.split('\n')[0] if output else 'unknown'
+
+        help_ok, help_output = BackendDetector._run_command(['claude', '--help'], timeout=5)
+        has_effort, effort_levels = (
+            BackendDetector._parse_claude_effort_levels(help_output) if help_ok else (False, [])
+        )
+        if has_effort and effort_levels:
+            reasoning_supported = True
+            reasoning_source = BackendInfo.REASONING_SOURCE_CLI_HELP
+            reasoning_note = (
+                'Parsed from `claude --help` (--effort); effective support depends on the selected Claude model.'
+            )
+        elif has_effort:
+            reasoning_supported = False
+            reasoning_source = BackendInfo.REASONING_SOURCE_UNKNOWN
+            reasoning_note = (
+                '`claude --help` exposes --effort but did not list allowed levels; '
+                'CLI default will be used unless configured explicitly.'
+            )
+        else:
+            reasoning_supported = False
+            reasoning_source = BackendInfo.REASONING_SOURCE_UNSUPPORTED
+            reasoning_note = 'This Claude Code CLI version did not advertise --effort in `--help`.'
 
         # `claude` has no command to enumerate models (only --model), so we
         # report none instead of inventing names. The backend still runs with
@@ -376,6 +463,11 @@ class BackendDetector:
                 'Claude Code exposes no model-listing command; it uses its own '
                 'default or the model set via `claude config` / --model.'
             ),
+            reasoning_supported=reasoning_supported,
+            reasoning_levels=effort_levels,
+            reasoning_default=None,
+            reasoning_source=reasoning_source,
+            reasoning_note=reasoning_note,
         )
 
     @staticmethod
@@ -400,6 +492,11 @@ class BackendDetector:
             'copilot', 'gh', version, [],
             models_source=BackendInfo.SOURCE_UNKNOWN,
             models_note='Copilot CLI does not expose model selection; the service chooses the model.',
+            reasoning_supported=False,
+            reasoning_levels=[],
+            reasoning_default=None,
+            reasoning_source=BackendInfo.REASONING_SOURCE_UNSUPPORTED,
+            reasoning_note='Copilot CLI does not expose a reasoning effort option.',
         )
 
     @staticmethod
@@ -414,7 +511,133 @@ class BackendDetector:
         # `codex` has no model-listing command either; its own cache/config
         # files are the only real sources. No hardcoded fallback.
         models, source, note = BackendDetector._probe_codex_models()
-        return BackendInfo('codex', 'codex', version, models, models_source=source, models_note=note)
+        r_supported, r_levels, r_default, r_source, r_note, model_reasoning = (
+            BackendDetector._probe_codex_reasoning()
+        )
+        return BackendInfo(
+            'codex', 'codex', version, models,
+            models_source=source,
+            models_note=note,
+            reasoning_supported=r_supported,
+            reasoning_levels=r_levels,
+            reasoning_default=r_default,
+            reasoning_source=r_source,
+            reasoning_note=r_note,
+            model_reasoning=model_reasoning,
+        )
+
+    @staticmethod
+    def detect_backend(name: str) -> BackendInfo | None:
+        """Detect a single backend by name without probing unrelated CLIs."""
+        mapping = {
+            'opencode': ('opencode', BackendDetector._detect_opencode),
+            'claude-code': ('claude', BackendDetector._detect_claude_code),
+            'copilot': ('gh', BackendDetector._detect_copilot),
+            'codex': ('codex', BackendDetector._detect_codex),
+        }
+        spec = mapping.get(name)
+        if spec is None:
+            return None
+        cmd, fn = spec
+        if not shutil.which(cmd):
+            return None
+        return BackendDetector._detect_safely(name, cmd, fn)
+
+    @staticmethod
+    def _codex_home() -> Path:
+        raw = os.environ.get('CODEX_HOME', '').strip()
+        if raw:
+            return Path(raw).expanduser()
+        return Path.home() / '.codex'
+
+    @staticmethod
+    def _probe_codex_reasoning() -> tuple[
+        bool, list[str], str | None, str, str | None, dict[str, dict[str, Any]]
+    ]:
+        """Read per-model reasoning levels from $CODEX_HOME/models_cache.json."""
+        canonical_order = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+        cache_path = BackendDetector._codex_home() / 'models_cache.json'
+        if not cache_path.exists():
+            return (
+                False,
+                [],
+                None,
+                BackendInfo.REASONING_SOURCE_UNKNOWN,
+                'Codex model cache (~/.codex/models_cache.json) not found; '
+                'reasoning levels are hidden and the CLI default will be used.',
+                {},
+            )
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return (
+                False,
+                [],
+                None,
+                BackendInfo.REASONING_SOURCE_UNKNOWN,
+                'Codex model cache (~/.codex/models_cache.json) is unreadable; '
+                'reasoning levels are hidden and the CLI default will be used.',
+                {},
+            )
+
+        model_reasoning: dict[str, dict[str, Any]] = {}
+        union_levels: list[str] = []
+        if isinstance(data, dict) and isinstance(data.get('models'), list):
+            for model in data['models']:
+                if not isinstance(model, dict):
+                    continue
+                slug = model.get('slug')
+                if not isinstance(slug, str) or not slug.strip():
+                    continue
+                visibility = model.get('visibility', 'list')
+                if not isinstance(visibility, str) or visibility not in ('list', 'default'):
+                    continue
+                raw_levels = model.get('supported_reasoning_levels')
+                levels: list[str] = []
+                if isinstance(raw_levels, list):
+                    for item in raw_levels:
+                        effort = item.get('effort') if isinstance(item, dict) else item
+                        if isinstance(effort, str):
+                            cleaned = effort.strip()
+                            if cleaned and cleaned not in levels:
+                                levels.append(cleaned)
+                raw_default = model.get('default_reasoning_level')
+                default_level = (
+                    raw_default.strip()
+                    if isinstance(raw_default, str) and raw_default.strip()
+                    else None
+                )
+                if levels:
+                    model_reasoning[slug] = {'levels': levels, 'default': default_level}
+                    for lvl in levels:
+                        if lvl not in union_levels:
+                            union_levels.append(lvl)
+
+        if not union_levels:
+            return (
+                False,
+                [],
+                None,
+                BackendInfo.REASONING_SOURCE_UNKNOWN,
+                'Codex model cache did not include supported_reasoning_levels; '
+                'reasoning levels are hidden and the CLI default will be used.',
+                {},
+            )
+
+        ordered_levels = [lvl for lvl in canonical_order if lvl in union_levels] + [
+            lvl for lvl in union_levels if lvl not in canonical_order
+        ]
+        # Backend-level default is None because Codex defaults vary per model
+        # (callers should read model_reasoning[slug]['default']).
+        return (
+            True,
+            ordered_levels,
+            None,
+            BackendInfo.REASONING_SOURCE_CACHE,
+            "Read from Codex's local models_cache.json (passed via `-c model_reasoning_effort=<level>`).",
+            model_reasoning,
+        )
 
     @staticmethod
     def _probe_codex_models() -> tuple[list[str], str, str | None]:
@@ -422,10 +645,11 @@ class BackendDetector:
         # First try models_cache.json (written by Codex itself). A well-formed
         # file can still carry the wrong structure (models: null, slug: null),
         # so validate shapes instead of trusting the JSON to be typed.
-        cache_path = Path.home() / '.codex' / 'models_cache.json'
+        codex_home = BackendDetector._codex_home()
+        cache_path = codex_home / 'models_cache.json'
         if cache_path.exists():
             try:
-                with open(cache_path, 'r') as f:
+                with open(cache_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 models = []
                 if isinstance(data, dict) and isinstance(data.get('models'), list):
@@ -451,7 +675,7 @@ class BackendDetector:
         # real TOML — line-prefix matching misread model_provider="my-proxy"
         # and model_reasoning_effort as model names and swallowed inline
         # comments. Only the top-level `model` key counts.
-        config_path = Path.home() / '.codex' / 'config.toml'
+        config_path = codex_home / 'config.toml'
         if config_path.exists():
             try:
                 import tomllib
