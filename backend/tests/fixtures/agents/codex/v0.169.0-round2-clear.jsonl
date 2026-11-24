@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000002"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"## Review Summary\n\nThe change correctly escapes backslashes and SQLite `LIKE` wildcard characters before binding the search term. Searches containing `%` or `_` now treat those characters literally, as the updated comment describes.\n\nNo material correctness or regression issues found.\n\n```json\n{\n  \"verdict\": \"clear\",\n  \"summary\": \"The change escapes LIKE wildcard characters and preserves parameterized queries. No material correctness or regression issues were found.\",\n  \"findings\": []\n}\n```"}}
+{"type":"turn.completed","usage":{"input_tokens":21879,"cached_input_tokens":7040,"cache_write_input_tokens":0,"output_tokens":129,"reasoning_output_tokens":27}}

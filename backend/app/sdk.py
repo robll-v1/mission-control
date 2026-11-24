@@ -21,16 +21,19 @@ from app.core.context_compiler import ContextCompiler
 from app.core.config import UNSET, _UnsetType, resolve_backend_config
 from app.core.db import Database
 from app.core.execution import ExecutionService
+from app.core.finding_tracker import FindingTracker, compute_fingerprint, normalize_finding_path
 from app.core.github_ingest import fetch_pull_request, is_github_pr_url
 from app.core.mission_engine import MissionEngine
 from app.core.models import (
     Event,
+    FindingStatus as TrackedFindingStatus,
     ReviewFinding,
     ReviewResult,
     ReviewVerdict,
     Run,
     Task,
     TaskStatus,
+    TrackedFinding,
 )
 from app.core.proc import run_text
 from app.core.validation import ValidationService
@@ -378,6 +381,27 @@ class ReviewEngine:
             return task.latest_review_result.findings
         return []
 
+    def get_tracked_findings(self, task_id: str) -> list[TrackedFinding]:
+        """Get first-class cross-round findings stored in SQLite for a task."""
+        task = self._db.get_task(task_id)
+        if task is None:
+            raise KeyError(f'task not found: {task_id}')
+        ReviewResultService.backfill_task(db=self._db, task=task)
+        return self._db.list_findings(task_id)
+
+    def update_finding_status(self, task_id: str, finding_id: str, action: str) -> TrackedFinding:
+        """Apply a user status action ('resolve', 'dismiss', or 'reopen') to a tracked finding."""
+        task = self._db.get_task(task_id)
+        if task is None:
+            raise KeyError(f'task not found: {task_id}')
+        ReviewResultService.backfill_task(db=self._db, task=task)
+        return FindingTracker.set_user_status(
+            db=self._db,
+            task_id=task_id,
+            finding_id=finding_id,
+            action=action,
+        )
+
     def get_result(self, task_id: str) -> ReviewResult | None:
         """Get full ReviewResult from latest round."""
         task = self._db.get_task(task_id)
@@ -458,16 +482,16 @@ class ReviewEngine:
         resolved = self._resolve_review_config(str(repo))
         self.backend_name = str(resolved['backend'])
         self.model = resolved['model']
-        history = ReviewHistoryStore(str(repo))
 
-        # --- Incremental: detect last reviewed SHA ---
-        # Only local-diff history counts here: a PR review's base SHA and
-        # findings describe a different change set and must not seed a local
-        # incremental review.
-        previous_sha = None
+        # --- Incremental: detect last reviewed SHA & prior open findings ---
+        # SQLite is the sole source of truth; legacy `<repo>/.amc/reviews/` is
+        # only read (never written) when SQLite has no prior local_diff review
+        # for this repository.
+        previous_sha: str | None = None
+        previous_findings: list[StoredFinding] = []
         is_incremental = False
         if incremental and not pr_url:
-            previous_sha = history.get_last_reviewed_sha(mode='local_diff')
+            previous_sha, previous_findings = self._load_prior_local_state(repo)
             if previous_sha:
                 is_incremental = True
                 base = previous_sha
@@ -541,12 +565,12 @@ class ReviewEngine:
         latest_run = latest_runs[-1] if latest_runs else None
         metrics: dict[str, object] = dict(latest_run.metrics) if latest_run and latest_run.metrics else {}
 
-        # --- Finding dedup against history ---
+        # --- Finding dedup against prior local state (SQLite or read-only legacy import) ---
         finding_statuses: list[FindingStatus] = []
         resolved_findings: list[StoredFinding] = []
         unverified_findings: list[StoredFinding] = []
 
-        if is_incremental:
+        if is_incremental and previous_findings:
             new_stored = [
                 StoredFinding(
                     severity=f.severity,
@@ -556,7 +580,7 @@ class ReviewEngine:
                 )
                 for f in result.findings
             ]
-            comparison = history.compare_findings(new_stored, mode='local_diff')
+            comparison = self._compare_stored_findings(new_stored, previous_findings)
             finding_statuses = comparison['new'] + comparison['persistent'] + comparison['unverified']
             unverified_findings = [fs.finding for fs in comparison['unverified']]
 
@@ -575,17 +599,11 @@ class ReviewEngine:
             ).strip()
         can_continue = not report_passed and rounds_executed < max_rounds
 
-        # --- Save review to history ---
-        self._save_review_history(
-            repo=repo,
+        # Persist final tracked findings (including retained unverified findings)
+        # into SQLite as the sole source of truth (never writing `.amc/reviews/`).
+        self._persist_sdk_review_state(
             task=task,
             result=result,
-            base=base,
-            pr_url=pr_url,
-            focus=inferred_focus,
-            previous_sha=previous_sha,
-            duration_sec=time.time() - start_time,
-            metrics=metrics,
             retained_findings=unverified_findings,
         )
 
@@ -767,6 +785,7 @@ class ReviewEngine:
             task_id=task.id,
             backend=self.backend_name,
             round_index=len(self._db.list_runs(task.id)) + 1,
+            review_revision=task.local_snapshot_sha or task.pr_head_sha,
             status='completed',
             review_result=result,
             metrics=metrics,
@@ -777,10 +796,12 @@ class ReviewEngine:
         self._db.save_run(run)
         # Re-read: append_event() touches the row, so the local object may be stale.
         task = self._db.get_task(task.id) or task
+        runs = self._db.list_runs(task.id)
         task.last_run_id = run.id
-        task.latest_review_result = ReviewResultService.latest_result(self._db.list_runs(task.id))
+        task.latest_review_result = ReviewResultService.latest_result(runs)
         task.updated_at = time.time()
         self._db.save_task(task)
+        FindingTracker.sync_round(db=self._db, task=task, run=run, all_runs=runs)
 
         # Store events for audit trail
         self._engine.append_event(
@@ -796,6 +817,7 @@ class ReviewEngine:
             payload={
                 'verdict': result.verdict.value if hasattr(result.verdict, 'value') else str(result.verdict),
                 'finding_count': result.finding_count,
+                'parse_mode': result.parse_mode,
                 'mode': 'direct_api',
             },
         )
@@ -808,19 +830,6 @@ class ReviewEngine:
 
         # Update task status
         self._engine.set_stage(task.id, status=TaskStatus.COMPLETED, stage='review_done')
-
-        # Record the review so incremental mode works on this path too.
-        self._save_review_history(
-            repo=repo,
-            task=task,
-            result=result,
-            base=base,
-            pr_url=pr_url,
-            focus=inferred_focus,
-            previous_sha=None,
-            duration_sec=time.time() - start_time,
-            metrics=metrics,
-        )
 
         passed = result.verdict == ReviewVerdict.CLEAR
         return ReviewReport(
@@ -838,52 +847,155 @@ class ReviewEngine:
             metrics=metrics,
         )
 
-    def _save_review_history(
-        self,
-        *,
-        repo: Path,
-        task: Task,
-        result: ReviewResult,
-        base: str | None,
-        pr_url: str | None,
-        focus: str,
-        previous_sha: str | None,
-        duration_sec: float,
-        metrics: dict[str, object],
-        retained_findings: list[StoredFinding] | None = None,
-    ) -> None:
-        """Append a review to the repo-local history store."""
-        current_sha = task.local_head_sha or self._get_head_sha(str(repo)) or ''
-        record = ReviewRecord(
-            review_id=str(uuid.uuid4())[:8],
-            timestamp=time.time(),
-            head_sha=current_sha,
-            base_ref=base or self._detect_default_branch(str(repo)),
-            mode='pr' if pr_url else 'local_diff',
-            pr_url=pr_url,
-            focus=focus,
-            verdict=(
-                'concerns' if retained_findings and result.verdict == ReviewVerdict.CLEAR
-                else result.verdict.value if hasattr(result.verdict, 'value') else str(result.verdict)
-            ),
-            findings=[
+    def _load_prior_local_state(self, repo: Path) -> tuple[str | None, list[StoredFinding]]:
+        """Read prior local_diff SHA and open findings from SQLite, falling back
+        read-only to legacy ``<repo>/.amc/reviews/`` when SQLite has no history
+        for this repo yet. Never creates or writes ``.amc/reviews/``.
+        """
+        resolved_repo = str(repo.resolve())
+        local_tasks = [
+            t
+            for t in self._db.list_tasks()
+            if t.source_type == 'local_diff'
+            and str(Path(t.repo_path).resolve()) == resolved_repo
+            and t.latest_review_result is not None
+        ]
+        if local_tasks:
+            local_tasks.sort(key=lambda t: (t.updated_at, t.created_at), reverse=True)
+            prev_task = local_tasks[0]
+            # Pick the review_revision of the latest COMPLETED (non-aborted,
+            # CLEAR/CONCERNS) run instead of mutable `prev_task.local_snapshot_sha`
+            # (which an aborted round's pre-prepare refresh can overwrite).
+            prev_sha = prev_task.local_head_sha
+            completed_runs = [
+                r
+                for r in self._db.list_runs(prev_task.id)
+                if r.status == 'completed'
+                and r.review_revision
+                and (
+                    r.review_result is None
+                    or r.review_result.verdict in {ReviewVerdict.CLEAR, ReviewVerdict.CONCERNS}
+                )
+            ]
+            if completed_runs:
+                candidate_sha = completed_runs[-1].review_revision
+                check = run_text(
+                    ['git', 'cat-file', '-e', f'{candidate_sha}^{{commit}}'],
+                    cwd=resolved_repo,
+                    timeout=5,
+                )
+                if check.returncode == 0:
+                    prev_sha = candidate_sha
+            open_statuses = {
+                TrackedFindingStatus.NEW,
+                TrackedFindingStatus.PERSISTENT,
+                TrackedFindingStatus.UNVERIFIED,
+                TrackedFindingStatus.LIKELY_FIXED,
+            }
+            tracked = [
+                f for f in self._db.list_findings(prev_task.id) if f.status in open_statuses
+            ]
+            stored = [
                 StoredFinding(
                     severity=f.severity,
                     path=f.path or '',
                     line=f.line,
-                    summary=f.summary,
+                    summary=f.title,
+                    fingerprint=f.fingerprint,
                 )
-                for f in result.findings
-            ] + list(retained_findings or []),
-            finding_count=result.finding_count + len(retained_findings or []),
-            duration_sec=duration_sec,
-            changed_files=list(task.review_paths) if task.review_paths else [],
-            commit_range=(
-                f'{previous_sha[:7]}..{current_sha[:7]}' if previous_sha and current_sha else ''
-            ),
-            metadata={'metrics': metrics} if metrics else {},
-        )
-        ReviewHistoryStore(str(repo)).save_review(record)
+                for f in tracked
+            ]
+            return prev_sha, stored
+
+        legacy_dir = repo / ReviewHistoryStore.STORE_DIR
+        if (legacy_dir / ReviewHistoryStore.HISTORY_FILE).is_file() or (
+            legacy_dir / ReviewHistoryStore.LATEST_FILE
+        ).is_file():
+            legacy = ReviewHistoryStore(str(repo))
+            return (
+                legacy.get_last_reviewed_sha(mode='local_diff'),
+                legacy.get_previous_findings(mode='local_diff'),
+            )
+        return None, []
+
+    @staticmethod
+    def _compare_stored_findings(
+        new_findings: list[StoredFinding],
+        previous_findings: list[StoredFinding],
+    ) -> dict[str, list[FindingStatus]]:
+        """Compare findings in-memory without touching ``.amc/reviews/`` on disk."""
+        store = object.__new__(ReviewHistoryStore)
+        return store.compare_findings(new_findings, previous_findings=previous_findings)
+
+    def _persist_sdk_review_state(
+        self,
+        *,
+        task: Task,
+        result: ReviewResult,
+        retained_findings: list[StoredFinding],
+    ) -> None:
+        """Persist task's final ReviewResult and tracked findings into SQLite."""
+        with self._db.locked():
+            fresh = self._db.get_task(task.id) or task
+            fresh.latest_review_result = result
+            fresh.updated_at = time.time()
+            self._db.save_task(fresh)
+
+            existing = self._db.list_findings(task.id)
+            used_fps = {item.fingerprint for item in existing}
+            now = fresh.updated_at
+            to_save: list[TrackedFinding] = []
+            if not existing and result.findings:
+                for idx, finding in enumerate(result.findings):
+                    fp = compute_fingerprint(finding.path, finding.category, finding.summary)
+                    if fp in used_fps:
+                        fp = f'{fp[:12]}-{idx}'
+                    used_fps.add(fp)
+                    to_save.append(
+                        TrackedFinding(
+                            task_id=task.id,
+                            fingerprint=fp,
+                            category=finding.category,
+                            severity=finding.severity,
+                            path=normalize_finding_path(finding.path),
+                            line=finding.line if (finding.line is not None and finding.line > 0) else None,
+                            title=finding.summary,
+                            detail=finding.detail or finding.summary,
+                            first_round=1,
+                            last_round=1,
+                            status=TrackedFindingStatus.NEW,
+                            system_status=TrackedFindingStatus.NEW,
+                            user_status=None,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+            for idx, retained in enumerate(retained_findings):
+                fp = compute_fingerprint(retained.path, '', retained.summary)
+                if fp in used_fps:
+                    continue
+                used_fps.add(fp)
+                to_save.append(
+                    TrackedFinding(
+                        task_id=task.id,
+                        fingerprint=fp,
+                        category='',
+                        severity=retained.severity,
+                        path=normalize_finding_path(retained.path),
+                        line=retained.line if (retained.line is not None and retained.line > 0) else None,
+                        title=retained.summary,
+                        detail=retained.summary,
+                        first_round=1,
+                        last_round=1,
+                        status=TrackedFindingStatus.UNVERIFIED,
+                        system_status=TrackedFindingStatus.UNVERIFIED,
+                        user_status=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            if to_save:
+                self._db.save_findings(to_save)
 
     # ------------------------------------------------------------------
     # Local diff helpers
@@ -910,22 +1022,17 @@ class ReviewEngine:
         return get_commit_messages(repo_path, base)
 
     def _generated_paths_for_repo(self, repo_path: str) -> list[str]:
-        """Get list of generated/runtime paths to exclude from snapshot."""
+        """Get list of generated/runtime paths (including DB backups) to exclude from snapshot."""
         repo = Path(repo_path).resolve()
         paths = [
             (self._artifacts.runtime_root / 'tasks').resolve(),
-            self._db.path.resolve(),
             self._worktrees._worktrees_root_for_repo(str(repo)),
+            *(p.resolve() for p in self._db.generated_paths()),
         ]
         excluded: list[str] = []
         for path in paths:
             try:
                 excluded.append(path.relative_to(repo).as_posix())
-            except ValueError:
-                continue
-        for suffix in ('-journal', '-wal', '-shm'):
-            try:
-                excluded.append(Path(f'{self._db.path}{suffix}').resolve().relative_to(repo).as_posix())
             except ValueError:
                 continue
         return excluded

@@ -3,11 +3,24 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
-from app.core.models import CheckRun, Event, Run, Task
+from app.core.models import CheckRun, Event, FindingStatus, Run, Task, TrackedFinding
+
+SCHEMA_VERSION = 2
+_SEVERITY_RANK = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+_CLOSED_STATUSES = {FindingStatus.RESOLVED, FindingStatus.DISMISSED}
+_STATUS_RANK = {
+    FindingStatus.NEW: 0,
+    FindingStatus.PERSISTENT: 1,
+    FindingStatus.UNVERIFIED: 2,
+    FindingStatus.LIKELY_FIXED: 3,
+    FindingStatus.RESOLVED: 4,
+    FindingStatus.DISMISSED: 5,
+}
 
 
 class Database:
@@ -30,10 +43,13 @@ class Database:
 
     def __init__(self, path: str):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._is_memory = str(path) == ':memory:'
+        if not self._is_memory:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(path) if self._is_memory else self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        self.last_backup_path: Path | None = None
         self._init_schema()
 
     def close(self) -> None:
@@ -47,36 +63,155 @@ class Database:
         with self._lock:
             yield
 
+    def schema_version(self) -> int:
+        with self._lock:
+            row = self.conn.execute('PRAGMA user_version').fetchone()
+            return int(row[0]) if row else 0
+
+    def generated_paths(self) -> list[Path]:
+        """Return all on-disk SQLite files (main, WAL/journal/SHM, and migration backups)."""
+        if self._is_memory:
+            return []
+        paths: list[Path] = [
+            self.path,
+            Path(f'{self.path}-journal'),
+            Path(f'{self.path}-wal'),
+            Path(f'{self.path}-shm'),
+        ]
+        if self.path.parent.exists():
+            paths.extend(sorted(self.path.parent.glob(f'{self.path.name}.bak*')))
+        if self.last_backup_path is not None and self.last_backup_path not in paths:
+            paths.append(self.last_backup_path)
+        return paths
+
     def _init_schema(self) -> None:
         with self._lock:
             self._init_schema_locked()
 
+    def _backup_before_migration_locked(self, old_version: int) -> Path | None:
+        """Create a consistent SQLite backup file before upgrading an existing DB."""
+        if self._is_memory:
+            return None
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return None
+        stamp = time.strftime('%Y%m%d-%H%M%S', time.gmtime())
+        candidate = self.path.with_name(f'{self.path.name}.bak.v{old_version}.{stamp}')
+        suffix = 1
+        while candidate.exists():
+            candidate = self.path.with_name(f'{self.path.name}.bak.v{old_version}.{stamp}.{suffix}')
+            suffix += 1
+        dst = sqlite3.connect(candidate)
+        try:
+            self.conn.backup(dst)
+        finally:
+            dst.close()
+        self.last_backup_path = candidate
+        return candidate
+
     def _init_schema_locked(self) -> None:
-        self.conn.executescript(
+        existing_tables = {
+            row['name']
+            for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        current_version = int(self.conn.execute('PRAGMA user_version').fetchone()[0])
+
+        # Only snapshot a pre-migration backup when upgrading an existing DB
+        # with prior tables (avoid creating clutter on brand-new databases).
+        if existing_tables and current_version < SCHEMA_VERSION:
+            self._backup_before_migration_locked(current_version)
+
+        try:
+            self._apply_schema_locked(current_version)
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            raise
+
+    def _apply_schema_locked(self, current_version: int) -> None:
+        # Base tables (v1) + first-class findings table (v2) are idempotent.
+        self.conn.execute('BEGIN')
+        self.conn.execute(
             '''
             CREATE TABLE IF NOT EXISTS tasks (
               id TEXT PRIMARY KEY,
               data TEXT NOT NULL
-            );
+            )
+            '''
+        )
+        self.conn.execute(
+            '''
             CREATE TABLE IF NOT EXISTS runs (
               id TEXT PRIMARY KEY,
               task_id TEXT NOT NULL,
               data TEXT NOT NULL
-            );
+            )
+            '''
+        )
+        self.conn.execute(
+            '''
             CREATE TABLE IF NOT EXISTS events (
               id TEXT PRIMARY KEY,
               task_id TEXT NOT NULL,
               run_id TEXT,
               seq INTEGER NOT NULL,
               data TEXT NOT NULL
-            );
+            )
+            '''
+        )
+        self.conn.execute(
+            '''
             CREATE TABLE IF NOT EXISTS check_runs (
               id TEXT PRIMARY KEY,
               task_id TEXT NOT NULL,
               data TEXT NOT NULL
-            );
+            )
             '''
         )
+        self.conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS findings (
+              id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              fingerprint TEXT NOT NULL,
+              category TEXT NOT NULL DEFAULT '',
+              severity TEXT NOT NULL,
+              path TEXT,
+              line INTEGER,
+              title TEXT NOT NULL,
+              detail TEXT NOT NULL DEFAULT '',
+              first_round INTEGER NOT NULL,
+              last_round INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              system_status TEXT NOT NULL,
+              user_status TEXT,
+              location_changed INTEGER NOT NULL DEFAULT 0,
+              reopened INTEGER NOT NULL DEFAULT 0,
+              mentioned_after_dismiss INTEGER NOT NULL DEFAULT 0,
+              previous_path TEXT,
+              previous_line INTEGER,
+              created_at REAL NOT NULL,
+              updated_at REAL NOT NULL,
+              UNIQUE(task_id, fingerprint)
+            )
+            '''
+        )
+        self.conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_findings_task_id ON findings(task_id)'
+        )
+        self.conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS finding_sync_state (
+              task_id TEXT PRIMARY KEY,
+              last_synced_round INTEGER NOT NULL DEFAULT 0
+            )
+            '''
+        )
+        if current_version < SCHEMA_VERSION:
+            self.conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
         self.conn.commit()
 
     def save_task(self, task: Task) -> None:
@@ -149,3 +284,185 @@ class Database:
         with self._lock:
             rows = self.conn.execute('SELECT data FROM check_runs WHERE task_id = ?', (task_id,)).fetchall()
         return [CheckRun.model_validate_json(row['data']) for row in rows]
+
+    @staticmethod
+    def _row_to_finding(row: sqlite3.Row) -> TrackedFinding:
+        user_status = row['user_status']
+        return TrackedFinding(
+            id=row['id'],
+            task_id=row['task_id'],
+            fingerprint=row['fingerprint'],
+            category=row['category'] or '',
+            severity=row['severity'],
+            path=row['path'],
+            line=row['line'],
+            title=row['title'],
+            detail=row['detail'] or '',
+            first_round=int(row['first_round']),
+            last_round=int(row['last_round']),
+            status=FindingStatus(row['status']),
+            system_status=FindingStatus(row['system_status']),
+            user_status=FindingStatus(user_status) if user_status else None,
+            location_changed=bool(row['location_changed']),
+            reopened=bool(row['reopened']),
+            mentioned_after_dismiss=bool(row['mentioned_after_dismiss']),
+            previous_path=row['previous_path'],
+            previous_line=row['previous_line'],
+            created_at=float(row['created_at']),
+            updated_at=float(row['updated_at']),
+        )
+
+    @staticmethod
+    def _finding_params(finding: TrackedFinding) -> tuple:
+        return (
+            finding.id,
+            finding.task_id,
+            finding.fingerprint,
+            finding.category,
+            finding.severity,
+            finding.path,
+            finding.line,
+            finding.title,
+            finding.detail,
+            int(finding.first_round),
+            int(finding.last_round),
+            str(finding.status.value if isinstance(finding.status, FindingStatus) else finding.status),
+            str(finding.system_status.value if isinstance(finding.system_status, FindingStatus) else finding.system_status),
+            str(finding.user_status.value if isinstance(finding.user_status, FindingStatus) else finding.user_status)
+            if finding.user_status is not None
+            else None,
+            1 if finding.location_changed else 0,
+            1 if finding.reopened else 0,
+            1 if finding.mentioned_after_dismiss else 0,
+            finding.previous_path,
+            finding.previous_line,
+            float(finding.created_at),
+            float(finding.updated_at),
+        )
+
+    def save_finding(self, finding: TrackedFinding) -> None:
+        self.save_findings([finding])
+
+    def get_synced_round(self, task_id: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                'SELECT last_synced_round FROM finding_sync_state WHERE task_id = ?',
+                (task_id,),
+            ).fetchone()
+            if row is not None:
+                return int(row['last_synced_round'])
+            # Upgrade compatibility: if findings already exist for this task from
+            # a pre-finding_sync_state schema, treat their MAX(last_round) as
+            # already synced so re-reads never replay and overwrite user states.
+            max_row = self.conn.execute(
+                'SELECT MAX(last_round) AS m FROM findings WHERE task_id = ?',
+                (task_id,),
+            ).fetchone()
+        return int(max_row['m']) if (max_row is not None and max_row['m'] is not None) else 0
+
+    def set_synced_round(self, task_id: str, round_index: int) -> None:
+        with self._lock:
+            self.conn.execute(
+                '''
+                INSERT INTO finding_sync_state (task_id, last_synced_round) VALUES (?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET last_synced_round = MAX(last_synced_round, excluded.last_synced_round)
+                ''',
+                (task_id, int(round_index)),
+            )
+            self.conn.commit()
+
+    def save_findings(
+        self,
+        findings: Iterable[TrackedFinding],
+        *,
+        task_id: str | None = None,
+        synced_round: int | None = None,
+    ) -> None:
+        items = list(findings)
+        if not items and synced_round is None:
+            return
+        sql = '''
+            INSERT INTO findings (
+              id, task_id, fingerprint, category, severity, path, line,
+              title, detail, first_round, last_round, status, system_status,
+              user_status, location_changed, reopened, mentioned_after_dismiss,
+              previous_path, previous_line, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              fingerprint = excluded.fingerprint,
+              category = excluded.category,
+              severity = excluded.severity,
+              path = excluded.path,
+              line = excluded.line,
+              title = excluded.title,
+              detail = excluded.detail,
+              first_round = excluded.first_round,
+              last_round = excluded.last_round,
+              status = excluded.status,
+              system_status = excluded.system_status,
+              user_status = excluded.user_status,
+              location_changed = excluded.location_changed,
+              reopened = excluded.reopened,
+              mentioned_after_dismiss = excluded.mentioned_after_dismiss,
+              previous_path = excluded.previous_path,
+              previous_line = excluded.previous_line,
+              updated_at = excluded.updated_at
+        '''
+        with self._lock:
+            self.conn.execute('SAVEPOINT amc_save_findings')
+            try:
+                for item in items:
+                    self.conn.execute(sql, self._finding_params(item))
+                if synced_round is not None:
+                    target_task = task_id or (items[0].task_id if items else None)
+                    if target_task is not None:
+                        self.conn.execute(
+                            '''
+                            INSERT INTO finding_sync_state (task_id, last_synced_round) VALUES (?, ?)
+                            ON CONFLICT(task_id) DO UPDATE SET
+                              last_synced_round = MAX(last_synced_round, excluded.last_synced_round)
+                            ''',
+                            (target_task, int(synced_round)),
+                        )
+                self.conn.execute('RELEASE SAVEPOINT amc_save_findings')
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.execute('ROLLBACK TO SAVEPOINT amc_save_findings')
+                    self.conn.execute('RELEASE SAVEPOINT amc_save_findings')
+                except Exception:
+                    pass
+                raise
+
+    def get_finding(self, task_id: str, finding_id: str) -> TrackedFinding | None:
+        with self._lock:
+            row = self.conn.execute(
+                'SELECT * FROM findings WHERE task_id = ? AND id = ?',
+                (task_id, finding_id),
+            ).fetchone()
+        return self._row_to_finding(row) if row else None
+
+    def list_findings(self, task_id: str) -> list[TrackedFinding]:
+        with self._lock:
+            rows = self.conn.execute(
+                'SELECT * FROM findings WHERE task_id = ? ORDER BY created_at ASC, id ASC',
+                (task_id,),
+            ).fetchall()
+        findings = [self._row_to_finding(row) for row in rows]
+        findings.sort(
+            key=lambda f: (
+                1 if f.status in _CLOSED_STATUSES else 0,
+                _SEVERITY_RANK.get(f.severity.lower(), 9),
+                _STATUS_RANK.get(f.status, 9),
+                f.first_round,
+                f.created_at,
+                f.id,
+            )
+        )
+        return findings
+
+    def delete_findings(self, task_id: str) -> None:
+        with self._lock:
+            self.conn.execute('DELETE FROM findings WHERE task_id = ?', (task_id,))
+            self.conn.execute('DELETE FROM finding_sync_state WHERE task_id = ?', (task_id,))
+            self.conn.commit()

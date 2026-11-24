@@ -15,6 +15,18 @@ import {
   type ReviewLanguage,
 } from './i18n'
 import {
+  applyUpdatedFinding,
+  buildFixPrompt,
+  computeFindingCounts,
+  filterFindings,
+  findingLocationText,
+  isClosedFinding,
+  type FindingAction,
+  type FindingCounts,
+  type FindingFilter,
+  type TrackedFinding,
+} from './findings'
+import {
   buildStartRoundPayload,
   createRunDraft,
   formatRoundSettingsLabel,
@@ -58,6 +70,7 @@ type ReviewResult = {
   findings: ReviewFinding[]
   severity_counts: Record<string, number>
   finding_count: number
+  parse_mode?: string
   source_event_seq?: number | null
   supersedes_round_index?: number | null
 }
@@ -130,6 +143,8 @@ type TaskDetailResponse = {
   important_events?: EventRecord[]
   event_stats?: EventStats
   latest_review_result?: ReviewResult | null
+  findings?: TrackedFinding[]
+  finding_counts?: FindingCounts
   review_rounds?: ReviewRound[]
   runs?: ReviewRound[]
   artifacts: ArtifactRecord[]
@@ -141,6 +156,8 @@ type TaskDetail = {
   importantEvents: EventRecord[]
   eventStats: EventStats
   latestReviewResult: ReviewResult | null
+  findings: TrackedFinding[]
+  findingCounts: FindingCounts
   reviewRounds: ReviewRound[]
   artifacts: ArtifactRecord[]
 }
@@ -178,6 +195,7 @@ const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
 const normalizeTaskDetail = (payload: TaskDetailResponse): TaskDetail => {
   const events = payload.events
   const importantEvents = payload.important_events ?? events
+  const findings = payload.findings ?? []
   return {
     task: payload.task,
     events,
@@ -188,6 +206,8 @@ const normalizeTaskDetail = (payload: TaskDetailResponse): TaskDetail => {
       hidden_count: Math.max(events.length - importantEvents.length, 0),
     },
     latestReviewResult: payload.latest_review_result ?? payload.task.latest_review_result ?? null,
+    findings,
+    findingCounts: payload.finding_counts ?? computeFindingCounts(findings),
     reviewRounds: payload.review_rounds ?? payload.runs ?? [],
     artifacts: payload.artifacts,
   }
@@ -366,6 +386,8 @@ export function App() {
   const [isCreating, setIsCreating] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
   const [detailTab, setDetailTab] = useState<DetailTab>('results')
+  const [findingFilter, setFindingFilter] = useState<FindingFilter>('open')
+  const [updatingFindingIds, setUpdatingFindingIds] = useState<string[]>([])
   const [showAllEvents, setShowAllEvents] = useState(false)
   const [showModal, setShowModal] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
@@ -373,6 +395,7 @@ export function App() {
   // Start requests stay pending through preflight and prepare; one record
   // per task, so actions on another task cannot affect this one.
   const startTrackerRef = useRef(new StartTracker())
+  const findingSeqRef = useRef<Map<string, number>>(new Map())
   const [startingTaskIds, setStartingTaskIds] = useState<string[]>([])
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'light'
@@ -551,6 +574,7 @@ export function App() {
   useEffect(() => {
     if (!selectedTaskId) return
     setDetailTab('results')
+    setFindingFilter('open')
     setShowAllEvents(false)
     void loadTask(selectedTaskId)
   }, [selectedTaskId, loadTask])
@@ -683,13 +707,86 @@ export function App() {
     }
   }
 
+  const updateFindingStatus = async (taskId: string, findingId: string, action: FindingAction) => {
+    const seqKey = `${taskId}:${findingId}`
+    const nextFindingSeq = (findingSeqRef.current.get(seqKey) ?? 0) + 1
+    findingSeqRef.current.set(seqKey, nextFindingSeq)
+    // Advance the task's load sequence so any older in-flight GET /api/tasks/{id}
+    // cannot overwrite this mutation when it returns later.
+    const patchLoadSeq = (loadSeqByTaskRef.current.get(taskId) ?? 0) + 1
+    loadSeqByTaskRef.current.set(taskId, patchLoadSeq)
+
+    setUpdatingFindingIds((prev) => (prev.includes(findingId) ? prev : [...prev, findingId]))
+    try {
+      const res = await api<{ finding: TrackedFinding; counts: FindingCounts }>(
+        `/api/tasks/${taskId}/findings/${findingId}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ action }),
+        },
+      )
+      if (findingSeqRef.current.get(seqKey) !== nextFindingSeq) return
+      // If a newer GET (e.g., SSE round_finished that auto-reopened a finding)
+      // started after this PATCH was issued, do not overwrite it with our stale
+      // response; trigger a silent refresh to converge to exact server state.
+      if (loadSeqByTaskRef.current.get(taskId) !== patchLoadSeq) {
+        if (selectedTaskIdRef.current === taskId) {
+          void loadTask(taskId, { silent: true })
+        }
+        return
+      }
+      setDetail((prev) => {
+        if (!prev || prev.task.id !== taskId) return prev
+        const nextFindings = applyUpdatedFinding(prev.findings, res.finding)
+        return {
+          ...prev,
+          findings: nextFindings,
+          findingCounts: res.counts ?? computeFindingCounts(nextFindings),
+        }
+      })
+    } catch (err) {
+      if (findingSeqRef.current.get(seqKey) === nextFindingSeq) {
+        setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.updateFinding) })
+        // Re-sync if this failed mutation invalidated an in-flight SSE refresh.
+        if (selectedTaskIdRef.current === taskId) {
+          void loadTask(taskId, { silent: true })
+        }
+      }
+    } finally {
+      if (findingSeqRef.current.get(seqKey) === nextFindingSeq) {
+        setUpdatingFindingIds((prev) => prev.filter((id) => id !== findingId))
+      }
+    }
+  }
+
+  const copyFixPrompt = async (finding: TrackedFinding) => {
+    const text = buildFixPrompt(finding)
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text)
+      } else {
+        throw new Error('')
+      }
+      setNotice({ tone: 'info', text: (t) => t.findings.copiedFixPrompt })
+    } catch {
+      setNotice({ tone: 'error', text: (t) => t.errors.copyFailed })
+    }
+  }
+
   const selectTask = (id: string) => {
     setSelectedTaskId(id)
     setNavOpen(false)
   }
 
+  const trackedFindings = activeDetail?.findings ?? []
+  const findingCounts = activeDetail?.findingCounts ?? computeFindingCounts(trackedFindings)
+  const visibleTrackedFindings = useMemo(
+    () => filterFindings(trackedFindings, findingFilter),
+    [trackedFindings, findingFilter],
+  )
+
   const tabCounts: Record<DetailTab, number> = {
-    results: latestResult?.finding_count ?? 0,
+    results: trackedFindings.length > 0 ? findingCounts.open : (latestResult?.finding_count ?? 0),
     timeline: activeDetail?.eventStats.important_count ?? 0,
     rounds: orderedRounds.length,
     artifacts: activeDetail?.artifacts.length ?? 0,
@@ -1072,7 +1169,147 @@ export function App() {
 
                 {detailTab === 'results' && (
                   <>
-                    {latestResult && latestResult.findings.length > 0 ? (
+                    {trackedFindings.length > 0 ? (
+                      <>
+                        <div className="section-label">
+                          <span>{t.findings.heading}</span>
+                          <span className="count">{t.counts.findingsCompact(findingCounts.all)}</span>
+                        </div>
+                        <div className="finding-filters" role="group" aria-label={t.findings.heading}>
+                          {(
+                            [
+                              'open',
+                              'new',
+                              'persistent',
+                              'likely_fixed',
+                              'unverified',
+                              'resolved',
+                              'dismissed',
+                              'all',
+                            ] as FindingFilter[]
+                          )
+                            .filter((key) => key === 'open' || key === 'all' || findingCounts[key] > 0 || findingFilter === key)
+                            .map((key) => (
+                              <button
+                                key={key}
+                                type="button"
+                                className={`filter-pill ${findingFilter === key ? 'active' : ''}`}
+                                aria-pressed={findingFilter === key}
+                                onClick={() => setFindingFilter(key)}
+                              >
+                                <span>{t.findings.filter[key]}</span>
+                                <span className="n">{findingCounts[key]}</span>
+                              </button>
+                            ))}
+                        </div>
+                        {visibleTrackedFindings.length > 0 ? (
+                          <div className="findings">
+                            {visibleTrackedFindings.map((finding) => {
+                              const closed = isClosedFinding(finding.status)
+                              const busy = updatingFindingIds.includes(finding.id)
+                              const loc = findingLocationText(finding)
+                              const prevLoc =
+                                finding.location_changed && finding.previous_path
+                                  ? findingLocationText({
+                                      path: finding.previous_path,
+                                      line: finding.previous_line,
+                                    })
+                                  : null
+                              return (
+                                <article
+                                  className={`finding sev-${finding.severity} ${closed ? 'is-closed' : ''}`}
+                                  key={finding.id}
+                                >
+                                  <div className="finding-top">
+                                    <span className="sev-tag">{severityLabel(t, finding.severity)}</span>
+                                    <span className={`finding-status st-${finding.status}`}>
+                                      {t.findings.status[finding.status]}
+                                    </span>
+                                    <span className="finding-chip mono">
+                                      {t.findings.roundSpan(finding.first_round, finding.last_round)}
+                                    </span>
+                                    {finding.category && (
+                                      <span className="finding-chip mono">{finding.category}</span>
+                                    )}
+                                    {finding.reopened && (
+                                      <span className="finding-chip is-warn">{t.findings.reopened}</span>
+                                    )}
+                                    {finding.location_changed && (
+                                      <span className="finding-chip" title={prevLoc ? t.findings.previousLocation(prevLoc) : undefined}>
+                                        {t.findings.locationChanged}
+                                        {prevLoc ? ` · ${t.findings.previousLocation(prevLoc)}` : ''}
+                                      </span>
+                                    )}
+                                    <span className="finding-loc">{loc ?? t.findings.noLocation}</span>
+                                  </div>
+                                  <div className="finding-title">{finding.title}</div>
+                                  {finding.detail && finding.detail !== finding.title && (
+                                    <p className="finding-body">{finding.detail}</p>
+                                  )}
+                                  {finding.status === 'likely_fixed' && (
+                                    <p className="finding-note">{t.findings.likelyFixedHint}</p>
+                                  )}
+                                  {finding.status === 'dismissed' && finding.mentioned_after_dismiss && (
+                                    <p className="finding-note is-warn">
+                                      {t.findings.mentionedAfterDismiss(finding.last_round)}
+                                    </p>
+                                  )}
+                                  <div className="finding-actions">
+                                    {closed ? (
+                                      <button
+                                        type="button"
+                                        className="btn btn-secondary btn-xs"
+                                        disabled={busy}
+                                        onClick={() => void updateFindingStatus(selectedTask.id, finding.id, 'reopen')}
+                                      >
+                                        {t.findings.undo}
+                                      </button>
+                                    ) : (
+                                      <>
+                                        <button
+                                          type="button"
+                                          className="btn btn-secondary btn-xs"
+                                          disabled={busy}
+                                          onClick={() => void updateFindingStatus(selectedTask.id, finding.id, 'resolve')}
+                                        >
+                                          {t.findings.markResolved}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="btn btn-ghost btn-xs"
+                                          disabled={busy}
+                                          onClick={() => void updateFindingStatus(selectedTask.id, finding.id, 'dismiss')}
+                                        >
+                                          {t.findings.dismiss}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="btn btn-ghost btn-xs"
+                                          onClick={() => void copyFixPrompt(finding)}
+                                        >
+                                          {t.findings.copyFixPrompt}
+                                        </button>
+                                      </>
+                                    )}
+                                  </div>
+                                </article>
+                              )
+                            })}
+                          </div>
+                        ) : (
+                          <div className="empty-note">
+                            <span>{t.findings.noneMatchingFilter}</span>{' '}
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-xs"
+                              onClick={() => setFindingFilter('all')}
+                            >
+                              {t.findings.showAll}
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    ) : latestResult && latestResult.findings.length > 0 ? (
                       <>
                         <div className="section-label">
                           <span>{t.findings.heading}</span>
@@ -1177,6 +1414,12 @@ export function App() {
                                 <span className="kv-k">{t.rounds.language}</span>
                                 <span className="kv-v mono">{round.settings?.language || round.language || DEFAULT_REVIEW_LANGUAGE}</span>
                               </div>
+                              {round.review_result?.parse_mode && (
+                                <div className="kv">
+                                  <span className="kv-k">{t.rounds.parseMode}</span>
+                                  <span className="kv-v mono">{round.review_result.parse_mode}</span>
+                                </div>
+                              )}
                               <div className="kv">
                                 <span className="kv-k">{t.rounds.status}</span>
                                 <span className="kv-v">{round.status}</span>

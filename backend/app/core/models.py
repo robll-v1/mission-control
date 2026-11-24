@@ -32,12 +32,47 @@ class ReviewVerdict(StrEnum):
     INCONCLUSIVE = 'inconclusive'
 
 
+class FindingStatus(StrEnum):
+    NEW = 'new'
+    PERSISTENT = 'persistent'
+    UNVERIFIED = 'unverified'
+    LIKELY_FIXED = 'likely_fixed'
+    RESOLVED = 'resolved'
+    DISMISSED = 'dismissed'
+
+
 class ReviewFinding(BaseModel):
     severity: str
     summary: str
     path: str | None = None
     line: int | None = None
     detail: str = ''
+    category: str = ''
+
+
+class TrackedFinding(BaseModel):
+    """First-class finding tracked across review rounds in SQLite."""
+    id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    task_id: str
+    fingerprint: str
+    category: str = ''
+    severity: str
+    path: str | None = None
+    line: int | None = None
+    title: str
+    detail: str = ''
+    first_round: int = 1
+    last_round: int = 1
+    status: FindingStatus = FindingStatus.NEW
+    system_status: FindingStatus = FindingStatus.NEW
+    user_status: FindingStatus | None = None
+    location_changed: bool = False
+    reopened: bool = False
+    mentioned_after_dismiss: bool = False
+    previous_path: str | None = None
+    previous_line: int | None = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
 
 
 class ReviewResult(BaseModel):
@@ -46,6 +81,7 @@ class ReviewResult(BaseModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
     severity_counts: dict[str, int] = Field(default_factory=dict)
     finding_count: int = 0
+    parse_mode: str = 'markdown'
     source_event_seq: int | None = None
     supersedes_round_index: int | None = None
 
