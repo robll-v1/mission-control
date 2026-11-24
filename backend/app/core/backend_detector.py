@@ -227,11 +227,16 @@ class BackendDetector:
     @staticmethod
     def _run_command(cmd: list[str], timeout: int = 5) -> tuple[bool, str]:
         """Run a command and return (success, output)."""
+        from app.adapters.base import resolve_executable
+
+        resolved_cmd = [resolve_executable(cmd[0]), *cmd[1:]] if cmd else cmd
         try:
             result = subprocess.run(
-                cmd,
+                resolved_cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=timeout,
             )
             return result.returncode == 0, result.stdout.strip()

@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import json
 
-from app.adapters.base import AdapterEvent, RunnerAdapter, resolve_executable, validate_model_name
+from app.adapters.base import (
+    AdapterEvent,
+    RunnerAdapter,
+    resolve_executable,
+    validate_model_name,
+    validate_reasoning_level,
+)
 from app.core.models import Task
 
 
@@ -15,6 +21,8 @@ class CopilotAdapter(RunnerAdapter):
 
     def __init__(self, model: str | None = None, variant: str | None = None, reasoning: str | None = None):
         self.model = validate_model_name(model)
+        # Validate format consistently across all adapters before degrading.
+        validate_reasoning_level(reasoning if reasoning is not None else variant)
         # Copilot CLI does not expose reasoning effort; degrade cleanly to CLI default.
         self.variant = None
         self.reasoning = None

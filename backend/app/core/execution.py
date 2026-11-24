@@ -40,6 +40,18 @@ from app.services.review_result_service import ReviewResultService
 logger = logging.getLogger(__name__)
 
 
+def _strip_embedded_review_focus(description: str, old_focus: str) -> str:
+    """Remove a stale baked-in review focus block when a round overrides focus."""
+    cleaned_old = old_focus.strip()
+    if not description or not cleaned_old:
+        return description
+    updated = description.replace(f'\n\n## Review Focus\n{cleaned_old}', '')
+    updated = updated.replace(f'\nReview focus: {cleaned_old}', '')
+    if updated == f'Review focus: {cleaned_old}':
+        updated = ''
+    return updated
+
+
 class IdleTimeoutError(RuntimeError):
     pass
 
@@ -134,20 +146,10 @@ class ExecutionService:
         task = self.db.get_task(task_id)
         if task is None:
             raise KeyError(f'task not found: {task_id}')
-        # If the execution service carries constructor-level defaults (e.g.
-        # ReviewEngine(backend=..., model=..., reasoning=...)) and the task did
-        # not record its own model/reasoning, apply them at the review layer
-        # only when the task's backend matches (SettingsResolver then handles
-        # explicit round overrides and cross-agent isolation cleanly).
-        default_matches_task = (
-            self._default_backend is None or self._default_backend == task.backend
-        )
-        eff_review_model = task.model if task.model is not None else (
-            self._default_model if default_matches_task else None
-        )
-        eff_review_reasoning = task.reasoning if task.reasoning is not None else (
-            self._default_reasoning if default_matches_task else None
-        )
+        # Constructor-level explicit defaults (e.g. ReviewEngine / `amc review
+        # --model --reasoning`) sit ABOVE env (AMC_MODEL/AMC_REASONING) for the
+        # matching agent, while still yielding to explicit per-round overrides
+        # (including `None` resets) and isolating cleanly on cross-agent switches.
         settings = SettingsResolver.resolve(
             task.repo_path,
             round_agent=backend,
@@ -156,9 +158,12 @@ class ExecutionService:
             round_language=language,
             round_focus=review_focus,
             round_note=review_note,
+            explicit_agent=self._default_backend,
+            explicit_model=self._default_model,
+            explicit_reasoning=self._default_reasoning,
             review_agent=task.backend,
-            review_model=eff_review_model,
-            review_reasoning=eff_review_reasoning,
+            review_model=task.model,
+            review_reasoning=task.reasoning,
             review_language=task.language,
             review_focus=task.review_focus,
         )
@@ -270,11 +275,19 @@ class ExecutionService:
         task.branch_name = branch_name
         task.worktree_path = worktree_path
         # Compile context & build prompt with this round's effective backend
-        # and review_focus so per-round focus overrides actually enter the prompt.
+        # and review_focus. When a round overrides focus, strip any stale
+        # baked-in focus section from description so the model does not receive
+        # conflicting instructions.
+        round_description = (
+            _strip_embedded_review_focus(task.description, task.review_focus)
+            if effective_settings.focus != task.review_focus
+            else task.description
+        )
         round_task = task.model_copy(
             update={
                 'backend': effective_settings.agent,
                 'review_focus': effective_settings.focus,
+                'description': round_description,
             }
         )
         compile_started_at = time.perf_counter()

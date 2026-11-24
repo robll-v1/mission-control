@@ -236,6 +236,11 @@ class SettingsResolver:
         round_language: str | None | _UnsetType = UNSET,
         round_focus: str | None = None,
         round_note: str | None = None,
+        # Explicit CLI / SDK constructor overrides (beats env for matching agent;
+        # still overridden by per-round overrides and isolated on agent switch)
+        explicit_agent: str | None = None,
+        explicit_model: str | None = None,
+        explicit_reasoning: str | None = None,
         # Review (task)-level defaults
         review_agent: str | None = None,
         review_model: str | None = None,
@@ -262,6 +267,7 @@ class SettingsResolver:
         # 1. Resolve agent
         configured_default_agent = repo_default_agent or global_default_agent or default_agent
         cleaned_round_agent = None if isinstance(round_agent, _UnsetType) else _clean_opt(round_agent)
+        cleaned_explicit_agent = _clean_opt(explicit_agent)
         cleaned_review_agent = _clean_opt(review_agent)
         if cleaned_round_agent:
             selected_agent = cleaned_round_agent
@@ -269,6 +275,9 @@ class SettingsResolver:
         elif cleaned_review_agent:
             selected_agent = cleaned_review_agent
             agent_source = 'review'
+        elif cleaned_explicit_agent:
+            selected_agent = cleaned_explicit_agent
+            agent_source = 'explicit'
         elif repo_default_agent:
             selected_agent = repo_default_agent
             agent_source = 'repo'
@@ -280,18 +289,25 @@ class SettingsResolver:
             agent_source = 'default'
 
         # Cross-agent guard:
+        # - Explicit constructor/CLI model/reasoning apply only when the selected
+        #   agent still matches the explicit/base agent (beats env).
         # - Review-level model/reasoning only apply when the selected agent
         #   still matches the review's agent.
         # - AMC_MODEL / AMC_REASONING belong to AMC_BACKEND (when set) or the
-        #   base agent (review agent, else configured default). Switching to a
-        #   different agent must NOT carry over another agent's env vars.
+        #   base agent (review agent, else explicit agent, else configured
+        #   default). Switching to another agent must NOT inherit env vars.
+        base_agent = cleaned_review_agent or cleaned_explicit_agent or configured_default_agent
+        explicit_owner = cleaned_explicit_agent or base_agent
+        explicit_matches_agent = selected_agent == explicit_owner
+        effective_explicit_model = _clean_opt(explicit_model) if explicit_matches_agent else None
+        effective_explicit_reasoning = _clean_opt(explicit_reasoning) if explicit_matches_agent else None
+
         review_matches_agent = (
             cleaned_review_agent is not None and cleaned_review_agent == selected_agent
         )
         effective_review_model = _clean_opt(review_model) if review_matches_agent else None
         effective_review_reasoning = _clean_opt(review_reasoning) if review_matches_agent else None
 
-        base_agent = cleaned_review_agent or configured_default_agent
         env_owner_agent = _clean_opt(os.environ.get('AMC_BACKEND', '')) or base_agent
         env_applies = selected_agent == env_owner_agent
 
@@ -304,6 +320,9 @@ class SettingsResolver:
         if not isinstance(round_model, _UnsetType):
             resolved_model = _clean_opt(round_model)
             model_source = 'round'
+        elif effective_explicit_model:
+            resolved_model = effective_explicit_model
+            model_source = 'explicit'
         elif env_model:
             resolved_model = env_model
             model_source = 'env'
@@ -324,6 +343,9 @@ class SettingsResolver:
         if not isinstance(round_reasoning, _UnsetType):
             resolved_reasoning = _clean_opt(round_reasoning)
             reasoning_source = 'round'
+        elif effective_explicit_reasoning:
+            resolved_reasoning = effective_explicit_reasoning
+            reasoning_source = 'explicit'
         elif env_reasoning:
             resolved_reasoning = env_reasoning
             reasoning_source = 'env'

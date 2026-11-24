@@ -713,15 +713,110 @@ def test_codex_detector_honors_codex_home_and_current_ignores_non_string_values(
     assert info.reasoning_default is None  # per-model default lives in model_reasoning
     assert info.model_reasoning['gpt-custom-home'] == {'levels': ['low', 'high'], 'default': 'high'}
 
-    # Non-string values in YAML must never be stringified by /api/config/current
+    # Non-string values (including backend.default) must never be coerced to strings by /api/config/current
     save_global_config({
         'backend': {
-            'default': 'codex',
+            'default': 123,
             'codex': {'model': {'nested': 'secret'}, 'reasoning': 123},
         }
     })
     cur = routes_config.get_current_config()['config']
+    assert cur['backend'] == 'opencode'  # fell back to DEFAULT_CONFIG['backend']['default']
     assert cur['model'] is None
     assert cur['reasoning'] is None
     assert 'secret' not in str(cur)
 
+
+def test_sdk_explicit_flags_beat_env_and_round_focus_strips_stale_focus(git_repo, tmp_path, isolated_config, monkeypatch):
+    from app.sdk import ReviewEngine
+
+    (git_repo / 'a.txt').write_text('round2 test\n', encoding='utf-8')
+    monkeypatch.setenv('AMC_MODEL', 'env-model')
+    monkeypatch.setenv('AMC_REASONING', 'low')
+
+    seen: list[tuple[str, str | None, str | None, str]] = []
+
+    class _CaptureAdapter(_RecordingAdapter):
+        def make_command(self, *, task, prompt):
+            seen.append((self.name, self.model, self.reasoning, prompt))
+            return super().make_command(task=task, prompt=prompt)
+
+    engine = ReviewEngine(
+        db_path=str(tmp_path / 'sdk_env.db'),
+        runtime_root=str(tmp_path / 'rt_env'),
+        backend='codex',
+        model='flag-model',
+        reasoning='xhigh',
+    )
+    engine._execution.adapter_factory = (
+        lambda name, *, model=None, variant=None, reasoning=None, _resolved=False: _CaptureAdapter(
+            name, model=model, reasoning=reasoning if reasoning is not None else variant,
+        )
+    )
+
+    def _wait_idle(task_id: str) -> None:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if not engine._execution.is_active(task_id):
+                return
+            time.sleep(0.05)
+        pytest.fail('round did not finish in time')
+
+    try:
+        task = engine.create_task(str(git_repo), review_focus='old-focus-alpha')
+        # Round 1: explicit constructor --model/--reasoning MUST beat AMC_MODEL/AMC_REASONING
+        r1 = engine.start_review(task.id)
+        _wait_idle(task.id)
+        assert r1.model == 'flag-model'
+        assert r1.reasoning == 'xhigh'
+        assert r1.settings.sources['model'] == 'explicit'
+        assert r1.settings.sources['reasoning'] == 'explicit'
+        assert 'old-focus-alpha' in seen[0][3]
+
+        # Round 2: overriding review_focus must replace stale embedded focus in prompt
+        engine._execution.start_task(task.id, review_focus='new-focus-beta')
+        _wait_idle(task.id)
+        assert 'new-focus-beta' in seen[1][3]
+        assert 'old-focus-alpha' not in seen[1][3]
+    finally:
+        engine._db.close()
+
+
+def test_check_agent_rejects_unsupported_claude_effort_and_invalid_copilot_reasoning(tmp_path, isolated_config, monkeypatch):
+    from app.core.backend_detector import BackendInfo
+
+    client = _config_client()
+    monkeypatch.setattr(routes_config.shutil, 'which', lambda name: f'/usr/local/bin/{name}')
+    monkeypatch.setattr(
+        routes_config,
+        'run_text',
+        lambda cmd, timeout=15: subprocess.CompletedProcess(cmd, 0, stdout='2.0.0 (Claude Code)\n', stderr=''),
+    )
+    monkeypatch.setattr(
+        routes_config.BackendDetector,
+        'detect_backend',
+        staticmethod(lambda _n: BackendInfo(
+            'claude-code', 'claude', '2.0.0', [],
+            reasoning_supported=False,
+            reasoning_source='unsupported',
+            reasoning_note='This Claude Code CLI version did not advertise --effort in `--help`.',
+        )),
+    )
+
+    res = client.post('/api/config/check-agent', json={'backend': 'claude-code', 'reasoning': 'high'})
+    assert res.status_code == 200
+    assert res.json()['ok'] is False
+    assert 'not supported' in res.json()['message']
+
+    # Copilot validates reasoning format consistently (422 on invalid chars)
+    bad_cop = client.post('/api/config/check-agent', json={'backend': 'copilot', 'reasoning': 'bad;rm'})
+    assert bad_cop.status_code == 422
+
+    # /effective rejects fake .git directory without HEAD and oversized .amc.yaml (>1 MiB)
+    fake_repo = tmp_path / 'fake_git'
+    (fake_repo / '.git').mkdir(parents=True)
+    assert client.get('/api/config/effective', params={'repo_path': str(fake_repo)}).status_code == 400
+
+    (fake_repo / '.git' / 'HEAD').write_text('ref: refs/heads/main\n', encoding='utf-8')
+    (fake_repo / '.amc.yaml').write_text('x' * 1_100_000, encoding='utf-8')
+    assert client.get('/api/config/effective', params={'repo_path': str(fake_repo)}).status_code == 400

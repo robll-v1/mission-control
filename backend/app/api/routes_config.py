@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from app.adapters import get_adapter
 from app.core.backend_detector import BackendDetector, ModelFilter
 from app.core.config import (
+    _MAX_CONFIG_BYTES,
     DEFAULT_CONFIG,
     UNSET,
     ConfigError,
@@ -156,7 +157,12 @@ def get_current_config():
         section = config.get('backend', {}) if isinstance(config, dict) else {}
         if not isinstance(section, dict):
             section = {}
-        backend = str(section.get('default') or defaults['default'])
+        raw_default = section.get('default')
+        backend = (
+            raw_default.strip()
+            if isinstance(raw_default, str) and raw_default.strip()
+            else defaults['default']
+        )
         selected = section.get(backend, {})
         if not isinstance(selected, dict):
             selected = {}
@@ -194,6 +200,19 @@ def get_current_config():
         raise HTTPException(status_code=500, detail=f'Failed to load config: {str(e)}')
 
 
+def _is_git_repo_dir(resolved_root: Path) -> bool:
+    git_entry = resolved_root / '.git'
+    if git_entry.is_dir():
+        return (git_entry / 'HEAD').is_file()
+    if git_entry.is_file():
+        try:
+            first_line = git_entry.read_text(encoding='utf-8', errors='replace').splitlines()[0].strip()
+        except (OSError, IndexError):
+            return False
+        return first_line.startswith('gitdir:')
+    return False
+
+
 def _validate_effective_repo_path(repo_path: str | None) -> str | None:
     if repo_path is None or not repo_path.strip():
         return None
@@ -201,7 +220,7 @@ def _validate_effective_repo_path(repo_path: str | None) -> str | None:
     if not root.exists() or not root.is_dir():
         raise HTTPException(status_code=400, detail='repo_path must be an existing directory')
     resolved_root = root.resolve()
-    if not (resolved_root / '.git').exists():
+    if not _is_git_repo_dir(resolved_root):
         raise HTTPException(status_code=400, detail='repo_path must be a git repository')
     cfg_path = resolved_root / '.amc.yaml'
     if cfg_path.exists() or cfg_path.is_symlink():
@@ -212,6 +231,8 @@ def _validate_effective_repo_path(repo_path: str | None) -> str | None:
             raise HTTPException(status_code=400, detail=f'unreadable .amc.yaml: {exc}') from exc
         if not resolved_cfg.is_relative_to(resolved_root) or not stat.S_ISREG(st.st_mode):
             raise HTTPException(status_code=400, detail='.amc.yaml must be a regular file inside repo_path')
+        if st.st_size > _MAX_CONFIG_BYTES:
+            raise HTTPException(status_code=400, detail='.amc.yaml exceeds maximum allowed size')
     return str(resolved_root)
 
 
@@ -320,6 +341,21 @@ def check_agent(request: CheckAgentRequest):
     if effective_reasoning is not None:
         detected = BackendDetector.detect_backend(backend_name)
         if detected is not None:
+            if not detected.reasoning_supported and detected.reasoning_source == 'unsupported':
+                return CheckAgentResponse(
+                    ok=False,
+                    backend=backend_name,
+                    executable=executable,
+                    command=cmd,
+                    exit_code=result.returncode,
+                    message=(
+                        f'CLI check passed ({detail or backend_name}), but reasoning effort '
+                        f'{effective_reasoning!r} is not supported by this {backend_name} installation. '
+                        f'{detected.reasoning_note or ""}'
+                    ).strip(),
+                    model=adapter.model,
+                    reasoning=effective_reasoning,
+                )
             allowed: list[str] = []
             if adapter.model and adapter.model in detected.model_reasoning:
                 allowed = list(detected.model_reasoning[adapter.model].get('levels') or [])
