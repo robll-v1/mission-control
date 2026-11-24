@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import {
+  computeOverflowResyncDelayMs,
   isImportantEvent,
   mergeEventLists,
   mergeStreamEvent,
@@ -78,4 +79,17 @@ test('mergeEventLists preserves buffered SSE events when initial or stale GET sn
   assert.deepEqual(merged.events.map((e) => e.seq), [1, 2, 3])
   assert.deepEqual(merged.importantEvents.map((e) => e.seq), [1, 2])
   assert.deepEqual(merged.eventStats, { all_count: 3, important_count: 2, hidden_count: 1 })
+})
+
+test('computeOverflowResyncDelayMs backs off exponentially and caps at 10s', () => {
+  assert.equal(computeOverflowResyncDelayMs(0, true), 0)
+  assert.equal(computeOverflowResyncDelayMs(0, false), 500)
+  assert.equal(computeOverflowResyncDelayMs(1, true), 500)
+  assert.equal(computeOverflowResyncDelayMs(1, false), 500)
+  assert.equal(computeOverflowResyncDelayMs(2, false), 1000)
+  assert.equal(computeOverflowResyncDelayMs(3, false), 2000)
+  assert.equal(computeOverflowResyncDelayMs(4, false), 4000)
+  assert.equal(computeOverflowResyncDelayMs(5, false), 8000)
+  assert.equal(computeOverflowResyncDelayMs(6, false), 10_000)
+  assert.equal(computeOverflowResyncDelayMs(20, false), 10_000)
 })

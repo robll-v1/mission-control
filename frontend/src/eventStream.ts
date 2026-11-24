@@ -40,6 +40,22 @@ const LIFECYCLE_REFRESH_KINDS = new Set([
   'error',
 ])
 
+export const OVERFLOW_RESYNC_BASE_DELAY_MS = 500
+export const OVERFLOW_RESYNC_MAX_DELAY_MS = 10_000
+
+/**
+ * Exponential backoff for silent overflow-resync retries.
+ * The very first resync after a stale GET snapshot runs immediately (0ms);
+ * subsequent retries after failures or still-stale snapshots back off from
+ * 500ms up to 10s so fast-failing GETs never cause a request storm.
+ */
+export function computeOverflowResyncDelayMs(attempt: number, immediate = false): number {
+  const safeAttempt = Math.max(0, Math.floor(attempt))
+  if (immediate && safeAttempt === 0) return 0
+  const exp = Math.min(safeAttempt > 0 ? safeAttempt - 1 : 0, 5)
+  return Math.min(OVERFLOW_RESYNC_BASE_DELAY_MS * 2 ** exp, OVERFLOW_RESYNC_MAX_DELAY_MS)
+}
+
 export function isImportantEvent(event: StreamEventRecord): boolean {
   if (NOISY_EVENT_KINDS.has(event.kind)) return false
   if (event.kind === 'agent.tool_use' && event.level === 'info') {

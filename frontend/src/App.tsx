@@ -15,6 +15,7 @@ import {
   type ReviewLanguage,
 } from './i18n'
 import {
+  computeOverflowResyncDelayMs,
   mergeEventLists,
   mergeStreamEvent,
   parseStreamEventPayload,
@@ -404,7 +405,12 @@ export function App() {
   const findingSeqRef = useRef<Map<string, number>>(new Map())
   const streamEventsByTaskRef = useRef<Map<string, EventRecord[]>>(new Map())
   const streamOverflowCutoffByTaskRef = useRef<Map<string, number>>(new Map())
-  const inFlightLoadsByTaskRef = useRef<Map<string, number>>(new Map())
+  const activeLoadSeqByTaskRef = useRef<Map<string, number>>(new Map())
+  const overflowResyncTimerByTaskRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  const overflowRetryAttemptByTaskRef = useRef<Map<string, number>>(new Map())
+  const loadTaskRef = useRef<(taskId: string, options?: { silent?: boolean; isOverflowResync?: boolean }) => Promise<void>>(
+    async () => {},
+  )
   const [startingTaskIds, setStartingTaskIds] = useState<string[]>([])
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'light'
@@ -481,14 +487,51 @@ export function App() {
     }
   }, [])
 
+  const clearOverflowResync = useCallback((taskId: string, options?: { clearCutoff?: boolean }) => {
+    const timer = overflowResyncTimerByTaskRef.current.get(taskId)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      overflowResyncTimerByTaskRef.current.delete(taskId)
+    }
+    if (options?.clearCutoff) {
+      streamOverflowCutoffByTaskRef.current.delete(taskId)
+      overflowRetryAttemptByTaskRef.current.delete(taskId)
+    }
+  }, [])
+
+  const scheduleOverflowResync = useCallback((taskId: string, options?: { immediate?: boolean }) => {
+    if (selectedTaskIdRef.current !== taskId) return
+    if ((streamOverflowCutoffByTaskRef.current.get(taskId) ?? 0) <= 0) return
+    if (overflowResyncTimerByTaskRef.current.has(taskId)) return
+    const attempt = overflowRetryAttemptByTaskRef.current.get(taskId) ?? 0
+    const delayMs = computeOverflowResyncDelayMs(attempt, Boolean(options?.immediate))
+    overflowRetryAttemptByTaskRef.current.set(taskId, attempt + 1)
+    const timer = setTimeout(() => {
+      overflowResyncTimerByTaskRef.current.delete(taskId)
+      if (selectedTaskIdRef.current !== taskId) return
+      if ((streamOverflowCutoffByTaskRef.current.get(taskId) ?? 0) <= 0) return
+      if (activeLoadSeqByTaskRef.current.has(taskId)) return
+      void loadTaskRef.current(taskId, { silent: true, isOverflowResync: true })
+    }, delayMs)
+    overflowResyncTimerByTaskRef.current.set(taskId, timer)
+  }, [])
+
   const loadTask = useCallback(async (taskId: string, options?: { silent?: boolean; isOverflowResync?: boolean }) => {
     if (selectedTaskIdRef.current !== taskId) return
+    clearOverflowResync(taskId)
     const nextSeq = (loadSeqByTaskRef.current.get(taskId) ?? 0) + 1
     loadSeqByTaskRef.current.set(taskId, nextSeq)
-    inFlightLoadsByTaskRef.current.set(taskId, (inFlightLoadsByTaskRef.current.get(taskId) ?? 0) + 1)
+    activeLoadSeqByTaskRef.current.set(taskId, nextSeq)
+    let needsOverflowRetry = false
+    let immediateOverflowRetry = false
     try {
       const data = normalizeTaskDetail(await api<TaskDetailResponse>(`/api/tasks/${taskId}`))
-      if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
+      if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) {
+        if (selectedTaskIdRef.current === taskId && (streamOverflowCutoffByTaskRef.current.get(taskId) ?? 0) > 0) {
+          needsOverflowRetry = true
+        }
+        return
+      }
       const rawMaxFetchedSeq = data.events.reduce((max, ev) => Math.max(max, ev.seq), 0)
       const buffered = streamEventsByTaskRef.current.get(taskId) ?? []
       if (buffered.length > 0) {
@@ -518,29 +561,41 @@ export function App() {
       })
       // Keep the overflow cutoff armed until a server snapshot actually covers
       // all evicted events (`rawMaxFetchedSeq >= overflowCutoff`). If this resync
-      // fails or stays stale, subsequent SSE events will retry cleanly.
+      // fails or stays stale, schedule a single exponentially backed-off retry so
+      // recovery completes even if the SSE stream goes quiet and never storms GETs.
       const overflowCutoff = streamOverflowCutoffByTaskRef.current.get(taskId) ?? 0
       if (overflowCutoff > 0) {
         if (rawMaxFetchedSeq >= overflowCutoff) {
-          streamOverflowCutoffByTaskRef.current.delete(taskId)
-        } else if (!options?.isOverflowResync && selectedTaskIdRef.current === taskId) {
-          void loadTask(taskId, { silent: true, isOverflowResync: true })
+          clearOverflowResync(taskId, { clearCutoff: true })
+        } else {
+          needsOverflowRetry = true
+          immediateOverflowRetry = !options?.isOverflowResync
         }
       }
     } catch (err) {
+      if (selectedTaskIdRef.current === taskId && (streamOverflowCutoffByTaskRef.current.get(taskId) ?? 0) > 0) {
+        needsOverflowRetry = true
+      }
       if (selectedTaskIdRef.current !== taskId || loadSeqByTaskRef.current.get(taskId) !== nextSeq) return
       if (!options?.silent) {
         setNotice({ tone: 'error', text: errorMessage(err, (t) => t.errors.loadReview) })
       }
     } finally {
-      const remainingLoads = (inFlightLoadsByTaskRef.current.get(taskId) ?? 1) - 1
-      if (remainingLoads > 0) {
-        inFlightLoadsByTaskRef.current.set(taskId, remainingLoads)
-      } else {
-        inFlightLoadsByTaskRef.current.delete(taskId)
+      // Track only the latest loadTask sequence per task so superseded, stalled
+      // GET requests can never wedge overflow recovery.
+      if (activeLoadSeqByTaskRef.current.get(taskId) === nextSeq) {
+        activeLoadSeqByTaskRef.current.delete(taskId)
+        if (
+          needsOverflowRetry &&
+          selectedTaskIdRef.current === taskId &&
+          (streamOverflowCutoffByTaskRef.current.get(taskId) ?? 0) > 0
+        ) {
+          scheduleOverflowResync(taskId, { immediate: immediateOverflowRetry })
+        }
       }
     }
-  }, [])
+  }, [clearOverflowResync, scheduleOverflowResync])
+  loadTaskRef.current = loadTask
 
   const loadConfigMeta = useCallback(async () => {
     const seq = ++configSeqRef.current
@@ -689,9 +744,9 @@ export function App() {
         void refreshTasks({ silent: true })
       } else if (
         (streamOverflowCutoffByTaskRef.current.get(selectedTaskId) ?? 0) > 0 &&
-        (inFlightLoadsByTaskRef.current.get(selectedTaskId) ?? 0) === 0
+        !activeLoadSeqByTaskRef.current.has(selectedTaskId)
       ) {
-        void loadTask(selectedTaskId, { silent: true, isOverflowResync: true })
+        scheduleOverflowResync(selectedTaskId)
       }
     }
 
@@ -702,10 +757,11 @@ export function App() {
     }
 
     return () => {
+      clearOverflowResync(selectedTaskId)
       source.close()
       eventSourceRef.current = null
     }
-  }, [selectedTaskId, loadTask, refreshTasks])
+  }, [selectedTaskId, loadTask, refreshTasks, clearOverflowResync, scheduleOverflowResync])
 
   useEffect(() => {
     if (!showModal) return
