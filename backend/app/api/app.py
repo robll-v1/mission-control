@@ -90,7 +90,7 @@ _prune_startup_worktrees()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Graceful shutdown: abort all running tasks before exit."""
+    """Graceful shutdown: abort all running tasks and close SSE streams before exit."""
     yield
     # ── shutdown ──
     active_ids = list(execution._active.keys())
@@ -102,6 +102,7 @@ async def lifespan(app: FastAPI):
                 logger.info('Aborted task %s', task_id)
             except Exception:
                 logger.exception('Failed to abort task %s during shutdown', task_id)
+    engine.event_bus.close_all()
     logger.info('Shutdown complete.')
 
 

@@ -15,6 +15,11 @@ import {
   type ReviewLanguage,
 } from './i18n'
 import {
+  mergeStreamEvent,
+  parseStreamEventPayload,
+  shouldRefreshTaskOnEvent,
+} from './eventStream'
+import {
   applyUpdatedFinding,
   buildFixPrompt,
   computeFindingCounts,
@@ -584,11 +589,47 @@ export function App() {
     eventSourceRef.current?.close()
     const source = new EventSource(`/api/tasks/${selectedTaskId}/stream`)
     eventSourceRef.current = source
-    source.onmessage = () => {
-      void loadTask(selectedTaskId, { silent: true })
-      void refreshTasks({ silent: true })
+    let hadError = false
+
+    source.onopen = () => {
+      if (hadError) {
+        hadError = false
+        // Resync task/findings/rounds cleanly after an automatic Last-Event-ID reconnect.
+        void loadTask(selectedTaskId, { silent: true })
+        void refreshTasks({ silent: true })
+      }
     }
-    source.onerror = () => source.close()
+
+    source.onmessage = (msg) => {
+      const parsed = parseStreamEventPayload(msg.data)
+      if (!parsed) {
+        void loadTask(selectedTaskId, { silent: true })
+        void refreshTasks({ silent: true })
+        return
+      }
+      setDetail((prev) => {
+        if (!prev || prev.task.id !== selectedTaskId) return prev
+        const merged = mergeStreamEvent(prev.events, prev.importantEvents, parsed)
+        if (!merged.changed) return prev
+        return {
+          ...prev,
+          events: merged.events,
+          importantEvents: merged.importantEvents,
+          eventStats: merged.eventStats,
+        }
+      })
+      if (shouldRefreshTaskOnEvent(parsed)) {
+        void loadTask(selectedTaskId, { silent: true })
+        void refreshTasks({ silent: true })
+      }
+    }
+
+    // Do NOT close on transient errors so browser EventSource automatically
+    // reconnects with the `Last-Event-ID` header.
+    source.onerror = () => {
+      hadError = true
+    }
+
     return () => {
       source.close()
       eventSourceRef.current = null

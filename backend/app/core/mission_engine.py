@@ -3,12 +3,14 @@ from __future__ import annotations
 import time
 
 from app.core.db import Database
+from app.core.event_bus import EventBus
 from app.core.models import Event, EventLevel, Task, TaskStatus
 
 
 class MissionEngine:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, event_bus: EventBus | None = None):
         self.db = db
+        self.event_bus = event_bus if event_bus is not None else EventBus()
 
     def create_task(
         self,
@@ -121,21 +123,15 @@ class MissionEngine:
         run_id: str | None = None,
         touch_task: bool = True,
     ) -> Event:
-        with self.db.locked():
-            seq = len(self.db.list_events(task_id)) + 1
-            event = Event(
-                task_id=task_id,
-                run_id=run_id,
-                seq=seq,
-                ts=time.time(),
-                kind=kind,
-                level=level,
-                payload=payload,
-            )
-            self.db.append_event(event)
-            if touch_task:
-                task = self.db.get_task(task_id)
-                if task is not None:
-                    task.updated_at = event.ts
-                    self.db.save_task(task)
-            return event
+        event = self.db.append_event_auto_seq(
+            task_id=task_id,
+            kind=kind,
+            payload=payload,
+            level=level,
+            run_id=run_id,
+            touch_task=touch_task,
+        )
+        # Publish AFTER the DB commit so any subscriber that queries SQLite
+        # (e.g. overflow resync or gap catch-up) is guaranteed to see it.
+        self.event_bus.publish(event)
+        return event
