@@ -184,13 +184,20 @@ def _resolve_editor_binary(editor: str | None) -> tuple[str, str]:
     )
 
 
-def build_editor_argv(editor_key: str, binary: str, target: Path, line: int | None = None) -> list[str]:
+def build_editor_argv(
+    editor_key: str,
+    binary: str,
+    target: Path,
+    line: int | None = None,
+    *,
+    platform: str | None = None,
+) -> list[str]:
     """Build a safe argv list (never a shell string) for an allowlisted native editor.
 
     ``target`` is used as-is without re-resolving symlinks so the caller's already
     validated path is passed directly.
     """
-    if not _is_trusted_native_binary(binary):
+    if not _is_trusted_native_binary(binary, platform=platform):
         raise EditorNotAllowedError(f'editor binary {binary!r} is not a trusted native executable')
     abs_target = str(target)
     valid_line = int(line) if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None

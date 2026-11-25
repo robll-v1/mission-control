@@ -1,6 +1,7 @@
 """P6 backend tests: safe Open-in-Editor, file snippets, atomic deletion & concurrency, diff, storage & repo status."""
 from __future__ import annotations
 
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,14 +39,23 @@ def test_open_in_editor_blocks_traversal_symlink_and_unlisted_editors(tmp_path, 
     except OSError:
         has_symlink = False
 
+    fake_code_bin = (
+        r'C:\Program Files\Microsoft VS Code\Code.exe'
+        if sys.platform == 'win32'
+        else '/usr/local/bin/code'
+    )
     spawned: list[list[str]] = []
-    monkeypatch.setattr(editor_service.shutil, 'which', lambda name: f'/usr/local/bin/{name}' if name == 'code' else None)
+    monkeypatch.setattr(
+        editor_service,
+        '_locate_native_editor_binary',
+        lambda key, **kw: fake_code_bin if key == 'code' else None,
+    )
     monkeypatch.setattr(editor_service, '_spawn_editor', lambda argv: spawned.append(argv))
 
     # Valid relative file + line works with explicit argv (never shell)
     res = editor_service.open_in_editor(str(repo), 'notes.py', line=2, editor='code')
     assert res == {'ok': True, 'editor': 'code', 'path': 'notes.py', 'line': 2}
-    assert spawned == [['/usr/local/bin/code', '--goto', f'{inside.resolve()}:2']]
+    assert spawned == [[fake_code_bin, '--goto', f'{inside.resolve()}:2']]
 
     # Path traversal blocked
     with pytest.raises(editor_service.PathAccessError):
@@ -72,7 +82,7 @@ def test_open_in_editor_blocks_traversal_symlink_and_unlisted_editors(tmp_path, 
             editor_service.open_in_editor(str(repo), 'notes.py', editor=bad_editor)
 
     # macOS fallback `open` always passes `-t` so scripts/bundles are never executed
-    assert editor_service.build_editor_argv('open', '/usr/bin/open', inside.resolve(), line=2) == [
+    assert editor_service.build_editor_argv('open', '/usr/bin/open', inside.resolve(), line=2, platform='darwin') == [
         '/usr/bin/open',
         '-t',
         str(inside.resolve()),
@@ -195,8 +205,17 @@ def test_p6_task_and_config_endpoints(git_repo, tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, 'artifacts', artifacts)
     monkeypatch.setattr(app_module, 'execution', execution)
 
+    fake_code_bin = (
+        r'C:\Program Files\Microsoft VS Code\Code.exe'
+        if sys.platform == 'win32'
+        else '/usr/bin/code'
+    )
     spawned: list[list[str]] = []
-    monkeypatch.setattr(editor_service, '_locate_native_editor_binary', lambda key, **kw: '/usr/bin/code' if key == 'code' else None)
+    monkeypatch.setattr(
+        editor_service,
+        '_locate_native_editor_binary',
+        lambda key, **kw: fake_code_bin if key == 'code' else None,
+    )
     monkeypatch.setattr(editor_service, '_spawn_editor', lambda argv: spawned.append(argv))
 
     client = TestClient(app_module.app)
@@ -230,7 +249,7 @@ def test_p6_task_and_config_endpoints(git_repo, tmp_path, monkeypatch):
         headers=hdrs,
     )
     assert r_open.status_code == 200
-    assert spawned and spawned[0][:2] == ['/usr/bin/code', '--goto']
+    assert spawned and spawned[0][:2] == [fake_code_bin, '--goto']
     assert client.post(
         f'/api/tasks/{task.id}/open-in-editor',
         json={'path': '../outside', 'line': 1},
@@ -345,7 +364,8 @@ def test_concurrent_delete_and_start_are_mutually_exclusive(git_repo, tmp_path, 
     del_result: dict[str, int] = {}
 
     def run_delete():
-        res = client.delete(f'/api/tasks/{task.id}', headers=hdrs)
+        thread_client = TestClient(app_module.app)
+        res = thread_client.delete(f'/api/tasks/{task.id}', headers=hdrs)
         del_result['status'] = res.status_code
 
     t = threading.Thread(target=run_delete)
@@ -410,8 +430,8 @@ def test_concurrent_validation_blocks_delete_until_finished(git_repo, tmp_path, 
     assert client.post(f'/api/tasks/{task.id}/validate', json={'mode': 'standard'}, headers=hdrs).status_code == 409
 
     release_val.set()
-    # Wait briefly for validation thread's finally block to release the reservation
-    for _ in range(50):
+    # Wait for validation thread's finally block to release the reservation
+    for _ in range(250):
         if not execution.is_active(task.id):
             break
         threading.Event().wait(0.02)
