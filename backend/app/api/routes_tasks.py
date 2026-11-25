@@ -1,3 +1,6 @@
+import os
+import shutil
+import stat
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -5,12 +8,21 @@ from pydantic import BaseModel
 
 from app.core.context_compiler import ContextCompiler
 from app.core.config import resolve_backend_config
+from app.core.execution import ExecutionService
 from app.core.finding_tracker import FindingTracker
 from app.core.github_ingest import fetch_pull_request, is_github_pr_url
 from app.core.mission_engine import MissionEngine
 from app.core.models import FindingStatus, TaskStatus
 from app.schemas.task import CreateTaskRequest
 from app.services.artifact_store import ArtifactStore
+from app.services.diff_service import DiffService
+from app.services.editor_service import (
+    EditorNotAllowedError,
+    EditorUnavailableError,
+    PathAccessError,
+    open_in_editor,
+    read_file_snippet,
+)
 from app.services.local_review_service import build_local_review_source
 from app.services.review_result_service import ReviewResultService
 
@@ -18,6 +30,12 @@ from app.services.review_result_service import ReviewResultService
 class UpdateFindingStatusRequest(BaseModel):
     action: str | None = None
     status: str | None = None
+
+
+class OpenInEditorRequest(BaseModel):
+    path: str
+    line: int | None = None
+    editor: str | None = None
 
 
 def get_engine() -> MissionEngine:
@@ -33,6 +51,11 @@ def get_artifacts() -> ArtifactStore:
 def get_contexts() -> ContextCompiler:
     from app.api.app import contexts
     return contexts
+
+
+def get_execution() -> ExecutionService:
+    from app.api.app import execution
+    return execution
 
 
 def _generated_paths(repo_path: str, mission: MissionEngine, artifacts: ArtifactStore) -> list[str]:
@@ -304,4 +327,214 @@ def update_task_finding(
     return {
         'finding': updated.model_dump(),
         'counts': FindingTracker.counts(all_findings),
+    }
+
+
+def _safe_task_artifact_root(artifact_store: ArtifactStore, task_id: str) -> Path | None:
+    """Return the non-created task artifact directory if ``task_id`` is a safe single path segment."""
+    if not task_id or task_id in ('.', '..') or '/' in task_id or '\\' in task_id or '\x00' in task_id:
+        return None
+    tasks_root = (artifact_store.runtime_root / 'tasks').resolve()
+    entry = tasks_root / task_id
+    if entry.parent != tasks_root:
+        return None
+    return entry
+
+
+def _remove_task_artifact_entry(artifact_store: ArtifactStore, task_id: str) -> None:
+    """Safely remove a task's own artifact directory without following symlinks."""
+    entry = _safe_task_artifact_root(artifact_store, task_id)
+    if entry is None:
+        return
+    try:
+        lst = entry.lstat()
+    except OSError:
+        return
+    if stat.S_ISLNK(lst.st_mode):
+        # Remove only the symlink itself; never recursively delete its target.
+        try:
+            entry.unlink()
+        except OSError:
+            pass
+        return
+    if stat.S_ISDIR(lst.st_mode):
+        shutil.rmtree(entry, ignore_errors=True)
+
+
+@router.delete('/{task_id}')
+def delete_task(
+    task_id: str,
+    mission: MissionEngine = Depends(get_engine),
+    artifact_store: ArtifactStore = Depends(get_artifacts),
+    execution: ExecutionService = Depends(get_execution),
+):
+    # Acquire the shared per-task exclusive slot so neither start_task nor
+    # validation can race with worktree cleanup, DB deletion, or artifact removal.
+    has_reserve = hasattr(execution, 'try_reserve_task') and hasattr(execution, 'release_task')
+    if has_reserve:
+        if not execution.try_reserve_task(task_id, 'deleting'):
+            raise HTTPException(
+                status_code=409,
+                detail='cannot delete an active review; wait or cancel the running operation first',
+            )
+    elif execution.is_active(task_id):
+        raise HTTPException(
+            status_code=409,
+            detail='cannot delete an active review; wait or cancel the running operation first',
+        )
+
+    try:
+        task = mission.db.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail='task not found')
+        if task.status == TaskStatus.VALIDATING:
+            raise HTTPException(
+                status_code=409,
+                detail='cannot delete a review while validation checks are running',
+            )
+
+        # Clean up isolated worktree BEFORE deleting DB state; if cleanup fails or
+        # leaves the worktree behind, abort deletion so the user can retry cleanly.
+        if task.worktree_path:
+            try:
+                cleanup_res = execution.worktrees.cleanup_worktree(task)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f'failed to clean up review worktree: {exc}',
+                ) from exc
+            if isinstance(cleanup_res, dict) and cleanup_res.get('exists_after'):
+                raise HTTPException(
+                    status_code=500,
+                    detail='failed to remove review worktree; delete aborted so you can retry',
+                )
+
+        deleted = mission.db.delete_task(task_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail='task not found')
+
+        _remove_task_artifact_entry(artifact_store, task_id)
+        return {'ok': True, 'deleted_task_id': task_id}
+    finally:
+        if has_reserve:
+            execution.release_task(task_id, 'deleting')
+
+
+@router.post('/{task_id}/open-in-editor')
+def open_task_file_in_editor(
+    task_id: str,
+    request: OpenInEditorRequest,
+    mission: MissionEngine = Depends(get_engine),
+):
+    task = mission.db.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail='task not found')
+    try:
+        return open_in_editor(
+            task.repo_path,
+            request.path,
+            line=request.line,
+            editor=request.editor,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (PathAccessError, EditorNotAllowedError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except EditorUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get('/{task_id}/snippet')
+def get_task_file_snippet(
+    task_id: str,
+    path: str = Query(...),
+    line: int = Query(..., ge=1),
+    context: int = Query(default=2, ge=0, le=10),
+    mission: MissionEngine = Depends(get_engine),
+):
+    task = mission.db.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail='task not found')
+    try:
+        return read_file_snippet(task.repo_path, path, line=line, context=context)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (PathAccessError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+_MAX_DIFF_RESPONSE_BYTES = 250_000
+
+
+def _read_bounded_artifact_text(task_root: Path, rel_path: str, max_bytes: int) -> tuple[str, bool] | None:
+    """Read up to ``max_bytes`` from a regular non-symlink artifact file strictly inside ``task_root``."""
+    try:
+        root_lst = task_root.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(root_lst.st_mode) or not stat.S_ISDIR(root_lst.st_mode):
+        return None
+    resolved_root = task_root.resolve()
+    candidate = resolved_root / rel_path
+    try:
+        resolved_file = candidate.resolve(strict=True)
+        resolved_file.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return None
+
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+    fd = -1
+    try:
+        fd = os.open(str(resolved_file), flags)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        with os.fdopen(fd, 'rb') as handle:
+            fd = -1
+            raw = handle.read(max_bytes + 1)
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    truncated = len(raw) > max_bytes
+    if truncated:
+        raw = raw[:max_bytes]
+    return raw.decode('utf-8', errors='replace'), truncated
+
+
+@router.get('/{task_id}/diff')
+def get_task_diff(
+    task_id: str,
+    mission: MissionEngine = Depends(get_engine),
+    artifact_store: ArtifactStore = Depends(get_artifacts),
+):
+    task = mission.db.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail='task not found')
+    diff_text = ''
+    source = 'none'
+    truncated = False
+    task_root = _safe_task_artifact_root(artifact_store, task_id)
+    if task_root is not None:
+        for rel, label in (
+            ('context/local_diff.patch', 'local_diff'),
+            ('context/pr_diff.patch', 'pr_diff'),
+            (DiffService.EXPORT_DIFF_REL, 'export_diff'),
+        ):
+            read_res = _read_bounded_artifact_text(task_root, rel, _MAX_DIFF_RESPONSE_BYTES)
+            if read_res is not None:
+                diff_text, truncated = read_res
+                source = label
+                break
+    return {
+        'task_id': task_id,
+        'source': source,
+        'changed_files': list(task.review_paths),
+        'diff': diff_text,
+        'truncated': truncated,
     }

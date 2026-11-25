@@ -42,7 +42,12 @@ class ValidateRequest(BaseModel):
 
 @router.post('/{task_id}/validate')
 def validate_task(task_id: str, request: ValidateRequest, validation: ValidationService = Depends(get_validation)):
-    validation.start_validation(task_id, mode=request.mode)
+    try:
+        validation.start_validation(task_id, mode=request.mode)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {'ok': True}
 
 

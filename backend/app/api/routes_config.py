@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.adapters import get_adapter
@@ -484,3 +484,110 @@ def save_config(request: SaveConfigRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Failed to save config: {str(e)}')
+
+
+@router.get('/storage')
+def get_storage_info():
+    """Return platform application data and config paths for the Settings Storage view."""
+    from app.core.config import _global_config_path
+    from app.core.paths import (
+        get_data_dir,
+        get_db_path,
+        get_runtime_dir,
+        get_worktrees_dir,
+        has_bundled_ui,
+    )
+
+    return {
+        'data_dir': str(get_data_dir()),
+        'db_path': str(get_db_path()),
+        'runtime_dir': str(get_runtime_dir()),
+        'worktrees_dir': str(get_worktrees_dir()),
+        'config_path': str(_global_config_path()),
+        'bundled_ui': has_bundled_ui(),
+    }
+
+
+@router.get('/repo-status')
+def get_repo_status(repo_path: str | None = Query(default=None)):
+    """Lightweight read-only preflight for the New Review form (git status + gh auth).
+
+    Security: disables repo-configured external commands (``core.fsmonitor``,
+    ``core.hooksPath``, ``diff.external``, smudge/clean filters) and disables
+    optional index lock writes (``--no-optional-locks`` + ``GIT_OPTIONAL_LOCKS=0``)
+    so probing a user-supplied path never mutates the index or executes untrusted
+    repository config.
+    """
+    import os
+    import shutil
+    from pathlib import Path
+    from app.core.proc import run_text
+
+    gh_bin = shutil.which('gh')
+    gh_authenticated = False
+    if gh_bin:
+        try:
+            res = run_text([gh_bin, 'auth', 'status'], timeout=5)
+            gh_authenticated = res.returncode == 0
+        except Exception:
+            gh_authenticated = False
+
+    info: dict[str, object] = {
+        'repo_path': repo_path or '',
+        'exists': False,
+        'is_git_repo': False,
+        'branch': None,
+        'changed_files': 0,
+        'gh_available': bool(gh_bin),
+        'gh_authenticated': gh_authenticated,
+    }
+    raw_repo = (repo_path or '').strip()
+    if not raw_repo:
+        return info
+    candidate = Path(raw_repo).expanduser()
+    if not candidate.is_dir():
+        return info
+    info['exists'] = True
+    safe_git_prefix = [
+        'git',
+        '--no-optional-locks',
+        '-c', 'core.fsmonitor=false',
+        '-c', 'core.untrackedCache=false',
+        '-c', 'core.hooksPath=',
+        '-c', 'core.sshCommand=false',
+        '-c', 'diff.external=',
+        '-c', 'filter.lfs.process=',
+        '-c', 'filter.lfs.smudge=',
+        '-c', 'filter.lfs.clean=',
+    ]
+    safe_env = {**os.environ, 'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0'}
+    try:
+        git_check = run_text(
+            [*safe_git_prefix, 'rev-parse', '--is-inside-work-tree'],
+            cwd=str(candidate),
+            env=safe_env,
+            timeout=5,
+        )
+        if git_check.returncode != 0 or (git_check.stdout or '').strip() != 'true':
+            return info
+        info['is_git_repo'] = True
+        branch_res = run_text(
+            [*safe_git_prefix, 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=str(candidate),
+            env=safe_env,
+            timeout=5,
+        )
+        if branch_res.returncode == 0:
+            info['branch'] = (branch_res.stdout or '').strip() or None
+        status_res = run_text(
+            [*safe_git_prefix, 'status', '--porcelain'],
+            cwd=str(candidate),
+            env=safe_env,
+            timeout=5,
+        )
+        if status_res.returncode == 0:
+            lines = [ln for ln in (status_res.stdout or '').splitlines() if ln.strip()]
+            info['changed_files'] = len(lines)
+    except Exception:
+        pass
+    return info

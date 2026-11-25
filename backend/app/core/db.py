@@ -617,3 +617,31 @@ class Database:
             self.conn.execute('DELETE FROM findings WHERE task_id = ?', (task_id,))
             self.conn.execute('DELETE FROM finding_sync_state WHERE task_id = ?', (task_id,))
             self.conn.commit()
+
+    def delete_task(self, task_id: str) -> bool:
+        """Atomically delete a task and all of its runs, events, checks, and findings."""
+        with self._lock:
+            in_outer_tx = self.conn.in_transaction
+            self.conn.execute('SAVEPOINT amc_delete_task')
+            try:
+                cur = self.conn.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
+                if cur.rowcount == 0:
+                    self.conn.execute('RELEASE SAVEPOINT amc_delete_task')
+                    return False
+                self.conn.execute('DELETE FROM runs WHERE task_id = ?', (task_id,))
+                self.conn.execute('DELETE FROM events WHERE task_id = ?', (task_id,))
+                self.conn.execute('DELETE FROM check_runs WHERE task_id = ?', (task_id,))
+                self.conn.execute('DELETE FROM findings WHERE task_id = ?', (task_id,))
+                self.conn.execute('DELETE FROM finding_sync_state WHERE task_id = ?', (task_id,))
+                self.conn.execute('DELETE FROM task_event_seq WHERE task_id = ?', (task_id,))
+                self.conn.execute('RELEASE SAVEPOINT amc_delete_task')
+                if not in_outer_tx:
+                    self.conn.commit()
+                return True
+            except Exception:
+                try:
+                    self.conn.execute('ROLLBACK TO SAVEPOINT amc_delete_task')
+                    self.conn.execute('RELEASE SAVEPOINT amc_delete_task')
+                except Exception:
+                    pass
+                raise
