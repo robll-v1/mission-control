@@ -1,691 +1,242 @@
-# Mission Control
+<h1 align="center">Mission Control</h1>
 
-[![CI](https://github.com/robll-v1/mission-control/actions/workflows/ci.yml/badge.svg)](https://github.com/robll-v1/mission-control/actions/workflows/ci.yml)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+<p align="center">
+  <strong>Review your changes with the coding agent you already use. Locally, before you push.</strong>
+</p>
 
-> **Review your changes with the AI agent you already use — on your machine, before you push.**
+<p align="center">
+  Drive Codex CLI, Claude Code, OpenCode, or Copilot CLI against uncommitted local changes or GitHub PRs, switch agent / model / reasoning effort per round, and track findings across rounds in a local-first workbench.
+</p>
 
-**[English](#english)** | **[中文](#中文)**
+<p align="center">
+  <a href="#quick-start"><strong>Quick start</strong></a> &nbsp;&middot;&nbsp;
+  <a href="#show-what-matters"><strong>Workbench</strong></a> &nbsp;&middot;&nbsp;
+  <a href="#how-it-works"><strong>How it works</strong></a> &nbsp;&middot;&nbsp;
+  <a href="#cli-and-sdk"><strong>CLI &amp; SDK</strong></a> &nbsp;&middot;&nbsp;
+  <a href="#honest-boundaries"><strong>Boundaries</strong></a> &nbsp;&middot;&nbsp;
+  <a href="./README.zh-CN.md"><strong>简体中文</strong></a>
+</p>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/review-dark.png">
-  <img alt="Mission Control review console showing a verdict, severity counts and findings with file:line" src="docs/screenshots/review-light.png">
-</picture>
+<p align="center">
+  <a href="https://github.com/robll-v1/mission-control/actions/workflows/ci.yml"><img src="https://github.com/robll-v1/mission-control/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square" alt="Python 3.11+" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22663E?style=flat-square" alt="MIT License" /></a>
+  <a href="#supported-agents"><img src="https://img.shields.io/badge/agents-Codex_%7C_Claude_Code_%7C_OpenCode_%7C_Copilot-2F55D4?style=flat-square" alt="Works with Codex, Claude Code, OpenCode, and Copilot" /></a>
+</p>
 
-<a id="english"></a>
+<p align="center">
+  <img src="docs/screenshots/workbench-hero.png" alt="Mission Control workbench showing a two-round local review, cross-round Persistent and Likely fixed findings, and an inline code snippet" width="960" />
+</p>
 
-## Why Mission Control
-
-**1. Bring your own agent.** Mission Control drives the coding-agent CLI you already have — OpenCode, Claude Code, Codex or Copilot CLI. It detects which ones are installed and which models each can use, and you pick one in the UI. No extra seat, and no API key handed to another service.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/settings-dark.png">
-  <img alt="Model selection page listing the detected agent CLIs and their models" src="docs/screenshots/settings-light.png" width="680">
-</picture>
-
-**2. Reviews exactly what is on disk.** Staged, unstaged and untracked changes are captured into a snapshot commit through a temporary git index, and the agent reviews that snapshot in an isolated worktree. Your index, your `HEAD` and your working files are never touched, and the patch the agent reads always matches the files it can open.
-
-**3. Findings that survive the next round.** Each finding has a severity and a `file:line`, and is tracked across rounds as new, persistent or unverified. A problem is not marked fixed just because the model forgot to mention it again. Results come out as Markdown or JSON, with an exit code for CI or for another agent to act on.
-
-## How it compares
-
-| | Mission Control | [CodeRabbit](https://www.coderabbit.ai) | [GitHub Copilot code review](https://docs.github.com/en/copilot) | [PR-Agent](https://github.com/The-PR-Agent/pr-agent) |
-|---|---|---|---|---|
-| Runs | Your machine | Hosted service (PR bot + CLI) | GitHub / VS Code | Self-hosted, usually in CI |
-| Model | Any model your agent CLI supports | Chosen by the vendor | Chosen by GitHub | Any, with your own API key |
-| Extra cost | None beyond your agent | Subscription | Copilot plan | Your API usage |
-| Uncommitted local changes | Yes | Yes (CLI) | Yes (VS Code) | No, PR-focused |
-| Open source | Yes (MIT) | No | No | Yes |
-
-<sub>Compiled October 2026 from public documentation. Corrections welcome.</sub>
-
-More reading: [design and history](docs/project-design-history.md) · [architecture and sequence diagrams](docs/architecture-and-sequence-diagrams.md)
+<p align="center">
+  <sub>Two-round local review on the bundled synthetic demo repository (<code>examples/first-review/make_demo_repo.py</code>): Round 1 ran on OpenCode, Round 2 switched to Codex (<code>high</code> reasoning) after a fix — the SQL injection moved to <code>Likely fixed</code> while the unclosed connection stayed <code>Persistent</code>.</sub>
+</p>
 
 ---
 
-## Quick Start
+## Quick start
 
-There are two ways to use Mission Control:
+Mission Control ships its React workbench inside the Python package. **No Node.js installation is required** to run `amc start`, and no extra API key or subscription is needed beyond the coding agent CLI already installed on your machine.
 
-### Path A: CLI Only (Recommended for AI Agent Users)
+### 1. Launch the Web Workbench
+
+Run directly without cloning (with [`uv`](https://docs.astral.sh/uv/)):
 
 ```bash
-# Install
-git clone https://github.com/robll-v1/mission-control.git
-cd mission-control
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-
-# One-time global setup (interactive)
-amc init --global
-# → Detects available backends (opencode, claude-code, copilot, codex)
-# → Choose your preferred backend and model
-# → Saves to ~/.config/amc/config.yaml
-
-# Use in any project (activate venv first, or use full path .venv/bin/amc)
-cd ~/your-project
-amc review                    # review local changes
-amc review --model glm-5.1   # override model for one run
+uvx --from git+https://github.com/robll-v1/mission-control.git amc start
 ```
 
-### Path B: Web UI (Full Dashboard)
+Or install once with [`pipx`](https://pipx.pypa.io/):
 
 ```bash
-# One command — installs deps, starts backend + UI, opens browser
-make start
-
-# Or cross-platform (works on Windows too)
-pip install -e .
+pipx install git+https://github.com/robll-v1/mission-control.git
 amc start
 ```
 
-The system automatically:
-1. Creates a venv and installs dependencies (first run)
-2. Installs frontend packages if Node.js is available
-3. Finds free ports (no conflicts)
-4. Starts backend API + frontend dev server
-5. Opens your browser after health check passes
+`amc start` binds strictly to `127.0.0.1`, stores state in your platform application data directory, and opens the workbench in your browser. Stop it cleanly anytime with `amc stop` (or check running ports with `amc status`).
 
-### Management
+### 2. Try a two-round review from the CLI (30 seconds)
 
 ```bash
-amc stop       # graceful shutdown (aborts active reviews)
-amc status     # show running services
+# Generate the tiny synthetic repo with an SQL injection in notes.py
+python3 examples/first-review/make_demo_repo.py /tmp/amc-demo-notes
+
+# Round 1: review uncommitted local changes (structured JSON + CI exit code)
+amc review --repo /tmp/amc-demo-notes --format json --exit-code
+
+# Apply the parameterized query fix (still uncommitted) and re-review on another agent/reasoning
+python3 examples/first-review/make_demo_repo.py /tmp/amc-demo-notes --apply-fix
+amc review --repo /tmp/amc-demo-notes --backend codex --reasoning high
 ```
-
-### Options
-
-```bash
-amc start --port 9000       # custom backend port
-amc start --no-ui           # backend only
-amc start --no-browser      # skip browser open
-```
-
-## What It Does
-
-Mission Control automates code review by:
-1. Ingesting a GitHub PR (or local git diff)
-2. Compiling context from your repo (keyword extraction + file scoring)
-3. Running structured review rounds through your agent CLI (OpenCode, Claude Code, Codex or Copilot CLI)
-4. Extracting structured findings (severity / file / line)
-5. Enforcing review policy (blocks dangerous commands)
-
-### Features
-
-| Category | Highlights |
-|----------|-----------|
-| **Review** | Multi-round review, context-aware prompts, structured findings |
-| **Safety** | Static review policy (guard-rail against shell/docker/npm), preflight checks |
-| **Reliability** | Graceful shutdown, crash recovery, idle timeout |
-| **Output** | Verdict (clear/concerns/failed), severity ratings, exportable summaries |
-| **Streaming** | Real-time SSE events for live progress |
-| **Agent Skill** | CLI, Python SDK — no browser needed |
-
-## Prerequisites
-
-| Tool | Required | Notes |
-|------|----------|-------|
-| Python 3.11+ | ✅ | Backend runtime |
-| AI Agent CLI (one of:) | ✅ | Review execution engine |
-| › [OpenCode](https://github.com/opencode-ai/opencode) | | Supports any LLM (GPT, Claude, GLM, DeepSeek...) |
-| › [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | | Anthropic's CLI agent |
-| › [Copilot CLI](https://gh.io/copilot-cli) | | GitHub Copilot (via `gh copilot`) |
-| › [Codex CLI](https://github.com/openai/codex) | | OpenAI's terminal agent |
-| Node.js 18+ | Optional | Frontend UI |
-| `GITHUB_TOKEN` | Recommended | Higher API rate limits |
-
-## Configuration
-
-Two-level config system (like Git's global + local):
-
-```bash
-# Global defaults (all projects)
-amc init --global
-# → ~/.config/amc/config.yaml
-
-# Project-specific overrides
-cd my-project && amc init
-# → .amc.yaml (in project root)
-```
-
-Priority: `--model` flag > `$AMC_MODEL` env > `.amc.yaml` > `~/.config/amc/config.yaml` > backend default
-
-## Architecture
-
-```
-backend/
-  app/
-    api/           FastAPI routes + SSE streaming
-    adapters/      Agent backends (opencode, claude-code, copilot, codex)
-    core/          Engine, execution, context compiler, worktree, review policy
-    services/      Diff, artifact store, result extraction
-    cli.py         CLI entry point (amc start/stop/status/review)
-    sdk.py         Python SDK (ReviewEngine)
-    mcp_server.py  MCP tool server (blocked — see README)
-frontend/          React + Vite UI
-runtime/           Generated: worktrees, task artifacts
-data/              SQLite database (auto-created)
-```
-
-## Agent Skill
-
-Mission Control works as an **AI agent skill** — your coding agent calls it for code review without a browser or server.
-
-### CLI (`amc review`)
-
-```bash
-# Review local uncommitted changes
-amc review
-
-# Review a GitHub PR
-amc review https://github.com/org/repo/pull/123
-
-# Use a specific backend
-amc review --backend claude-code
-amc review --backend copilot
-amc review --backend codex
-
-# JSON output + exit code for CI
-amc review --format json --exit-code
-
-# Focused review
-amc review --focus "security" --rounds 2
-```
-
-Full options:
-```
-amc review [PR_URL] [OPTIONS]
-  PR_URL              GitHub PR URL (omit for local diff)
-  --repo, -r PATH     Repository path (default: cwd)
-  --base, -b BRANCH   Base branch (default: auto-detect)
-  --backend NAME      Agent backend: opencode, claude-code, copilot, codex
-  --model, -m MODEL   Model override
-  --rounds N          Max rounds (default: 1)
-  --format FMT        markdown | json
-  --focus, -f TEXT    Review focus area
-  --timeout SEC       Per-round timeout (default: 600)
-  --exit-code         Exit 1 if concerns found
-```
-
-### MCP Server (`amc mcp`) — ⚠️ Blocked
-
-> **Status: Blocked.** MCP mode works technically but is not recommended for daily use.
-> The Web UI (`amc start`) and CLI (`amc review`) are the supported interfaces.
-> MCP code is preserved for future reference but not actively maintained.
 
 <details>
-<summary>MCP details (archived)</summary>
-
-Start as stdio MCP tool server:
+<summary>Development install from source (for contributors)</summary>
 
 ```bash
-amc mcp
+git clone https://github.com/robll-v1/mission-control.git
+cd mission-control
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+# Verify backend and frontend
+pytest -q
+cd frontend && npm ci && npx tsc --noEmit && npm test && npm run build
 ```
-
-Agent configuration (Claude Desktop / OpenCode / etc.):
-
-```json
-{
-  "mcpServers": {
-    "mission-control": {
-      "command": "amc",
-      "args": ["mcp"],
-      "cwd": "/path/to/mission-control"
-    }
-  }
-}
-```
-
-| MCP Tool | Description |
-|----------|-------------|
-| `review_code` | Run code review (PR or local diff) |
-| `get_review_findings` | Get findings from recent review |
-| `abort_review` | Cancel running review |
 
 </details>
+
+---
+
+## Show what matters
+
+| Switch agent, model &amp; reasoning per round | Inspect exact snapshots &amp; diffs | Dynamic local capability detection |
+|---|---|---|
+| <img src="docs/screenshots/workbench-popover.png" alt="Per-round RunRoundPopover selecting agent, model, reasoning effort, output language, note, and focus override" /> | <img src="docs/screenshots/workbench-changes.png" alt="Unified diff viewer in the Changes tab showing parameterized SQL query fix in notes.py" /> | <img src="docs/screenshots/workbench-settings.png" alt="Model selection page showing detected local CLIs, per-model reasoning levels, and static Check agent button" /> |
+| Change agent, model, reasoning effort, output language, note, or focus for any round without creating a new review. | Uncommitted staged, unstaged, and untracked files are snapshotted into a temporary commit so the agent sees what is actually on disk. | Models and reasoning levels are read dynamically from your machine — never hardcoded — with a non-LLM `Check agent` static probe. |
+
+---
+
+## How it works
+
+1. **Snapshot without touching your working tree.** For local changes, Mission Control copies your real git index to a temporary `GIT_INDEX_FILE`, writes a snapshot commit parented at `HEAD`, and creates an isolated git worktree from that snapshot. Your working files, index, and `HEAD` are never modified.
+2. **Run your chosen agent with per-round settings.** Every round resolves `agent`, `model`, `reasoning`, `language`, `focus`, and `note` through a single layered `SettingsResolver` (`round > review > .amc.yaml > ~/.config/amc/config.yaml > default`), recording which layer supplied each value.
+3. **Track findings as first-class state.** Agent output is parsed JSON-first (with Markdown fallback) into SQLite. Across rounds, each finding transitions through `New`, `Persistent`, `Unverified`, or `Likely fixed` (verified against the exact diff between `prev_round.snapshot_sha` and `curr_round.snapshot_sha`).
+4. **Act on findings, then re-verify.** Copy a ready-to-paste fix prompt to your coding agent, jump directly to `file:line` via the allowlisted local `Open in editor` endpoint, run repository validation checks, and only you decide when to mark a finding `Resolved` or `Dismissed` (with full `Undo` and automatic reopen if a later round flags it again).
+
+---
+
+## Supported agents
+
+| Agent | CLI | Model discovery | Reasoning effort | Read-only sandbox |
+|---|---|---|---|---|
+| **Codex CLI** | `codex` | Local `~/.codex/models_cache.json` / config | Per-model levels (`-c model_reasoning_effort=...`) | Yes (`--sandbox read-only`) |
+| **Claude Code** | `claude` | Local CLI / config | Parsed from `claude --help` (`--effort ...`) | No (PATH guardrail only) |
+| **OpenCode** | `opencode` | Local CLI / catalog cache | Legacy `provider/model#variant` alias | No (PATH guardrail only) |
+| **Copilot CLI** | `gh copilot` | Agent default / config | Not exposed by CLI | No (PATH guardrail only) |
+
+Default reasoning is always **`Model default`** (`null` — no reasoning flag passed). Switching agents never leaks the previous agent's model or reasoning setting.
+
+---
+
+## How it compares
+
+| | Mission Control | [CodeRabbit](https://www.coderabbit.ai) | [GitHub Copilot Review](https://docs.github.com/en/copilot) | [PR-Agent](https://github.com/The-PR-Agent/pr-agent) |
+|---|---|---|---|---|
+| **Where it runs** | 100% local on your machine | Hosted SaaS (PR bot + CLI) | GitHub / VS Code | Self-hosted, primarily CI |
+| **Models &amp; agents** | Any CLI agent &amp; model you already have; switchable per round | Vendor-managed | Vendor-managed | Bring your own API key |
+| **Extra subscription** | None beyond your existing agent | Subscription | Copilot plan | Direct API usage |
+| **Uncommitted local changes** | Yes (exact index + untracked snapshot) | Yes (CLI) | Yes (VS Code) | PR-focused |
+| **Cross-round finding state** | `New / Persistent / Unverified / Likely fixed` + user `Resolved / Dismissed` | PR thread comments | PR thread comments | PR comments |
+| **License** | MIT | Proprietary | Proprietary | Open source |
+
+<sub>Based on public documentation; corrections welcome.</sub>
+
+---
+
+## CLI and SDK
+
+### CLI (`amc`)
+
+```bash
+# Start / stop / inspect the local workbench
+amc start [--port 8000] [--no-browser]
+amc status
+amc stop
+
+# Static non-LLM check of installed CLI flags & reasoning levels
+amc doctor
+
+# Review uncommitted local changes or a GitHub PR
+amc review
+amc review https://github.com/org/repo/pull/123
+amc review --backend codex --model gpt-6.1-terra --reasoning high --focus "security"
+amc review --format json --exit-code
+
+# Initialize global (~/.config/amc/config.yaml) or repo (.amc.yaml) config
+amc init --global
+amc init
+```
 
 ### Python SDK
 
 ```python
 from app.sdk import ReviewEngine
 
-engine = ReviewEngine(language='en')
-report = engine.review('/path/to/repo')
+engine = ReviewEngine(language="en", backend="codex", reasoning="high")
+report = engine.review("/path/to/repo")
 
-if report.passed:
-    print("All clear!")
-else:
+if not report.passed:
     for f in report.findings:
         print(f"[{f.severity}] {f.path}:{f.line} — {f.summary}")
 ```
 
-### Review Modes
+<details>
+<summary>Configuration layers (<code>.amc.yaml</code>), storage paths, architecture &amp; archived MCP</summary>
 
-| Mode | Trigger | Reviews |
-|------|---------|---------|
-| **PR mode** | Provide PR URL | GitHub pull request diff |
-| **Local diff** | No URL | `git diff` against base branch |
+### Configuration priority
 
-Both modes produce identical structured output.
+```text
+CLI flag (--model / --reasoning) > env (AMC_MODEL / AMC_REASONING) > repo .amc.yaml > global ~/.config/amc/config.yaml > agent default
+```
 
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/health` | Health check |
-| GET | `/api/tasks` | List tasks |
-| POST | `/api/tasks` | Create task |
-| GET | `/api/tasks/{id}` | Task detail |
-| GET | `/api/tasks/{id}/stream` | SSE event stream |
-| POST | `/api/tasks/{id}/start` | Start review round |
-| POST | `/api/tasks/{id}/abort` | Abort review |
-| POST | `/api/tasks/{id}/validate` | Run validation |
-| POST | `/api/tasks/{id}/export-summary` | Export summary |
-| POST | `/api/admin/shutdown` | Graceful shutdown |
-
-## Configuration (`.amc.yaml`)
+Example `.amc.yaml`:
 
 ```yaml
 repo:
-  path: .
   base_branch: main
 
 backend:
-  default: opencode
-  # Optional. Leave out to use your global model (or the agent's default);
-  # an empty value is treated the same as leaving it out.
-  # opencode:
-  #   model: provider/model
-  #   variant: high
-
-context:
-  adaptive_budget: true
-  hunk_snippets_enabled: true
-  include_recent_commits: 8
-  candidate_files_limit: 12
-  keywords_limit: 12
-  top_level_entries_limit: 12
-  include_top_level_entries: false
-  hunk_snippet_file_limit: 3
-  hunk_snippet_hunks_per_file: 1
-  hunk_snippet_context_lines: 8
-
-execution:
-  idle_timeout_sec: 180
+  default: codex
+  codex:
+    model: gpt-6.1-terra
+    reasoning: high
 
 validation:
   default_mode: standard
   checks:
-    build: { command: '' }
-    test: { command: '' }
+    tests:
+      command: pytest -q
+      modes: [standard, full]
+      required: true
 ```
 
-## Reliability
+### Application data directory
 
-- **Preflight check**: verifies AI backend before each round; fails fast with clear error
-- **Graceful shutdown**: `amc stop` → aborts active tasks → SIGTERM → fallback force-kill
-- **Crash recovery**: on restart, stale `running` tasks are marked `FAILED` with audit event
-- **Idle timeout**: kills unresponsive agent processes after 180s
+Global configuration lives at `~/.config/amc/config.yaml` (honoring `XDG_CONFIG_HOME`). Runtime SQLite state, artifacts, and short-path isolated worktrees (`<data_dir>/wt/<task_id>`) live in your OS application data directory (`~/Library/Application Support/amc` on macOS, `~/.local/share/amc` on Linux, `%APPDATA%\amc` on Windows), overridable via `AMC_DATA_DIR`.
 
-## Review policy — scope
+### Repository layout
 
-The static review policy prepends a directory of no-op shims to `PATH` so that
-`npm`, `docker`, `go`, `pytest` and friends fail fast during a review. Treat it
-as a **guard-rail against accidents, not a sandbox**: anything invoking an
-absolute path (`/usr/bin/python`, `C:\Python\python.exe`) bypasses `PATH`
-entirely. Violations are additionally flagged in the event stream.
-
-## Tests
-
-```bash
-pip install -e ".[dev]"
-pytest -q
+```text
+backend/app/
+  cli.py                    amc start / stop / status / review / doctor / init / mcp
+  sdk.py                    ReviewEngine Python SDK
+  api/                      FastAPI routes, SSE EventBus stream, loopback Host/Origin security
+  adapters/                 codex, claude-code, opencode, copilot CLI adapters
+  core/                     SettingsResolver, ExecutionService, FindingTracker, EventBus, worktrees, process-tree cleanup
+  services/                 Local snapshot, JSON-first result parser, safe Open-in-Editor, diff/summary export
+  static/ui/                Bundled React workbench served directly by FastAPI
+frontend/src/
+  workbench/                Direction A lean workbench (default; legacy console kept at ?ui=legacy)
+  i18n.ts                   English (default) and Simplified Chinese dictionaries
 ```
 
-## Cross-Platform
+### MCP server (`amc mcp`)
 
-| Feature | macOS/Linux | Windows |
-|---------|-------------|---------|
-| `make start` | ✅ | ❌ |
-| `amc start/stop/status` | ✅ | ✅ |
-| `amc review` / `amc mcp` | ✅ | ✅ |
-| Process management | SIGTERM / killpg | taskkill /T |
+The legacy stdio MCP server (`backend/app/mcp_server.py`) is currently archived and uses `mcp>=1.0.0,<2` in direct-API mode. Use `amc start`, `amc review`, or `ReviewEngine` for full multi-round tracking.
 
-## Notes
-
-- Set `GITHUB_TOKEN` or `GH_TOKEN` for GitHub API access
-- Task artifacts stored in `runtime/tasks/<task-id>/`
-- Worktrees auto-cleaned after review completes
-- Logs: `.run/backend.log`, `.run/frontend.log`
-
----
-
-<a id="中文"></a>
-
-# Mission Control（中文文档）
-
-> **用你已经在用的 AI Agent，在本地、push 之前审查你的改动。**
-
-## 为什么选 Mission Control
-
-**1. 直接用你已有的 Agent。** Mission Control 调用你本机已经装好的 coding agent CLI：OpenCode、Claude Code、Codex 或 Copilot CLI。它会自动检测装了哪些、各自能用哪些模型，你在界面里选一个就行。不用再买一份席位，也不用把 API Key 交给另一个服务。
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/settings-dark.png">
-  <img alt="模型选择页：列出检测到的 Agent CLI 和各自可用的模型" src="docs/screenshots/settings-light.png" width="680">
-</picture>
-
-**2. 审查的就是你磁盘上的代码。** 已暂存、未暂存和未跟踪的改动会通过一个临时 git index 存成快照 commit，Agent 在隔离的 worktree 里审查这个快照。你的 index、`HEAD` 和工作区文件都不会被改动，Agent 读到的 patch 和它能打开的文件始终一致。
-
-**3. 问题不会在下一轮“消失”。** 每条问题都带严重程度和 `文件:行号`，并在多轮之间标记为新增、持续或待验证。模型这一轮没再提到某个问题，不代表它已经修好。结果可以输出为 Markdown 或 JSON，并提供退出码，方便接入 CI 或交给其他 Agent 继续处理。
-
-## 和同类工具对比
-
-| | Mission Control | [CodeRabbit](https://www.coderabbit.ai) | [GitHub Copilot 代码审查](https://docs.github.com/en/copilot) | [PR-Agent](https://github.com/The-PR-Agent/pr-agent) |
-|---|---|---|---|---|
-| 运行位置 | 你的电脑 | 托管服务（PR 机器人 + CLI） | GitHub / VS Code | 自部署，通常在 CI 中 |
-| 模型 | 你的 Agent CLI 支持的任意模型 | 由厂商决定 | 由 GitHub 决定 | 任意，需自备 API Key |
-| 额外费用 | 无（只用你现有的 Agent） | 订阅 | Copilot 套餐 | 按你的 API 用量 |
-| 未提交的本地改动 | 支持 | 支持（CLI） | 支持（VS Code） | 不支持，面向 PR |
-| 开源 | 是（MIT） | 否 | 否 | 是 |
-
-<sub>根据 2026 年 10 月的公开文档整理，如有错误欢迎指正。</sub>
-
-延伸阅读：[设计与开发历程](docs/project-design-history.md) · [架构图与关键时序图](docs/architecture-and-sequence-diagrams.md)
-
-## 快速开始
-
-两种使用方式：
-
-### 路径 A: 纯 CLI（推荐给 AI Agent 用户）
-
-```bash
-# 安装
-git clone https://github.com/robll-v1/mission-control.git
-cd mission-control
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-
-# 一次性全局配置（交互式）
-amc init --global
-# → 自动检测已安装的 agent CLI (opencode, claude, copilot, codex)
-# → 选择后端和模型
-# → 保存到 ~/.config/amc/config.yaml
-
-# 在任何项目中使用（需先 activate venv，或用 .venv/bin/amc）
-cd ~/your-project
-amc review                    # 审查本地改动
-amc review --model glm-5.1   # 临时指定模型
-```
-
-### 路径 B: Web UI（完整仪表盘）
-
-```bash
-# 一键启动（自动安装依赖、启动服务、打开浏览器）
-make start
-
-# 跨平台方式（Windows 也支持）
-pip install -e .
-amc start
-```
-
-系统自动完成：
-1. 创建虚拟环境并安装依赖（首次运行）
-2. 安装前端依赖（如有 Node.js）
-3. 自动寻找可用端口
-4. 启动后端 API + 前端开发服务器
-5. 健康检查通过后打开浏览器
-
-### 管理命令
-
-```bash
-amc stop       # 优雅停机（先中止活跃的审查任务）
-amc status     # 查看运行中的服务
-```
-
-### 启动选项
-
-```bash
-amc start --port 9000       # 自定义后端端口
-amc start --no-ui           # 仅后端
-amc start --no-browser      # 不自动打开浏览器
-```
-
-## 功能概述
-
-Mission Control 自动化代码审查流程：
-1. 接入 GitHub PR（或本地 git diff）
-2. 从仓库编译上下文（关键词提取 + 文件评分）
-3. 通过你的 Agent CLI（OpenCode、Claude Code、Codex 或 Copilot CLI）执行结构化审查
-4. 提取结构化发现（严重程度 / 文件 / 行号）
-5. 执行审查策略（阻止危险命令）
-
-### 核心特性
-
-| 类别 | 亮点 |
-|------|------|
-| **审查** | 多轮审查、上下文感知、结构化发现 |
-| **安全** | 静态审查策略（拦截 shell/docker/npm 的护栏）、预检查 |
-| **可靠性** | 优雅停机、崩溃恢复、空闲超时 |
-| **输出** | 判定（通过/关注/阻止）、严重程度分级、可导出摘要 |
-| **实时** | SSE 事件流，实时查看审查进度 |
-| **Agent 技能** | CLI、Python SDK — 无需浏览器 |
-
-## 环境要求
-
-| 工具 | 必需 | 说明 |
-|------|------|------|
-| Python 3.11+ | ✅ | 后端运行时 |
-| AI Agent CLI（任选一个）| ✅ | 审查执行引擎 |
-| › [OpenCode](https://github.com/opencode-ai/opencode) | | 支持任意 LLM（GPT、Claude、GLM、DeepSeek…） |
-| › [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | | Anthropic 的 CLI Agent |
-| › [Copilot CLI](https://gh.io/copilot-cli) | | GitHub Copilot（通过 `gh copilot`） |
-| › [Codex CLI](https://github.com/openai/codex) | | OpenAI 的终端 Agent |
-| Node.js 18+ | 可选 | 前端 UI |
-| `GITHUB_TOKEN` | 推荐 | 提高 API 限额 |
-
-## 配置
-
-两级配置系统（类似 Git 的全局 + 项目级）：
-
-```bash
-# 全局默认（所有项目共享）
-amc init --global
-# → ~/.config/amc/config.yaml
-
-# 项目级覆盖
-cd my-project && amc init
-# → .amc.yaml（在项目根目录）
-```
-
-优先级：`--model` 参数 > `$AMC_MODEL` 环境变量 > `.amc.yaml` > `~/.config/amc/config.yaml` > 后端默认
-
-## Agent 技能
-
-Mission Control 可作为 **AI Agent 技能** 使用 — 编码 Agent 调用它获取代码审查反馈，无需浏览器或服务器。
-
-### CLI 审查 (`amc review`)
-
-```bash
-# 审查本地未提交的更改
-amc review
-
-# 审查 GitHub PR
-amc review https://github.com/org/repo/pull/123
-
-# 指定后端 Agent
-amc review --backend claude-code
-amc review --backend copilot
-amc review --backend codex
-
-# JSON 输出 + 退出码（适合 CI）
-amc review --format json --exit-code
-
-# 聚焦审查
-amc review --focus "security" --rounds 2
-```
-
-完整选项：
-```
-amc review [PR_URL] [选项]
-  PR_URL              GitHub PR URL（省略则为本地 diff 模式）
-  --repo, -r PATH     仓库路径（默认：当前目录）
-  --base, -b BRANCH   基准分支（默认：自动检测）
-  --backend NAME      Agent 后端：opencode, claude-code, copilot, codex
-  --model, -m MODEL   模型覆盖
-  --rounds N          最大轮数（默认：1）
-  --format FMT        markdown | json
-  --focus, -f TEXT    审查重点
-  --timeout SEC       每轮超时（默认：600秒）
-  --exit-code         有问题时退出码为 1
-```
-
-### MCP 服务器 (`amc mcp`) — ⚠️ 已阻塞
-
-> **状态：已阻塞。** MCP 模式技术上可用，但不推荐日常使用。
-> Web UI（`amc start`）和 CLI（`amc review`）是目前支持的接口。
-> MCP 代码保留供未来参考，但不再主动维护。
-
-<details>
-<summary>MCP 详情（存档）</summary>
-
-以 stdio 模式启动 MCP 工具服务器：
-
-```bash
-amc mcp
-```
-
-Agent 配置示例（Claude Desktop / OpenCode 等）：
-
-```json
-{
-  "mcpServers": {
-    "mission-control": {
-      "command": "amc",
-      "args": ["mcp"],
-      "cwd": "/path/to/mission-control"
-    }
-  }
-}
-```
-
-| MCP 工具 | 描述 |
-|----------|------|
-| `review_code` | 执行代码审查（PR 或本地 diff） |
-| `get_review_findings` | 获取最近审查的发现 |
-| `abort_review` | 取消正在运行的审查 |
+More documentation: [architecture &amp; sequence diagrams](docs/architecture-and-sequence-diagrams.md) &middot; [local snapshot design](docs/local-review-design.md) &middot; [project design history](docs/project-design-history.md)
 
 </details>
 
-### Python SDK
+---
 
-```python
-from app.sdk import ReviewEngine
+## Honest boundaries
 
-engine = ReviewEngine(language='en')  # 'zh' 用于中文输出
-report = engine.review('/path/to/repo')
+- **Listed models are not call guarantees.** Model and reasoning lists are discovered from local CLI caches, help output, or config files; only a real model request proves account access and quota.
+- **PATH shims are guardrails, not an OS sandbox.** Only Codex CLI runs with an explicit `--sandbox read-only` flag (and the UI only displays the read-only sandbox badge when Codex is active).
+- **Silence never equals fixed.** A finding omitted in a later round becomes `Unverified` (or `Likely fixed` if the code at that location changed between round snapshots) — never automatically `Resolved`.
+- **Loopback-only local security.** The web server binds to `127.0.0.1`, enforces exact `Host`/`Origin` validation, restricts `Open in editor` to allowlisted native executables inside the resolved repository root, and disables repo-configured git commands (`core.fsmonitor`, hooks) during preflight status probes.
 
-if report.passed:
-    print("审查通过！")
-else:
-    for f in report.findings:
-        print(f"[{f.severity}] {f.path}:{f.line} — {f.summary}")
-```
+## License
 
-### 审查模式
-
-| 模式 | 触发条件 | 审查内容 |
-|------|----------|----------|
-| **PR 模式** | 提供 PR URL | GitHub Pull Request diff |
-| **本地 diff** | 不提供 URL | `git diff` 对比基准分支 |
-
-两种模式输出格式完全一致。
-
-## API 接口
-
-| 方法 | 路径 | 描述 |
-|------|------|------|
-| GET | `/api/health` | 健康检查 |
-| GET | `/api/tasks` | 任务列表 |
-| POST | `/api/tasks` | 创建任务 |
-| GET | `/api/tasks/{id}` | 任务详情 |
-| GET | `/api/tasks/{id}/stream` | SSE 事件流 |
-| POST | `/api/tasks/{id}/start` | 开始审查轮次 |
-| POST | `/api/tasks/{id}/abort` | 中止审查 |
-| POST | `/api/tasks/{id}/validate` | 执行验证 |
-| POST | `/api/tasks/{id}/export-summary` | 导出摘要 |
-| POST | `/api/admin/shutdown` | 优雅停机 |
-
-## 配置文件 (`.amc.yaml`)
-
-```yaml
-repo:
-  path: .                        # 仓库路径
-  base_branch: main              # 基准分支
-
-backend:
-  default: opencode              # Agent 后端
-  # 可选。不写则使用全局配置的模型（或 agent 自己的默认模型）；写空值等同于不写。
-  # opencode:
-  #   model: provider/model      # 仅在需要为本仓库固定模型时填写
-  #   variant: high              # 变体
-
-context:
-  adaptive_budget: true         # 根据 patch 大小动态裁剪上下文
-  hunk_snippets_enabled: true   # 注入 hunk 周边代码片段
-  include_recent_commits: 8      # 上下文近期 commit 数
-  candidate_files_limit: 12      # 最大候选文件数
-  keywords_limit: 12             # 注入 prompt 的关键词上限
-  top_level_entries_limit: 12    # top-level entries 上限
-  include_top_level_entries: false  # 默认不注入仓库根目录列表
-  hunk_snippet_file_limit: 3     # 最多抽取多少个文件的 snippet
-  hunk_snippet_hunks_per_file: 1 # 每个文件最多抽取多少个 hunk snippet
-  hunk_snippet_context_lines: 8  # hunk 前后保留的上下文行数
-
-execution:
-  idle_timeout_sec: 180          # Agent 空闲超时（秒）
-
-validation:
-  default_mode: standard         # standard | full
-  checks:
-    build: { command: '' }       # 如 'make build'
-    test: { command: '' }        # 如 'go test ./...'
-```
-
-## 可靠性
-
-- **预检查**：每轮审查前验证 AI 后端可用，失败则快速报错
-- **优雅停机**：`amc stop` → 中止活跃任务 → SIGTERM → 兜底强杀
-- **崩溃恢复**：重启时自动将滞留的 `running` 任务标记为 `FAILED`
-- **空闲超时**：180 秒无响应自动终止 Agent 进程
-
-## 审查策略的边界
-
-静态审查策略通过在 `PATH` 前插入一批空操作 shim，让 `npm`、`docker`、`go`、
-`pytest` 等命令在审查期间快速失败。请把它当作**防误操作的护栏，而不是沙箱**：
-任何使用绝对路径的调用（`/usr/bin/python`、`C:\Python\python.exe`）都能绕过
-`PATH`。违规调用会额外记录在事件流中。
-
-## 测试
-
-```bash
-pip install -e ".[dev]"
-pytest -q
-```
-
-## 跨平台支持
-
-| 功能 | macOS/Linux | Windows |
-|------|-------------|---------|
-| `make start` | ✅ | ❌ |
-| `amc start/stop/status` | ✅ | ✅ |
-| `amc review` / `amc mcp` | ✅ | ✅ |
-| 进程管理 | SIGTERM / killpg | taskkill /T |
-
-## 备注
-
-- 设置 `GITHUB_TOKEN` 或 `GH_TOKEN` 以访问 GitHub API
-- 任务产物存储在 `runtime/tasks/<task-id>/`
-- 审查完成后自动清理 worktree
-- 日志：`.run/backend.log`、`.run/frontend.log`
+[MIT](LICENSE)
