@@ -125,10 +125,26 @@ class ExecutionService:
         self._default_reasoning = default_reasoning
         self._lock = threading.Lock()
         self._active: dict[str, ActiveProcess] = {}
+        self._busy_ops: dict[str, str] = {}
+
+    def try_reserve_task(self, task_id: str, reason: str) -> bool:
+        """Atomically reserve an exclusive per-task slot shared by start, validation, and delete."""
+        with self._lock:
+            if task_id in self._active or task_id in self._busy_ops:
+                return False
+            self._busy_ops[task_id] = reason
+            return True
+
+    def release_task(self, task_id: str, reason: str | None = None) -> None:
+        """Release a reservation acquired via :meth:`try_reserve_task`."""
+        with self._lock:
+            current = self._busy_ops.get(task_id)
+            if current is not None and (reason is None or current == reason):
+                self._busy_ops.pop(task_id, None)
 
     def is_active(self, task_id: str) -> bool:
         with self._lock:
-            return task_id in self._active
+            return task_id in self._active or task_id in self._busy_ops
 
     def start_task(
         self,
@@ -174,14 +190,23 @@ class ExecutionService:
                 f'Available: {", ".join(sorted(self.adapters)) or "(none)"}'
             )
         with self._lock:
-            if task_id in self._active:
-                raise RuntimeError('a review round is already in progress for this PR')
+            if task_id in self._active or task_id in self._busy_ops:
+                raise RuntimeError('a review round or exclusive operation is already in progress for this task')
             # Reserve the slot atomically with the check. All the prepare work
             # below used to happen before registration, so two concurrent
             # starts could both pass the check and launch rounds into the
             # same worktree.
             placeholder = ActiveProcess(task_id=task_id, run_id=None, process=None, worker=None)
             self._active[task_id] = placeholder
+        # Re-check task existence AFTER acquiring the exclusive slot so a
+        # concurrent delete that won the race is never revived by this start.
+        latest_task = self.db.get_task(task_id)
+        if latest_task is None:
+            with self._lock:
+                if self._active.get(task_id) is placeholder:
+                    self._active.pop(task_id, None)
+            raise KeyError(f'task not found: {task_id}')
+        task = latest_task
         try:
             return self._launch_round(task, prompt, review_note, settings, placeholder)
         except BaseException as exc:

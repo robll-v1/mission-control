@@ -66,7 +66,7 @@ execution = ExecutionService(
         name, model=model, variant=variant, reasoning=reasoning,
     ),
 )
-validation = ValidationService(db=db, mission=engine, artifacts=artifacts)
+validation = ValidationService(db=db, mission=engine, artifacts=artifacts, execution=execution)
 diffs = DiffService(artifacts)
 summaries = SummaryService(db, artifacts)
 

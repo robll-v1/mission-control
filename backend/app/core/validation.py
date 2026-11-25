@@ -34,14 +34,34 @@ _VALIDATION_SHELL = _resolve_validation_shell()
 
 
 class ValidationService:
-    def __init__(self, *, db: Database, mission: MissionEngine, artifacts: ArtifactStore):
+    def __init__(self, *, db: Database, mission: MissionEngine, artifacts: ArtifactStore, execution=None):
         self.db = db
         self.mission = mission
         self.artifacts = artifacts
+        self.execution = execution
 
     def start_validation(self, task_id: str, mode: str | None = None) -> None:
-        worker = threading.Thread(target=self._validate_task, args=(task_id, mode), daemon=True)
-        worker.start()
+        reserved = False
+        if self.execution is not None and hasattr(self.execution, 'try_reserve_task'):
+            if not self.execution.try_reserve_task(task_id, 'validation'):
+                raise RuntimeError('task is currently busy; wait for the active operation to finish')
+            reserved = True
+        try:
+            if self.db.get_task(task_id) is None:
+                raise KeyError(f'task not found: {task_id}')
+            worker = threading.Thread(target=self._validate_task_guarded, args=(task_id, mode, reserved), daemon=True)
+            worker.start()
+        except BaseException:
+            if reserved and self.execution is not None:
+                self.execution.release_task(task_id, 'validation')
+            raise
+
+    def _validate_task_guarded(self, task_id: str, mode: str | None, reserved: bool) -> None:
+        try:
+            self._validate_task(task_id, mode)
+        finally:
+            if reserved and self.execution is not None:
+                self.execution.release_task(task_id, 'validation')
 
     def _validate_task(self, task_id: str, mode: str | None) -> None:
         task = self.db.get_task(task_id)
