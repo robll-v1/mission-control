@@ -11,3 +11,11 @@ data/
 runtime/
 .run/
 .amc/
+
+# Local AI agent tooling & private handoff/draft notes
+.cao/
+.claude/
+AGENTS.md
+CLAUDE.md
+docs/design/
+docs/project-status.md
