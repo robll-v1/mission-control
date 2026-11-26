@@ -34,5 +34,3 @@ Notes:
   that the new round does not cover comes back as `unverified`, not
   `resolved`. Use `--no-incremental` for a full re-review that replaces
   prior findings.
-- Full acceptance record, environment and observed results live in
-  [docs/release-readiness.md](../../docs/release-readiness.md).
