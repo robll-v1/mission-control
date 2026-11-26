@@ -635,7 +635,7 @@ export function WorkbenchSettings({ repoPaths, t, onBack, onSaved }: Props) {
               <div className="wb-card wb-kv-table">
                 <div className="wb-kv-row">
                   <span className="wb-t2">{t.workbench.aboutVersion}</span>
-                  <span className="wb-mono">0.1.0</span>
+                  <span className="wb-mono">0.1.1</span>
                 </div>
                 <div className="wb-kv-row">
                   <span className="wb-t2">License</span>

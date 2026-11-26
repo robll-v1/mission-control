@@ -1,6 +1,6 @@
 [project]
 name = 'agent-mission-control'
-version = '0.1.0'
+version = '0.1.1'
 description = 'Local-first cross-agent code review workbench and CLI for uncommitted local changes and GitHub PRs'
 readme = 'README.md'
 license = 'MIT'

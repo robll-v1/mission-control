@@ -3,7 +3,7 @@ name: mission-control
 description: "Run cross-agent local code review before git push using Mission Control (amc). Drives a second coding agent CLI already installed on this machine (Codex, Claude Code, OpenCode, or Copilot CLI) against an isolated snapshot of uncommitted local changes or a GitHub PR, returns structured file:line findings in JSON, and tracks findings across rounds (New, Persistent, Unverified, Likely fixed) without modifying the working tree or git index. Use when the user asks to cross-review local changes before pushing, get a second-opinion AI code review, verify whether previous review findings were actually fixed, or review a GitHub pull request locally."
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.1.1"
   author: robll-v1
 ---
 
