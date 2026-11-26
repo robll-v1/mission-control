@@ -62,9 +62,10 @@ def test_skill_helper_prefers_cross_agent_and_resolves_amc_or_uvx(tmp_path):
     assert helper.resolve_amc_command(lambda n: '/opt/bin/uvx' if n == 'uvx' else None) == [
         '/opt/bin/uvx',
         '--from',
-        helper.AMC_GIT_SPEC,
+        helper.AMC_PACKAGE_SPEC,
         'amc',
     ]
+    assert helper.AMC_PACKAGE_SPEC == 'agent-mission-control'
 
     argv = helper.build_review_argv(
         ['/usr/local/bin/amc'],

@@ -36,7 +36,7 @@ Mission Control snapshots the exact working tree (staged, unstaged, and untracke
    - `--focus "<area>"` — e.g. `"security, concurrency, edge cases"`
    - `--pr <github-pr-url>` — review a GitHub pull request instead of local changes
 
-   The helper locates `amc` on `PATH` or falls back to `uvx --from git+https://github.com/robll-v1/mission-control.git amc`, picks an installed reviewer CLI different from `--exclude`, and emits structured JSON to stdout.
+   The helper locates `amc` on `PATH` or falls back to `uvx --from agent-mission-control amc`, picks an installed reviewer CLI different from `--exclude`, and emits structured JSON to stdout.
 
 2. **Inspect the structured JSON receipt** (`verdict`, `passed`, `finding_count`, `findings[]`):
    - `verdict == "clear"` and `passed == true` -> report clean review and stop.
@@ -59,7 +59,7 @@ If the user wants to browse multi-round diffs, inline snippets, or mark findings
 amc start
 ```
 
-(Or `uvx --from git+https://github.com/robll-v1/mission-control.git amc start` — no Node.js required.)
+(Or `uvx --from agent-mission-control amc start` — no Node.js required.)
 
 ## Rules and honest reporting
 
