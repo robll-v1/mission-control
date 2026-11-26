@@ -2014,26 +2014,9 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 def cmd_mcp(args: argparse.Namespace) -> None:
     """Start MCP server (stdio mode)."""
-    root = _root_dir()
-    if not _is_packaged_mode(root):
-        os.chdir(root)
-
-    # Show model info on stderr so user knows what's being used
     import sys
-    from app.adapters.direct_api_adapter import resolve_direct_api_config
-    from app.core.config import load_repo_config
-    cfg = load_repo_config('.')
-    api_cfg = resolve_direct_api_config(cfg)
-    if api_cfg.is_valid():
-        print(f"[amc mcp] Direct API: model={api_cfg.model}, wire={api_cfg.wire_api}", file=sys.stderr)
-        amc_model = cfg.get('backend', {}).get(cfg.get('backend', {}).get('default', ''), {}).get('model', '')
-        if amc_model and amc_model != api_cfg.model:
-            print(f"[amc mcp] Note: amc config has model={amc_model} (used by CLI mode).", file=sys.stderr)
-            print(f"[amc mcp]       MCP uses {api_cfg.model} from Codex config (direct API doesn't support {amc_model}).", file=sys.stderr)
-    else:
-        print("[amc mcp] Warning: Direct API config incomplete. Review will fail.", file=sys.stderr)
-        print("[amc mcp] Configure ~/.codex/config.toml or backend.direct_api in amc config.", file=sys.stderr)
 
+    print('[amc mcp] Starting Mission Control MCP server (stdio)...', file=sys.stderr, flush=True)
     from app.mcp_server import serve
     serve()
 

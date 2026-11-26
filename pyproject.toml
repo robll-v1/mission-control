@@ -73,3 +73,4 @@ app = ['static/*', 'static/ui/*', 'static/ui/assets/*']
 
 [project.scripts]
 amc = 'app.cli:main'
+agent-mission-control = 'app.cli:main'
