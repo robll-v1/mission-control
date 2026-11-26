@@ -49,14 +49,36 @@ Use mission-control to cross-review my local changes before I push, fix any conf
 
 The bundled skill ([`skills/mission-control/SKILL.md`](skills/mission-control/SKILL.md)) automatically picks a **different** installed CLI from the host agent (for example, Claude Code writes → Codex reviews), runs `amc review --format json` (falling back to `uvx` if `amc` is not installed globally), and loops cleanly until verified.
 
-### Option B: CLI or Local Web Workbench (zero-clone with `uvx`)
+### Option B: MCP Server (Claude Code / Cursor / Windsurf / Claude Desktop)
+
+```bash
+# Claude Code (one-liner)
+claude mcp add mission-control -- uvx agent-mission-control mcp
+```
+
+Or add to `.mcp.json` / Cursor MCP config:
+
+```json
+{
+  "mcpServers": {
+    "mission-control": {
+      "command": "uvx",
+      "args": ["agent-mission-control", "mcp"]
+    }
+  }
+}
+```
+
+Exposes 5 tools (`check_agents`, `start_review`, `wait_review`, `update_finding`, `abort_review`) backed by your local CLIs and the same SQLite database as `amc start` (open the Web Workbench anytime to inspect the exact MCP tasks and diffs).
+
+### Option C: CLI or Local Web Workbench (zero-clone with `uvx`)
 
 ```bash
 # Review uncommitted local changes from the terminal (structured JSON + CI exit code)
-uvx --from agent-mission-control amc review --backend codex --reasoning high --format json --exit-code
+uvx agent-mission-control review --backend codex --reasoning high --format json --exit-code
 
 # Or launch the local Web Workbench (bundled React UI, no Node.js needed)
-uvx --from agent-mission-control amc start
+uvx agent-mission-control start
 ```
 
 Prefer a permanent local install?
@@ -178,7 +200,7 @@ for f in report.findings:
 ```
 
 <details>
-<summary>Configuration layers (<code>.amc.yaml</code>), storage paths, repository layout &amp; archived MCP</summary>
+<summary>Configuration layers (<code>.amc.yaml</code>), storage paths &amp; architecture docs</summary>
 
 Priority: `CLI flag (--model / --reasoning) > env (AMC_MODEL / AMC_REASONING) > repo .amc.yaml > global ~/.config/amc/config.yaml > agent default`.
 
@@ -202,8 +224,6 @@ validation:
 ```
 
 Global config lives at `~/.config/amc/config.yaml` (honoring `XDG_CONFIG_HOME`). SQLite state, artifacts, and short-path isolated worktrees (`<data_dir>/wt/<task_id>`) live in your OS application data directory (`~/Library/Application Support/amc` on macOS, `~/.local/share/amc` on Linux, `%APPDATA%\amc` on Windows), overridable via `AMC_DATA_DIR`.
-
-The legacy stdio MCP server (`backend/app/mcp_server.py`) is archived and uses `mcp>=1.0.0,<2` in direct-API mode; use the Agent Skill, `amc review`, `amc start`, or `ReviewEngine` for full multi-round tracking.
 
 More reading: [architecture &amp; sequence diagrams](docs/architecture-and-sequence-diagrams.md) &middot; [local snapshot design](docs/local-review-design.md) &middot; [project design history](docs/project-design-history.md)
 

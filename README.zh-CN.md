@@ -49,14 +49,36 @@ npx skills add robll-v1/mission-control -g
 
 内置 Skill（[`skills/mission-control/SKILL.md`](skills/mission-control/SKILL.md)）会自动避开当前宿主、选择本机已装的**第二个** CLI（例如 Claude Code 写代码 → Codex 审查），调用 `amc review --format json`（本机未全局装 `amc` 时自动走 `uvx`），并在修复后自动复审。
 
-### 方式 B：CLI 或本地 Web 工作台（`uvx` 零克隆启动）
+### 方式 B：MCP Server（Claude Code / Cursor / Windsurf / Claude Desktop）
+
+```bash
+# Claude Code 一行接入
+claude mcp add mission-control -- uvx agent-mission-control mcp
+```
+
+或添加到 `.mcp.json` / Cursor MCP 配置：
+
+```json
+{
+  "mcpServers": {
+    "mission-control": {
+      "command": "uvx",
+      "args": ["agent-mission-control", "mcp"]
+    }
+  }
+}
+```
+
+提供 5 个正交工具（`check_agents`、`start_review`、`wait_review`、`update_finding`、`abort_review`），直接驱动本机 CLI 并与 `amc start` 共享同一个 SQLite 数据库（随时打开 Web 工作台即可查看 MCP 发起的任务与 Diff）。
+
+### 方式 C：CLI 或本地 Web 工作台（`uvx` 零克隆启动）
 
 ```bash
 # 终端审查未提交改动（输出结构化 JSON + CI 退出码）
-uvx --from agent-mission-control amc review --backend codex --reasoning high --format json --exit-code
+uvx agent-mission-control review --backend codex --reasoning high --format json --exit-code
 
 # 或直接启动本地 Web 工作台（内置 React 静态包，无需 Node.js）
-uvx --from agent-mission-control amc start
+uvx agent-mission-control start
 ```
 
 希望常驻安装到本机：
@@ -178,7 +200,7 @@ for f in report.findings:
 ```
 
 <details>
-<summary>配置分层（<code>.amc.yaml</code>）、存储路径、仓库目录与归档 MCP 说明</summary>
+<summary>配置分层（<code>.amc.yaml</code>）、存储路径与架构文档</summary>
 
 配置优先级：`命令行参数（--model / --reasoning）> 环境变量（AMC_MODEL / AMC_REASONING）> 仓库 .amc.yaml > 全局 ~/.config/amc/config.yaml > Agent 默认`。
 
@@ -202,8 +224,6 @@ validation:
 ```
 
 全局配置位于 `~/.config/amc/config.yaml`（遵循 `XDG_CONFIG_HOME`）。SQLite 数据库、产物与短路径隔离 worktree（`<data_dir>/wt/<task_id>`）保存在系统应用数据目录（macOS `~/Library/Application Support/amc`、Linux `~/.local/share/amc`、Windows `%APPDATA%\amc`），可通过 `AMC_DATA_DIR` 覆盖。
-
-旧版 stdio MCP 服务（`backend/app/mcp_server.py`）目前处于归档状态，依赖 `mcp>=1.0.0,<2` 并走 direct-API 模式；日常多轮追踪请优先使用 Agent Skill、`amc review`、`amc start` 或 `ReviewEngine`。
 
 延伸阅读：[架构与时序图](docs/architecture-and-sequence-diagrams.md) &middot; [本地快照设计](docs/local-review-design.md) &middot; [项目设计历程](docs/project-design-history.md)
 

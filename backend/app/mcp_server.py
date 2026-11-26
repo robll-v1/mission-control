@@ -1,10 +1,8 @@
-"""
-MCP Tool Server for Mission Control Agent Skill.
+"""Thin FastMCP stdio transport adapter for Mission Control.
 
-Exposes code review capabilities as MCP tools for AI agents.
-Runs in stdio mode (launched via `amc mcp`).
-
-Uses Direct API mode (no subprocess) to avoid nested agent issues.
+All orchestration, SQLite persistence, cross-agent selection, and process
+cleanup live in :mod:`app.services.mcp_service`. This module only exposes
+the 5 orthogonal MCP tools and guards the stdio JSON-RPC stdout channel.
 """
 from __future__ import annotations
 
@@ -12,278 +10,207 @@ import asyncio
 import json
 import os
 import sys
-import time
+from io import TextIOWrapper
 from typing import Annotated
 
+import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.stdio import stdio_server
 
-# ── Server setup ──────────────────────────────────────────────────────
+from app.services.mcp_service import McpReviewService
 
 mcp = FastMCP(
-    name="mission-control",
-    instructions="""Mission Control code review server.
+    name='mission-control',
+    instructions="""Mission Control — local cross-agent code review server.
 
-WORKFLOW (non-blocking, two-step):
-1. Call review_code with repo_path → returns immediately with a task_id
-2. Wait 60-120 seconds (reviews take time)
-3. Call get_review_status with the task_id → returns findings when done
-
-If get_review_status returns status="running", wait another 30s and retry.
-
-INTERPRETING RESULTS:
-- verdict="clear" + passed=true → code is fine, proceed
-- verdict="concerns" + passed=false → review findings and fix issues
-- finding severity: critical > high > medium > low
+WORKFLOW:
+1. Optional: call check_agents() to inspect locally installed agent CLIs and reasoning levels (zero LLM calls).
+2. Call start_review(repo_path=..., exclude_agent=<your-own-agent>) to snapshot uncommitted local changes (or a GitHub PR) and launch a review on a second local CLI.
+3. Call wait_review(task_id=...) — it long-polls up to 25s and returns either progress (done=false) or structured findings (done=true). Repeat wait_review while done=false.
+4. After fixing confirmed issues, call start_review(task_id=..., repo_path=...) to run Round 2 on the updated working tree and track findings as new / persistent / unverified / likely_fixed.
+5. Use update_finding(task_id, finding_id, action='resolve'|'dismiss'|'reopen') for human dispositions, or abort_review(task_id) to cancel an active round.
 
 RULES:
-- Do NOT call review_code in a loop
-- Call review_code ONCE per review session
-- Use get_review_status to poll (not review_code again)
+- Pass exclude_agent (e.g. 'claude-code' or 'codex') so Mission Control picks a different installed CLI when available.
+- Never claim a finding is fixed when its status is 'unverified'.
+- Never fabricate a clean review if ok=false or verdict is 'failed'/'inconclusive'.
 """,
 )
 
-# Global engine instance (lazy init)
-_engine = None
+_service: McpReviewService | None = None
 
 
-def _get_engine():
-    """Lazy-initialize ReviewEngine."""
-    global _engine
-    if _engine is None:
-        from app.sdk import ReviewEngine
-        _engine = ReviewEngine(language='en', backend='direct_api')
-    return _engine
+def get_service() -> McpReviewService:
+    """Return the lazily initialized shared-SQLite MCP review service."""
+    global _service
+    if _service is None:
+        _service = McpReviewService.from_shared_paths()
+    return _service
 
 
-# Background review tasks
-_background_tasks: dict[str, asyncio.Task] = {}
-_background_results: dict[str, dict] = {}
+def set_service(service: McpReviewService | None) -> None:
+    """Inject a custom McpReviewService (primarily for isolated tests)."""
+    global _service
+    _service = service
+
+
+def _dumps(payload: dict) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
 # ── Tools ─────────────────────────────────────────────────────────────
 
 
 @mcp.tool()
-async def review_code(
-    repo_path: Annotated[str, "Absolute path to the git repository to review"],
-    pr_url: Annotated[str | None, "GitHub PR URL (omit for local diff mode)"] = None,
-    base: Annotated[str | None, "Base branch for local diff (auto-detects if omitted)"] = None,
-    focus: Annotated[str | None, "Review focus area (e.g. 'security', 'performance', 'correctness')"] = None,
-    timeout: Annotated[int, "Timeout in seconds (default: 300)"] = 300,
-    context: Annotated[str | None, "Additional context (requirements, intent) as JSON string"] = None,
+async def check_agents(
+    backend: Annotated[
+        str | None,
+        "Optional specific backend to probe ('codex', 'claude-code', 'opencode', 'copilot'). Omit to check all installed CLIs.",
+    ] = None,
 ) -> str:
-    """Start an AI-powered code review on a repository (non-blocking).
-
-    Returns immediately with a task_id. Use get_review_status(task_id) to poll
-    for results. Reviews typically take 60-120 seconds.
-
-    Usage:
-    1. Call review_code → get task_id
-    2. Wait ~60-120s, then call get_review_status with the task_id
-    3. If status is "completed", findings are included in the response
-    """
-    # Resolve API config early to report model to caller
-    from app.adapters.direct_api_adapter import resolve_direct_api_config
-    from app.core.config import load_repo_config
-    amc_cfg = load_repo_config(repo_path)
-    api_config = resolve_direct_api_config(amc_cfg)
-
-    if not api_config.is_valid():
-        return json.dumps({
-            "status": "error",
-            "message": "Direct API config incomplete. Need base_url, api_key, and model. "
-                       "Configure in ~/.codex/config.toml or ~/.config/amc/config.yaml (backend.direct_api section).",
-        }, indent=2)
-
-    print(f"[mission-control] Starting inline review: {repo_path}", file=sys.stderr, flush=True)
-    print(f"[mission-control] Using model: {api_config.model} via {api_config.wire_api} API", file=sys.stderr, flush=True)
-
-    engine = _get_engine()
-
-    # Parse context if provided
-    ctx_data = None
-    if context:
-        try:
-            ctx_data = json.loads(context)
-        except json.JSONDecodeError:
-            ctx_data = {"intent": context}
-
-    # Generate a short task key
-    import hashlib
-    task_key = hashlib.md5(f"{repo_path}:{time.time()}".encode()).hexdigest()[:8]
-
-    async def _run_review():
-        try:
-            report = await asyncio.to_thread(
-                engine.review_inline,
-                repo_path,
-                pr_url=pr_url,
-                base=base,
-                review_focus=focus or '',
-                timeout_sec=timeout,
-                context=ctx_data,
-            )
-            result = {
-                "status": "completed",
-                "passed": report.passed,
-                "verdict": str(report.verdict),
-                "finding_count": report.finding_count,
-                "findings": [
-                    {
-                        "severity": f.severity,
-                        "path": f.path,
-                        "line": f.line,
-                        "summary": f.summary,
-                    }
-                    for f in report.findings
-                ] if report.findings else [],
-                "summary": report.summary or "",
-                "duration_sec": report.duration_sec,
-                "model": api_config.model,
-            }
-            if report.error:
-                result["error"] = report.error
-            _background_results[task_key] = result
-            print(f"[mission-control] Review {task_key} complete — verdict: {report.verdict}, findings: {report.finding_count}", file=sys.stderr, flush=True)
-        except Exception as exc:
-            _background_results[task_key] = {
-                "status": "failed",
-                "error": str(exc),
-            }
-            print(f"[mission-control] Review {task_key} failed: {exc}", file=sys.stderr, flush=True)
-
-    # Launch in background
-    _background_tasks[task_key] = asyncio.create_task(_run_review())
-
-    return json.dumps({
-        "status": "started",
-        "task_id": task_key,
-        "model": api_config.model,
-        "message": f"Review started using {api_config.model} (direct API). Call get_review_status in ~60-120 seconds.",
-        "estimated_seconds": 90,
-    }, indent=2)
+    """Check locally installed coding agent CLIs, models, and reasoning capabilities (zero LLM calls)."""
+    result = await asyncio.to_thread(get_service().check_agents, backend)
+    return _dumps(result)
 
 
 @mcp.tool()
-async def get_review_status(
-    task_id: Annotated[str, "Task ID returned by review_code"],
+async def start_review(
+    repo_path: Annotated[
+        str | None,
+        'Path to the local git repository (required for a new task; optional when continuing an existing task_id).',
+    ] = None,
+    task_id: Annotated[
+        str | None,
+        'Existing task_id to run the next review round on (preserves cross-round finding history).',
+    ] = None,
+    pr_url: Annotated[
+        str | None,
+        'Optional GitHub PR URL. Omit to review uncommitted local changes via a zero-touch snapshot.',
+    ] = None,
+    base: Annotated[
+        str | None,
+        'Optional base branch for local diff review (auto-detected if omitted).',
+    ] = None,
+    backend: Annotated[
+        str | None,
+        "Optional explicit reviewer backend ('codex', 'claude-code', 'opencode', 'copilot').",
+    ] = None,
+    exclude_agent: Annotated[
+        str | None,
+        "Host agent to avoid for cross-agent review (e.g. 'claude-code', 'codex'). Falls back honestly if only one CLI is installed.",
+    ] = None,
+    model: Annotated[str | None, 'Optional model ID override for this round.'] = None,
+    reasoning: Annotated[str | None, "Optional reasoning effort override (e.g. 'low', 'medium', 'high')."] = None,
+    focus: Annotated[str | None, "Optional review focus (e.g. 'security, concurrency, edge cases')."] = None,
+    note: Annotated[str | None, 'Optional note for this review round (e.g. what changed since round 1).'] = None,
+    language: Annotated[str, "Review output language: 'en' (default) or 'zh-CN'."] = 'en',
 ) -> str:
-    """Check the status and results of a code review.
-
-    Call this after review_code returns a task_id. If the review is still
-    running, returns status="running". Once complete, returns the full
-    findings and verdict.
-
-    Typical workflow:
-    1. review_code → task_id
-    2. Wait 60-120 seconds
-    3. get_review_status(task_id) → full results
-    """
-    # Check in-memory results first
-    if task_id in _background_results:
-        return json.dumps(_background_results[task_id], indent=2, ensure_ascii=False)
-
-    if task_id in _background_tasks:
-        task = _background_tasks[task_id]
-        if not task.done():
-            return json.dumps({
-                "status": "running",
-                "message": "Review is still in progress. Try again in 30 seconds.",
-            }, indent=2)
-        # Task done but result not stored (shouldn't happen)
-        return json.dumps({"status": "completed", "message": "Review finished but no result captured."}, indent=2)
-
-    return json.dumps({"status": "not_found", "message": f"No review found with task_id: {task_id}"})
+    """Start a new local/PR code review or launch the next round on an existing task_id."""
+    result = await asyncio.to_thread(
+        get_service().start_review,
+        repo_path=repo_path,
+        task_id=task_id,
+        pr_url=pr_url,
+        base=base,
+        backend=backend,
+        exclude_agent=exclude_agent,
+        model=model,
+        reasoning=reasoning,
+        focus=focus,
+        note=note,
+        language=language,
+    )
+    return _dumps(result)
 
 
 @mcp.tool()
-async def get_review_findings(
-    repo_path: Annotated[str, "Path to the repository (used to identify the review)"],
-    min_severity: Annotated[str, "Minimum severity to include: critical, high, medium, low"] = "low",
+async def wait_review(
+    task_id: Annotated[str, 'Task ID returned by start_review.'],
+    wait_sec: Annotated[
+        int,
+        'Maximum seconds to long-poll before returning progress (default 25, clamped to 0..45 to stay under 60s client timeouts).',
+    ] = 25,
+    min_severity: Annotated[
+        str | None,
+        "Optional minimum severity filter: 'critical', 'high', 'medium', or 'low'.",
+    ] = None,
 ) -> str:
-    """Get findings from the most recent review of a repository.
+    """Wait for a review round to complete (bounded long-poll) and return progress or structured findings."""
+    result = await asyncio.to_thread(
+        get_service().wait_review,
+        task_id=task_id,
+        wait_sec=wait_sec,
+        min_severity=min_severity,
+    )
+    return _dumps(result)
 
-    Returns filtered findings based on minimum severity threshold.
-    Useful for checking only critical/high issues.
-    """
-    severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-    min_level = severity_order.get(min_severity.lower(), 1)
 
-    # Search background results for matching repo
-    for key, result in _background_results.items():
-        if result.get("status") == "completed":
-            findings = [
-                f for f in result.get("findings", [])
-                if severity_order.get(f.get("severity", ""), 0) >= min_level
-            ]
-            return json.dumps({
-                "verdict": result.get("verdict", ""),
-                "finding_count": len(findings),
-                "findings": findings,
-            }, indent=2, ensure_ascii=False)
-
-    # Fall back to the on-disk task database.
-    # NB: `tasks` rows are a single JSON `data` blob with no repo_path column,
-    # so the filtering has to happen in Python rather than in SQL.
-    import os
-
-    from app.core.db import Database
-    from app.core.paths import get_db_path, maybe_import_legacy_db
-    from app.services.review_result_service import ReviewResultService
-
-    maybe_import_legacy_db()
-    db = Database(str(get_db_path()))
-    target = os.path.normcase(os.path.abspath(repo_path))
-    matching = [
-        task for task in db.list_tasks()
-        if os.path.normcase(os.path.abspath(task.repo_path)) == target
-    ]
-    if not matching:
-        return json.dumps({"error": "No review found for this repository"})
-
-    task = max(matching, key=lambda t: t.updated_at)
-    task = ReviewResultService.backfill_task(db=db, task=task)
-    result = task.latest_review_result
-    if not result:
-        return json.dumps({"error": "Review has no results yet"})
-
-    findings = [
-        {"severity": f.severity, "path": f.path, "line": f.line, "summary": f.summary}
-        for f in (result.findings or [])
-        if severity_order.get(f.severity, 0) >= min_level
-    ]
-    return json.dumps({
-        "verdict": str(result.verdict),
-        "finding_count": len(findings),
-        "findings": findings,
-    }, indent=2, ensure_ascii=False)
+@mcp.tool()
+async def update_finding(
+    task_id: Annotated[str, 'Task ID owning the finding.'],
+    finding_id: Annotated[str, 'Finding ID returned by wait_review.'],
+    action: Annotated[str, "Disposition action: 'resolve', 'dismiss', or 'reopen'."],
+) -> str:
+    """Record a human disposition (resolve, dismiss, or reopen) on a tracked finding in shared SQLite."""
+    result = await asyncio.to_thread(
+        get_service().update_finding,
+        task_id=task_id,
+        finding_id=finding_id,
+        action=action,
+    )
+    return _dumps(result)
 
 
 @mcp.tool()
 async def abort_review(
-    task_id: Annotated[str, "Task ID of the review to abort"],
+    task_id: Annotated[str, 'Task ID of the active review round to cancel.'],
 ) -> str:
-    """Abort a running review.
+    """Cancel an active preflight or review round and terminate its subprocess tree."""
+    result = await asyncio.to_thread(get_service().abort_review, task_id=task_id)
+    return _dumps(result)
 
-    Use this if a review is taking too long or is no longer needed.
+
+# ── Stdio transport with strict stdout isolation ──────────────────────
+
+
+async def _run_stdio_isolated() -> None:
+    """Run FastMCP stdio transport on a dedicated dup'd stdout fd.
+
+    Redirects fd 1 and ``sys.stdout`` to ``stderr`` so accidental prints or
+    library output can never corrupt the JSON-RPC stream.
     """
-    if task_id in _background_tasks:
-        task = _background_tasks[task_id]
-        if not task.done():
-            task.cancel()
-            _background_results[task_id] = {"status": "aborted"}
-            return json.dumps({"status": "aborted", "task_id": task_id})
-        return json.dumps({"status": "already_finished"})
+    sys.stdout.flush()
+    raw_stdout_fd = os.dup(1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
 
-    return json.dumps({"status": "not_found", "message": f"No active review with task_id: {task_id}"})
+    raw_binary = os.fdopen(raw_stdout_fd, 'wb', buffering=0)
+    text_stdout = TextIOWrapper(raw_binary, encoding='utf-8')
+    protocol_stdout = anyio.wrap_file(text_stdout)
+    try:
+        async with stdio_server(stdout=protocol_stdout) as (read_stream, write_stream):
+            await mcp._mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp._mcp_server.create_initialization_options(),
+            )
+    finally:
+        if _service is not None:
+            _service.shutdown()
+        try:
+            text_stdout.flush()
+        except Exception:
+            pass
+        try:
+            text_stdout.close()
+        except Exception:
+            pass
 
 
-# ── Entry point ───────────────────────────────────────────────────────
-
-def serve():
-    """Run MCP server in stdio mode (blocking)."""
-    asyncio.run(mcp.run_stdio_async())
+def serve() -> None:
+    """Start the Mission Control MCP server over stdio."""
+    asyncio.run(_run_stdio_isolated())
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     serve()

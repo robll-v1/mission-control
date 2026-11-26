@@ -78,6 +78,10 @@ def run_clean_venv_smoke(wheel_path: Path) -> None:
 
         amc_bin = venv_dir / ('Scripts/amc.exe' if sys.platform == 'win32' else 'bin/amc')
         assert amc_bin.is_file(), f'amc entry point not found at {amc_bin}'
+        alias_bin = venv_dir / (
+            'Scripts/agent-mission-control.exe' if sys.platform == 'win32' else 'bin/agent-mission-control'
+        )
+        assert alias_bin.is_file(), f'agent-mission-control entry point not found at {alias_bin}'
 
         env = {
             **os.environ,
@@ -93,8 +97,9 @@ def run_clean_venv_smoke(wheel_path: Path) -> None:
         # Verify Node is genuinely absent from the test PATH
         assert shutil.which('node', path=env['PATH']) is None, 'node should be excluded from smoke PATH'
 
-        # 1. CLI help & doctor
+        # 1. CLI help, package-name alias & doctor
         subprocess.run([str(amc_bin), '--help'], cwd=str(work_dir), env=env, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run([str(alias_bin), '--help'], cwd=str(work_dir), env=env, check=True, stdout=subprocess.DEVNULL)
         subprocess.run([str(amc_bin), 'review', '--help'], cwd=str(work_dir), env=env, check=True, stdout=subprocess.DEVNULL)
         doctor = subprocess.run([str(amc_bin), 'doctor', '--json'], cwd=str(work_dir), env=env, capture_output=True, text=True)
         # Doctor exits 0 if at least one CLI is present, non-zero if none; either way it must emit valid JSON
