@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-AMC_GIT_SPEC = 'git+https://github.com/robll-v1/mission-control.git'
+AMC_PACKAGE_SPEC = 'agent-mission-control'
 
 # Ordered preference for cross-agent code review backends.
 REVIEWER_CANDIDATES: tuple[tuple[str, str], ...] = (
@@ -86,10 +86,10 @@ def resolve_amc_command(which_fn=shutil.which) -> list[str] | None:
         return [amc_bin]
     uvx_bin = which_fn('uvx')
     if uvx_bin:
-        return [uvx_bin, '--from', AMC_GIT_SPEC, 'amc']
+        return [uvx_bin, '--from', AMC_PACKAGE_SPEC, 'amc']
     pipx_bin = which_fn('pipx')
     if pipx_bin:
-        return [pipx_bin, 'run', '--spec', AMC_GIT_SPEC, 'amc']
+        return [pipx_bin, 'run', '--spec', AMC_PACKAGE_SPEC, 'amc']
     return None
 
 
@@ -146,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     'ok': False,
                     'error': 'Mission Control (`amc`), `uvx`, and `pipx` were not found on PATH.',
-                    'install_hint': f'Install uv (https://docs.astral.sh/uv/) or run: pipx install {AMC_GIT_SPEC}',
+                    'install_hint': f'Install uv (https://docs.astral.sh/uv/) or run: pipx install {AMC_PACKAGE_SPEC}',
                 },
                 indent=2,
             )

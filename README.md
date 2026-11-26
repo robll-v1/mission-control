@@ -19,6 +19,7 @@
 
 <p align="center">
   <a href="https://github.com/robll-v1/mission-control/actions/workflows/ci.yml"><img src="https://github.com/robll-v1/mission-control/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://pypi.org/project/agent-mission-control/"><img src="https://img.shields.io/pypi/v/agent-mission-control?style=flat-square&color=2F55D4" alt="PyPI" /></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square" alt="Python 3.11+" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22663E?style=flat-square" alt="MIT License" /></a>
   <a href="#supported-agents"><img src="https://img.shields.io/badge/agents-Codex_%7C_Claude_Code_%7C_OpenCode_%7C_Copilot-2F55D4?style=flat-square" alt="Works with Codex, Claude Code, OpenCode, and Copilot" /></a>
@@ -52,16 +53,16 @@ The bundled skill ([`skills/mission-control/SKILL.md`](skills/mission-control/SK
 
 ```bash
 # Review uncommitted local changes from the terminal (structured JSON + CI exit code)
-uvx --from git+https://github.com/robll-v1/mission-control.git amc review --backend codex --reasoning high --format json --exit-code
+uvx --from agent-mission-control amc review --backend codex --reasoning high --format json --exit-code
 
 # Or launch the local Web Workbench (bundled React UI, no Node.js needed)
-uvx --from git+https://github.com/robll-v1/mission-control.git amc start
+uvx --from agent-mission-control amc start
 ```
 
 Prefer a permanent local install?
 
 ```bash
-pipx install git+https://github.com/robll-v1/mission-control.git
+pipx install agent-mission-control   # or: pip install agent-mission-control
 amc review      # CLI review
 amc start       # Web workbench on 127.0.0.1 (stop with `amc stop`)
 amc doctor      # Non-LLM static check of installed agent flags & reasoning levels

@@ -19,6 +19,7 @@
 
 <p align="center">
   <a href="https://github.com/robll-v1/mission-control/actions/workflows/ci.yml"><img src="https://github.com/robll-v1/mission-control/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://pypi.org/project/agent-mission-control/"><img src="https://img.shields.io/pypi/v/agent-mission-control?style=flat-square&color=2F55D4" alt="PyPI" /></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square" alt="Python 3.11+" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22663E?style=flat-square" alt="MIT License" /></a>
   <a href="#支持的-agent"><img src="https://img.shields.io/badge/agents-Codex_%7C_Claude_Code_%7C_OpenCode_%7C_Copilot-2F55D4?style=flat-square" alt="支持 Codex、Claude Code、OpenCode 与 Copilot" /></a>
@@ -52,16 +53,16 @@ npx skills add robll-v1/mission-control -g
 
 ```bash
 # 终端审查未提交改动（输出结构化 JSON + CI 退出码）
-uvx --from git+https://github.com/robll-v1/mission-control.git amc review --backend codex --reasoning high --format json --exit-code
+uvx --from agent-mission-control amc review --backend codex --reasoning high --format json --exit-code
 
 # 或直接启动本地 Web 工作台（内置 React 静态包，无需 Node.js）
-uvx --from git+https://github.com/robll-v1/mission-control.git amc start
+uvx --from agent-mission-control amc start
 ```
 
 希望常驻安装到本机：
 
 ```bash
-pipx install git+https://github.com/robll-v1/mission-control.git
+pipx install agent-mission-control   # 或：pip install agent-mission-control
 amc review      # 命令行审查
 amc start       # 启动 127.0.0.1 本地工作台（amc stop 停止）
 amc doctor      # 不调用大模型的静态探针，检查 CLI 参数与推理档位
