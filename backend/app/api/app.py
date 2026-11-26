@@ -39,6 +39,7 @@ from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
 from app.services.diff_service import DiffService
 from app.services.summary_service import SummaryService
+from app.services.verification_service import VerificationService
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,17 @@ execution = ExecutionService(
     ),
 )
 validation = ValidationService(db=db, mission=engine, artifacts=artifacts, execution=execution)
+verification = VerificationService(
+    db=db,
+    mission=engine,
+    worktrees=worktrees,
+    artifacts=artifacts,
+    adapters=adapters,
+    execution=execution,
+    adapter_factory=lambda name, *, model=None, variant=None, reasoning=None: get_adapter(
+        name, model=model, variant=variant, reasoning=reasoning,
+    ),
+)
 diffs = DiffService(artifacts)
 summaries = SummaryService(db, artifacts)
 

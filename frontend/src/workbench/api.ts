@@ -1,4 +1,4 @@
-import { computeFindingCounts } from '../findings'
+import { computeAttestationCounts, computeFindingCounts } from '../findings'
 import type { TaskDetail, TaskDetailResponse } from './types'
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -36,6 +36,7 @@ export function normalizeTaskDetail(payload: TaskDetailResponse): TaskDetail {
     latestReviewResult: payload.latest_review_result ?? payload.task.latest_review_result ?? null,
     findings,
     findingCounts: payload.finding_counts ?? computeFindingCounts(findings),
+    attestationCounts: payload.attestation_counts ?? computeAttestationCounts(findings),
     rounds: payload.review_rounds ?? payload.runs ?? [],
     checks: payload.checks ?? [],
     artifacts: payload.artifacts ?? [],

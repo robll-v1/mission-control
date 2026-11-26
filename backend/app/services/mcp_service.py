@@ -28,10 +28,12 @@ from app.core.models import FindingStatus, Task, TaskStatus
 from app.core.paths import get_db_path, get_runtime_dir, get_worktrees_dir, maybe_import_legacy_db
 from app.core.proc import run_text
 from app.core.reviewer_selection import normalize_agent_name, select_reviewer_backend
+from app.core.verification_protocol import summarize_attestations
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
 from app.services.local_review_service import build_local_review_source
 from app.services.review_result_service import ReviewResultService
+from app.services.verification_service import VerificationService
 
 _ACTIVE_STATUSES = {TaskStatus.INGESTING, TaskStatus.RUNNING, TaskStatus.VALIDATING}
 _SEVERITY_ORDER = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1}
@@ -167,6 +169,7 @@ class McpReviewService:
         probe_backend_fn: Callable[..., dict[str, Any]] | None = None,
         pr_fetcher: Callable[[str], Any] = fetch_pull_request,
         poll_interval_sec: float = 0.25,
+        verification: VerificationService | None = None,
     ):
         self.db = db
         self.mission = mission
@@ -179,6 +182,16 @@ class McpReviewService:
         self._probe_backend = probe_backend_fn or _static_probe_backend
         self._pr_fetcher = pr_fetcher
         self._poll_interval_sec = max(0.02, float(poll_interval_sec))
+        self.verification = verification or VerificationService(
+            db=db,
+            mission=mission,
+            worktrees=worktrees,
+            artifacts=artifacts,
+            adapters=execution.adapters,
+            execution=execution,
+            adapter_factory=execution.adapter_factory,
+            detect_all_fn=self._detect_all,
+        )
 
         self._lock = threading.Lock()
         self._launches: dict[str, _LaunchRecord] = {}
@@ -735,6 +748,7 @@ class McpReviewService:
             'passed': passed,
             'summary': result.summary if result is not None else '',
             'finding_counts': counts,
+            'attestation_counts': summarize_attestations(tracked_findings),
             'findings': [
                 {
                     'id': f.id,
@@ -749,6 +763,7 @@ class McpReviewService:
                     'detail': f.detail,
                     'first_round': f.first_round,
                     'last_round': f.last_round,
+                    'attestations': [a.model_dump() for a in f.attestations],
                 }
                 for f in filtered
             ],
@@ -818,10 +833,59 @@ class McpReviewService:
             'finding_counts': FindingTracker.counts(all_findings),
         }
 
-    # ── Tool 5: abort_review ─────────────────────────────────────────
+    # ── Tool 5: verify_findings ──────────────────────────────────────
+
+    def verify_findings(
+        self,
+        *,
+        task_id: str,
+        backend: str | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
+        finding_ids: list[str] | None = None,
+        language: str = 'en',
+        wait_sec: int = 25,
+    ) -> dict[str, Any]:
+        """Run 1-pass Cold Falsification on a task's findings using a second local CLI."""
+        clean_id = (task_id or '').strip()
+        if not clean_id:
+            return _error_payload('invalid_task_id', 'task_id is required.')
+        clamped_wait = max(0, min(int(wait_sec), _MAX_WAIT_SEC))
+
+        try:
+            started = self.verification.start_verification(
+                clean_id,
+                backend=backend,
+                model=model,
+                reasoning=reasoning,
+                finding_ids=finding_ids,
+                language=language,
+            )
+        except KeyError as exc:
+            return _error_payload('task_not_found', str(exc))
+        except ValueError as exc:
+            return _error_payload('invalid_verification_request', str(exc))
+        except RuntimeError as exc:
+            return _error_payload('verification_unavailable', str(exc))
+
+        with self._lock:
+            self._owned_task_ids.add(clean_id)
+
+        if clamped_wait > 0:
+            finished = self.verification.wait(clean_id, timeout=float(clamped_wait))
+            if finished is not None:
+                return {**finished, 'done': True}
+
+        return {
+            **started,
+            'done': False,
+            'next_step': f"Call wait_review(task_id='{clean_id}') to wait for verification results.",
+        }
+
+    # ── Tool 6: abort_review ─────────────────────────────────────────
 
     def abort_review(self, *, task_id: str) -> dict[str, Any]:
-        """Abort an in-flight preflight/review round and terminate its process tree."""
+        """Abort an in-flight preflight/review round or verification and terminate its process tree."""
         clean_id = (task_id or '').strip()
         if not clean_id:
             return _error_payload('invalid_task_id', 'task_id is required.')
@@ -844,7 +908,7 @@ class McpReviewService:
             ):
                 time.sleep(0.02)
 
-        aborted = self.execution.abort_task(clean_id)
+        aborted = self.execution.abort_task(clean_id) or self.verification.abort_verification(clean_id)
         if aborted and launch is not None:
             launch.finished.wait(timeout=3.0)
 
@@ -860,7 +924,7 @@ class McpReviewService:
     # ── Lifecycle teardown ───────────────────────────────────────────
 
     def shutdown(self) -> None:
-        """Abort only active reviews launched by this MCP server process."""
+        """Abort only active reviews/verifications launched by this MCP server process."""
         with self._lock:
             owned = list(self._owned_task_ids)
             launches = [self._launches[tid] for tid in owned if tid in self._launches]
@@ -868,6 +932,8 @@ class McpReviewService:
             try:
                 if self.execution.is_active(tid):
                     self.execution.abort_task(tid)
+                if self.verification.is_verifying(tid):
+                    self.verification.abort_verification(tid)
             except Exception:
                 pass
         for launch in launches:

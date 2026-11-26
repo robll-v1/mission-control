@@ -8,9 +8,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
-from app.core.models import CheckRun, Event, EventLevel, FindingStatus, Run, Task, TrackedFinding
+from app.core.models import (
+    AttestationStance,
+    CheckRun,
+    Event,
+    EventLevel,
+    FindingAttestation,
+    FindingStatus,
+    Run,
+    Task,
+    TrackedFinding,
+)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _SEVERITY_RANK = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
 _CLOSED_STATUSES = {FindingStatus.RESOLVED, FindingStatus.DISMISSED}
 _STATUS_RANK = {
@@ -224,6 +234,32 @@ class Database:
               task_id TEXT PRIMARY KEY,
               last_seq INTEGER NOT NULL DEFAULT 0
             )
+            '''
+        )
+        self.conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS finding_attestations (
+              id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              finding_id TEXT NOT NULL,
+              kind TEXT NOT NULL DEFAULT 'falsification',
+              stance TEXT NOT NULL,
+              backend TEXT NOT NULL,
+              model TEXT,
+              reasoning TEXT,
+              cross_model INTEGER NOT NULL DEFAULT 1,
+              review_revision TEXT,
+              rationale TEXT NOT NULL DEFAULT '',
+              evidence TEXT NOT NULL DEFAULT '',
+              trigger_path TEXT NOT NULL DEFAULT '',
+              created_at REAL NOT NULL
+            )
+            '''
+        )
+        self.conn.execute(
+            '''
+            CREATE INDEX IF NOT EXISTS idx_finding_attestations_task_finding
+              ON finding_attestations(task_id, finding_id, created_at)
             '''
         )
         if current_version < SCHEMA_VERSION:
@@ -585,13 +621,128 @@ class Database:
                     pass
                 raise
 
+    @staticmethod
+    def _row_to_attestation(row: sqlite3.Row) -> FindingAttestation:
+        try:
+            stance = AttestationStance(row['stance'])
+        except ValueError:
+            stance = AttestationStance.UNCERTAIN
+        return FindingAttestation(
+            id=row['id'],
+            task_id=row['task_id'],
+            finding_id=row['finding_id'],
+            kind=row['kind'] or 'falsification',
+            stance=stance,
+            backend=row['backend'],
+            model=row['model'],
+            reasoning=row['reasoning'],
+            cross_model=bool(row['cross_model']),
+            review_revision=row['review_revision'],
+            rationale=row['rationale'] or '',
+            evidence=row['evidence'] or '',
+            trigger_path=row['trigger_path'] or '',
+            created_at=float(row['created_at'] or 0.0),
+        )
+
+    def save_attestations(self, attestations: Iterable[FindingAttestation]) -> None:
+        items = list(attestations)
+        if not items:
+            return
+        sql = '''
+            INSERT INTO finding_attestations (
+              id, task_id, finding_id, kind, stance, backend, model, reasoning,
+              cross_model, review_revision, rationale, evidence, trigger_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              stance = excluded.stance,
+              backend = excluded.backend,
+              model = excluded.model,
+              reasoning = excluded.reasoning,
+              cross_model = excluded.cross_model,
+              review_revision = excluded.review_revision,
+              rationale = excluded.rationale,
+              evidence = excluded.evidence,
+              trigger_path = excluded.trigger_path,
+              created_at = excluded.created_at
+        '''
+        with self._lock:
+            self.conn.execute('SAVEPOINT amc_save_attestations')
+            try:
+                for att in items:
+                    self.conn.execute(
+                        sql,
+                        (
+                            att.id,
+                            att.task_id,
+                            att.finding_id,
+                            att.kind,
+                            att.stance.value,
+                            att.backend,
+                            att.model,
+                            att.reasoning,
+                            1 if att.cross_model else 0,
+                            att.review_revision,
+                            att.rationale,
+                            att.evidence,
+                            att.trigger_path,
+                            float(att.created_at),
+                        ),
+                    )
+                self.conn.execute('RELEASE SAVEPOINT amc_save_attestations')
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.execute('ROLLBACK TO SAVEPOINT amc_save_attestations')
+                    self.conn.execute('RELEASE SAVEPOINT amc_save_attestations')
+                except Exception:
+                    pass
+                raise
+
+    def list_attestations(
+        self,
+        task_id: str,
+        finding_id: str | None = None,
+    ) -> list[FindingAttestation]:
+        with self._lock:
+            if finding_id is not None:
+                rows = self.conn.execute(
+                    '''
+                    SELECT * FROM finding_attestations
+                    WHERE task_id = ? AND finding_id = ?
+                    ORDER BY created_at ASC, id ASC
+                    ''',
+                    (task_id, finding_id),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    '''
+                    SELECT * FROM finding_attestations
+                    WHERE task_id = ?
+                    ORDER BY created_at ASC, id ASC
+                    ''',
+                    (task_id,),
+                ).fetchall()
+        return [self._row_to_attestation(row) for row in rows]
+
     def get_finding(self, task_id: str, finding_id: str) -> TrackedFinding | None:
         with self._lock:
             row = self.conn.execute(
                 'SELECT * FROM findings WHERE task_id = ? AND id = ?',
                 (task_id, finding_id),
             ).fetchone()
-        return self._row_to_finding(row) if row else None
+            if row is None:
+                return None
+            att_rows = self.conn.execute(
+                '''
+                SELECT * FROM finding_attestations
+                WHERE task_id = ? AND finding_id = ?
+                ORDER BY created_at ASC, id ASC
+                ''',
+                (task_id, finding_id),
+            ).fetchall()
+        finding = self._row_to_finding(row)
+        finding.attestations = [self._row_to_attestation(r) for r in att_rows]
+        return finding
 
     def list_findings(self, task_id: str) -> list[TrackedFinding]:
         with self._lock:
@@ -599,7 +750,23 @@ class Database:
                 'SELECT * FROM findings WHERE task_id = ? ORDER BY created_at ASC, id ASC',
                 (task_id,),
             ).fetchall()
-        findings = [self._row_to_finding(row) for row in rows]
+            att_rows = self.conn.execute(
+                '''
+                SELECT * FROM finding_attestations
+                WHERE task_id = ?
+                ORDER BY created_at ASC, id ASC
+                ''',
+                (task_id,),
+            ).fetchall()
+        by_finding: dict[str, list[FindingAttestation]] = {}
+        for att_row in att_rows:
+            att = self._row_to_attestation(att_row)
+            by_finding.setdefault(att.finding_id, []).append(att)
+        findings = []
+        for row in rows:
+            finding = self._row_to_finding(row)
+            finding.attestations = by_finding.get(finding.id, [])
+            findings.append(finding)
         findings.sort(
             key=lambda f: (
                 1 if f.status in _CLOSED_STATUSES else 0,
@@ -614,6 +781,7 @@ class Database:
 
     def delete_findings(self, task_id: str) -> None:
         with self._lock:
+            self.conn.execute('DELETE FROM finding_attestations WHERE task_id = ?', (task_id,))
             self.conn.execute('DELETE FROM findings WHERE task_id = ?', (task_id,))
             self.conn.execute('DELETE FROM finding_sync_state WHERE task_id = ?', (task_id,))
             self.conn.commit()
@@ -631,6 +799,7 @@ class Database:
                 self.conn.execute('DELETE FROM runs WHERE task_id = ?', (task_id,))
                 self.conn.execute('DELETE FROM events WHERE task_id = ?', (task_id,))
                 self.conn.execute('DELETE FROM check_runs WHERE task_id = ?', (task_id,))
+                self.conn.execute('DELETE FROM finding_attestations WHERE task_id = ?', (task_id,))
                 self.conn.execute('DELETE FROM findings WHERE task_id = ?', (task_id,))
                 self.conn.execute('DELETE FROM finding_sync_state WHERE task_id = ?', (task_id,))
                 self.conn.execute('DELETE FROM task_event_seq WHERE task_id = ?', (task_id,))

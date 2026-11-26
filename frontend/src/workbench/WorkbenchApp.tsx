@@ -133,6 +133,7 @@ export function WorkbenchApp() {
   const [startingTaskIds, setStartingTaskIds] = useState<string[]>([])
   const [startingSpecByTask, setStartingSpecByTask] = useState<Record<string, PendingRoundSpec>>({})
   const [runningValidation, setRunningValidation] = useState(false)
+  const [verifyingFindings, setVerifyingFindings] = useState(false)
   const [diffState, setDiffState] = useState<{ taskId: string; data: DiffResponse | null; loading: boolean }>({
     taskId: '',
     data: null,
@@ -636,6 +637,26 @@ export function WorkbenchApp() {
     }
   }
 
+  const handleVerifyFindings = async () => {
+    if (!selectedTaskId || verifyingFindings) return
+    setVerifyingFindings(true)
+    try {
+      const res = await api<{ verifier_backend: string }>(`/api/tasks/${selectedTaskId}/verify`, {
+        method: 'POST',
+        body: JSON.stringify({
+          language: language === 'zh-CN' ? 'zh-CN' : 'en',
+        }),
+      })
+      setNotice({ tone: 'info', text: (m) => m.findings.verificationStarted(res.verifier_backend) })
+      void loadTask(selectedTaskId, { silent: true })
+      void refreshTasks({ silent: true })
+    } catch (err) {
+      setNotice({ tone: 'error', text: errorMessage(err, (m) => m.findings.verificationFailed) })
+    } finally {
+      setVerifyingFindings(false)
+    }
+  }
+
   const handleRunChecks = async (mode: 'standard' | 'full') => {
     if (!selectedTaskId || runningValidation) return
     setRunningValidation(true)
@@ -653,8 +674,13 @@ export function WorkbenchApp() {
     }
   }
 
+  const isVerifyingSelected = Boolean(
+    selectedTask && selectedTask.status === 'validating' && selectedTask.current_stage === 'verifying_findings',
+  )
   const isStartingSelected = Boolean(selectedTask && startingTaskIds.includes(selectedTask.id))
-  const isSelectedActive = Boolean(selectedTask && (isRoundActive(selectedTask.status) || isStartingSelected))
+  const isSelectedActive = Boolean(
+    selectedTask && (isRoundActive(selectedTask.status) || isVerifyingSelected || isStartingSelected),
+  )
   const nextRoundNumber = orderedRounds.length + 1
   const activeRoundNumber =
     latestRound && isRoundActive(selectedTask?.status) ? latestRound.round_index : nextRoundNumber
@@ -954,6 +980,17 @@ export function WorkbenchApp() {
                           onRunNow={() => void startRound(selectedTask.id)}
                         />
                       </div>
+                    )}
+
+                    {!isSelectedActive && findingCounts.open > 0 && (
+                      <button
+                        type="button"
+                        className="wb-btn wb-btn-secondary wb-btn-sm"
+                        disabled={verifyingFindings}
+                        onClick={() => void handleVerifyFindings()}
+                      >
+                        {verifyingFindings ? t.findings.verifying : t.findings.verifyFindings}
+                      </button>
                     )}
 
                     <button

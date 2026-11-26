@@ -41,6 +41,30 @@ class FindingStatus(StrEnum):
     DISMISSED = 'dismissed'
 
 
+class AttestationStance(StrEnum):
+    CONFIRMED = 'confirmed'
+    DISPUTED = 'disputed'
+    UNCERTAIN = 'uncertain'
+
+
+class FindingAttestation(BaseModel):
+    """Independent verification evidence attached to a tracked finding."""
+    id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    task_id: str
+    finding_id: str
+    kind: str = 'falsification'
+    stance: AttestationStance = AttestationStance.UNCERTAIN
+    backend: str
+    model: str | None = None
+    reasoning: str | None = None
+    cross_model: bool = True
+    review_revision: str | None = None
+    rationale: str = ''
+    evidence: str = ''
+    trigger_path: str = ''
+    created_at: float = 0.0
+
+
 class ReviewFinding(BaseModel):
     severity: str
     summary: str
@@ -73,6 +97,7 @@ class TrackedFinding(BaseModel):
     previous_line: int | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
+    attestations: list[FindingAttestation] = Field(default_factory=list)
 
 
 class ReviewResult(BaseModel):

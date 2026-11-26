@@ -69,13 +69,13 @@ Or add to `.mcp.json` / Cursor MCP config:
 }
 ```
 
-Exposes 5 tools (`check_agents`, `start_review`, `wait_review`, `update_finding`, `abort_review`) backed by your local CLIs and the same SQLite database as `amc start` (open the Web Workbench anytime to inspect the exact MCP tasks and diffs).
+Exposes 6 tools (`check_agents`, `start_review`, `wait_review`, `verify_findings`, `update_finding`, `abort_review`) backed by your local CLIs and the same SQLite database as `amc start` (open the Web Workbench anytime to inspect the exact MCP tasks, diffs, and cross-model verification evidence).
 
 ### Option C: CLI or Local Web Workbench (zero-clone with `uvx`)
 
 ```bash
-# Review uncommitted local changes from the terminal (structured JSON + CI exit code)
-uvx agent-mission-control review --backend codex --reasoning high --format json --exit-code
+# Review uncommitted local changes (+ optional 1-pass Cold Falsification on a 2nd CLI)
+uvx agent-mission-control review --backend codex --reasoning high --verify-with auto --format json --exit-code
 
 # Or launch the local Web Workbench (bundled React UI, no Node.js needed)
 uvx agent-mission-control start
@@ -186,7 +186,7 @@ Default reasoning is always **`Model default`** (`null` — no reasoning flag pa
 
 ```bash
 # CLI
-amc review [PR_URL] [--repo PATH] [--backend codex|claude-code|opencode|copilot] [--model MODEL] [--reasoning LEVEL] [--focus TEXT] [--format json] [--exit-code]
+amc review [PR_URL] [--repo PATH] [--backend codex|claude-code|opencode|copilot] [--model MODEL] [--reasoning LEVEL] [--verify-with auto|BACKEND] [--focus TEXT] [--format json] [--exit-code]
 amc start [--port 8000] [--no-browser]   # amc status / amc stop / amc doctor / amc init [--global]
 ```
 

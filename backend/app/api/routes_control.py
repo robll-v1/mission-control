@@ -10,11 +10,17 @@ from app.core.execution import (
     ExecutionService,
     PullRequestRefreshError,
 )
+from app.services.verification_service import VerificationService
 
 
 def get_execution() -> ExecutionService:
     from app.api.app import execution
     return execution
+
+
+def get_verification() -> VerificationService:
+    from app.api.app import verification
+    return verification
 
 
 router = APIRouter(prefix='/api/tasks', tags=['control'])
@@ -83,9 +89,50 @@ def start_task(task_id: str, request: StartTaskRequest, execution: ExecutionServ
     return run.model_dump()
 
 
+class VerifyFindingsRequest(BaseModel):
+    backend: str | None = None
+    model: str | None = None
+    reasoning: str | None = None
+    finding_ids: list[str] | None = None
+    language: str | None = DEFAULT_REVIEW_LANGUAGE
+
+    @field_validator('language')
+    @classmethod
+    def _validate_language(cls, value: str | None) -> str:
+        return normalize_review_language(value, strict=True)
+
+
+@router.post('/{task_id}/verify')
+def verify_task_findings(
+    task_id: str,
+    request: VerifyFindingsRequest | None = None,
+    verification: VerificationService = Depends(get_verification),
+):
+    req = request or VerifyFindingsRequest()
+    try:
+        return verification.start_verification(
+            task_id,
+            backend=req.backend,
+            model=req.model,
+            reasoning=req.reasoning,
+            finding_ids=req.finding_ids,
+            language=req.language or DEFAULT_REVIEW_LANGUAGE,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.post('/{task_id}/abort')
-def abort_task(task_id: str, execution: ExecutionService = Depends(get_execution)):
-    ok = execution.abort_task(task_id)
+def abort_task(
+    task_id: str,
+    execution: ExecutionService = Depends(get_execution),
+    verification: VerificationService = Depends(get_verification),
+):
+    ok = execution.abort_task(task_id) or verification.abort_verification(task_id)
     if not ok:
         raise HTTPException(status_code=409, detail='task is not actively running')
     return {'ok': True}

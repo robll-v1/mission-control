@@ -5,10 +5,12 @@ import { test } from 'node:test'
 import {
   applyUpdatedFinding,
   buildFixPrompt,
+  computeAttestationCounts,
   computeFindingCounts,
   filterFindings,
   findingLocationText,
   isClosedFinding,
+  latestAttestation,
   type TrackedFinding,
 } from '../src/findings.ts'
 
@@ -114,4 +116,56 @@ test('buildFixPrompt formats severity, location, title, and detail', () => {
   const prompt = buildFixPrompt(SAMPLE[0])
   assert.ok(prompt.includes('[CRITICAL] notes.py:48 — SQL injection in search()'))
   assert.ok(prompt.includes('Bind the keyword as a SQL parameter.'))
+})
+
+test('latestAttestation and computeAttestationCounts summarize verification stances', () => {
+  const withAttestations: TrackedFinding[] = [
+    {
+      ...SAMPLE[0],
+      attestations: [
+        {
+          id: 'a1',
+          task_id: 't1',
+          finding_id: 'f1',
+          stance: 'uncertain',
+          backend: 'codex',
+          cross_model: false,
+          rationale: 'initial',
+        },
+        {
+          id: 'a2',
+          task_id: 't1',
+          finding_id: 'f1',
+          stance: 'confirmed',
+          backend: 'claude-code',
+          cross_model: true,
+          rationale: 'verified',
+        },
+      ],
+    },
+    {
+      ...SAMPLE[1],
+      attestations: [
+        {
+          id: 'a3',
+          task_id: 't1',
+          finding_id: 'f2',
+          stance: 'disputed',
+          backend: 'claude-code',
+          cross_model: true,
+          rationale: 'guarded upstream',
+        },
+      ],
+    },
+    SAMPLE[2],
+  ]
+  assert.equal(latestAttestation(withAttestations[0])?.id, 'a2')
+  assert.equal(latestAttestation(withAttestations[2]), null)
+  assert.deepEqual(computeAttestationCounts(withAttestations), {
+    confirmed: 1,
+    disputed: 1,
+    uncertain: 0,
+    unattested: 1,
+    cross_model_verified: 2,
+  })
 })

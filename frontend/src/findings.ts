@@ -16,6 +16,33 @@ export type FindingAction = 'resolve' | 'dismiss' | 'reopen'
 
 export type FindingFilter = 'open' | 'all' | FindingStatus
 
+export type AttestationStance = 'confirmed' | 'disputed' | 'uncertain'
+
+export type FindingAttestation = {
+  id: string
+  task_id: string
+  finding_id: string
+  kind?: string
+  stance: AttestationStance
+  backend: string
+  model?: string | null
+  reasoning?: string | null
+  cross_model: boolean
+  review_revision?: string | null
+  rationale: string
+  evidence?: string
+  trigger_path?: string
+  created_at?: number
+}
+
+export type AttestationCounts = {
+  confirmed: number
+  disputed: number
+  uncertain: number
+  unattested: number
+  cross_model_verified: number
+}
+
 export type TrackedFinding = {
   id: string
   task_id: string
@@ -38,6 +65,7 @@ export type TrackedFinding = {
   previous_line?: number | null
   created_at?: number
   updated_at?: number
+  attestations?: FindingAttestation[]
 }
 
 export type FindingCounts = {
@@ -132,6 +160,34 @@ export function applyUpdatedFinding(
 export function findingLocationText(finding: Pick<TrackedFinding, 'path' | 'line'>): string | null {
   if (!finding.path) return null
   return finding.line && finding.line > 0 ? `${finding.path}:${finding.line}` : finding.path
+}
+
+export function latestAttestation(finding: TrackedFinding): FindingAttestation | null {
+  const list = finding.attestations
+  if (!list || list.length === 0) return null
+  return list[list.length - 1]
+}
+
+export function computeAttestationCounts(findings: TrackedFinding[]): AttestationCounts {
+  const counts: AttestationCounts = {
+    confirmed: 0,
+    disputed: 0,
+    uncertain: 0,
+    unattested: 0,
+    cross_model_verified: 0,
+  }
+  for (const item of findings) {
+    const att = latestAttestation(item)
+    if (!att) {
+      counts.unattested += 1
+      continue
+    }
+    if (att.stance === 'confirmed') counts.confirmed += 1
+    else if (att.stance === 'disputed') counts.disputed += 1
+    else counts.uncertain += 1
+    if (att.cross_model) counts.cross_model_verified += 1
+  }
+  return counts
 }
 
 export function buildFixPrompt(finding: TrackedFinding): string {

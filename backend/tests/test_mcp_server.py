@@ -182,6 +182,7 @@ def test_mcp_entrypoint_registers_new_five_tools(isolated_config):
         'start_review',
         'wait_review',
         'update_finding',
+        'verify_findings',
         'abort_review',
     }
     for name, tool in by_name.items():
@@ -437,6 +438,7 @@ def test_mcp_stdio_protocol_handshake_and_zero_stdout_pollution(tmp_path):
             'start_review',
             'wait_review',
             'update_finding',
+            'verify_findings',
             'abort_review',
         }
     finally:

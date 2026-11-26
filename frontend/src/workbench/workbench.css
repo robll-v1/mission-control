@@ -616,6 +616,20 @@ html[data-ui='next'] body {
 .wb-loc-link:hover { text-decoration: underline; }
 .wb-finding-detail { margin: 0; color: var(--wb-t2); white-space: pre-wrap; }
 .wb-finding-hint { margin: 0; }
+.wb-attestation-box {
+  border: 1px solid var(--wb-border);
+  border-left: 3px solid var(--wb-border-strong);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--wb-sidebar);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.wb-attestation-confirmed { border-left-color: var(--wb-ok); }
+.wb-attestation-disputed { border-left-color: var(--wb-warn); }
+.wb-attestation-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.wb-attestation-text { margin: 0; white-space: pre-wrap; }
 .wb-snippet {
   border: 1px solid var(--wb-border);
   border-radius: 6px;
