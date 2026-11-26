@@ -1946,6 +1946,70 @@ def _print_review_markdown(report) -> None:
         print('Note: more rounds are available to address findings.')
 
 
+# ── doctor command ────────────────────────────────────────────────────
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    """Run non-LLM static probes against installed (or specified) agent CLIs."""
+    from fastapi import HTTPException
+    from app.api.routes_config import CheckAgentRequest, check_agent
+    from app.core.backend_detector import BackendDetector
+    from app.core.config import resolve_backend_config
+
+    target_backend = (getattr(args, 'backend', None) or '').strip() or None
+    model = (getattr(args, 'model', None) or '').strip() or None
+    reasoning = (getattr(args, 'reasoning', None) or '').strip() or None
+    as_json = bool(getattr(args, 'json', False))
+
+    checks: list[dict[str, object]] = []
+    if target_backend:
+        targets = [(target_backend, model, reasoning)]
+    else:
+        detected = BackendDetector.detect_all()
+        targets = []
+        for cap in detected:
+            cfg = resolve_backend_config('.', backend=cap.name)
+            targets.append((cap.name, model or cfg.get('model'), reasoning or cfg.get('reasoning')))
+
+    for name, b_model, b_reasoning in targets:
+        try:
+            res = check_agent(CheckAgentRequest(backend=name, model=b_model, reasoning=b_reasoning))
+            checks.append(res.model_dump())
+        except HTTPException as exc:
+            checks.append({
+                'ok': False,
+                'backend': name,
+                'executable': '',
+                'command': [],
+                'exit_code': None,
+                'message': str(exc.detail),
+                'model': b_model,
+                'reasoning': b_reasoning,
+            })
+
+    overall_ok = bool(checks) and all(bool(item.get('ok')) for item in checks)
+    payload = {
+        'ok': overall_ok,
+        'checked': len(checks),
+        'backends': checks,
+    }
+
+    if as_json:
+        _print_json(payload)
+    else:
+        if not checks:
+            print('No supported agent CLI detected on PATH (codex, claude, opencode, gh copilot).')
+        else:
+            for item in checks:
+                mark = _SYM_OK if item.get('ok') else _SYM_FAIL
+                bname = item.get('backend', '')
+                bmodel = item.get('model') or 'CLI default'
+                breason = item.get('reasoning') or 'Model default'
+                msg = item.get('message', '')
+                print(f'{mark} {bname} ({bmodel} · {breason}): {msg}')
+
+    sys.exit(0 if overall_ok else 1)
+
+
 # ── mcp command ───────────────────────────────────────────────────────
 
 def cmd_mcp(args: argparse.Namespace) -> None:
@@ -2017,6 +2081,13 @@ def main() -> None:
                           help='Exit 1 if review has concerns; setup/runtime errors exit 2')
     review_p.add_argument('--no-incremental', action='store_true', help='Review all current changes and replace prior findings')
 
+    # doctor subcommand
+    doctor_p = sub.add_parser('doctor', help='Run non-LLM static checks on installed agent CLIs and reasoning flags')
+    doctor_p.add_argument('--backend', default=None, help='Check a specific backend (opencode, claude-code, copilot, codex)')
+    doctor_p.add_argument('--model', '-m', default=None, help='Model name to validate')
+    doctor_p.add_argument('--reasoning', default=None, help='Reasoning effort level to validate')
+    doctor_p.add_argument('--json', action='store_true', help='Emit machine-readable JSON to stdout')
+
     # mcp subcommand
     sub.add_parser('mcp', help='Start MCP tool server (stdio)')
 
@@ -2028,6 +2099,7 @@ def main() -> None:
         'status': cmd_status,
         'init': cmd_init,
         'review': cmd_review,
+        'doctor': cmd_doctor,
         'mcp': cmd_mcp,
     }
     commands[args.command](args)

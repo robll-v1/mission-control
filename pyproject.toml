@@ -1,9 +1,36 @@
 [project]
 name = 'agent-mission-control'
 version = '0.1.0'
-description = 'Local-first console for multi-round GitHub pull request review'
+description = 'Local-first cross-agent code review workbench and CLI for uncommitted local changes and GitHub PRs'
 readme = 'README.md'
+license = 'MIT'
+license-files = ['LICENSE']
 requires-python = '>=3.11'
+authors = [
+  { name = 'robll-v1' },
+]
+keywords = [
+  'code-review',
+  'ai-agents',
+  'codex',
+  'claude-code',
+  'opencode',
+  'github-pr',
+  'developer-tools',
+  'cli',
+]
+classifiers = [
+  'Development Status :: 4 - Beta',
+  'Environment :: Console',
+  'Environment :: Web Environment',
+  'Intended Audience :: Developers',
+  'Operating System :: OS Independent',
+  'Programming Language :: Python :: 3',
+  'Programming Language :: Python :: 3.11',
+  'Programming Language :: Python :: 3.12',
+  'Programming Language :: Python :: 3.13',
+  'Topic :: Software Development :: Quality Assurance',
+]
 dependencies = [
   'fastapi>=0.116.0',
   'uvicorn>=0.35.0',
@@ -19,24 +46,30 @@ dev = [
   'pytest>=8.0',
 ]
 
+[project.urls]
+Homepage = 'https://github.com/robll-v1/mission-control'
+Repository = 'https://github.com/robll-v1/mission-control'
+Issues = 'https://github.com/robll-v1/mission-control/issues'
+
 [build-system]
-requires = ['setuptools>=68', 'wheel']
+requires = ['setuptools>=77', 'wheel']
 build-backend = 'setuptools.build_meta'
 
 [tool.pytest.ini_options]
 testpaths = ['backend/tests']
 pythonpath = ['backend']
 
-
 [tool.setuptools]
 package-dir = {"" = "backend"}
 include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["backend"]
+where = ['backend']
+include = ['app', 'app.*']
+exclude = ['tests', 'tests.*']
 
 [tool.setuptools.package-data]
-app = ["static/*", "static/ui/*", "static/ui/assets/*"]
+app = ['static/*', 'static/ui/*', 'static/ui/assets/*']
 
 [project.scripts]
-amc = "app.cli:main"
+amc = 'app.cli:main'
