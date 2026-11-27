@@ -1803,10 +1803,47 @@ def cmd_review(args: argparse.Namespace) -> None:
             recoverable=True,
         )
 
+    verification_result: dict | None = None
+    verify_with = (getattr(args, 'verify_with', None) or '').strip() or None
+    if (
+        verify_with
+        and report.error is None
+        and report.task_id
+        and report.finding_count > 0
+    ):
+        from app.adapters import AVAILABLE_BACKENDS, get_adapter
+        from app.services.verification_service import VerificationService
+
+        _eprint(f'Running Cold Falsification verification (verifier: {verify_with})...')
+        try:
+            adapters_map = {name: get_adapter(name) for name in AVAILABLE_BACKENDS}
+            verifier = VerificationService(
+                db=engine._db,
+                mission=engine._mission,
+                worktrees=engine._worktrees,
+                artifacts=engine._artifacts,
+                adapters=adapters_map,
+                execution=engine._execution,
+                adapter_factory=lambda name, *, model=None, variant=None, reasoning=None: get_adapter(
+                    name, model=model, variant=variant, reasoning=reasoning,
+                ),
+            )
+            verification_result = verifier.run_verification_sync(
+                report.task_id,
+                backend=verify_with,
+                timeout_sec=timeout,
+            )
+        except Exception as exc:
+            verification_result = {
+                'ok': False,
+                'verifier_backend': verify_with,
+                'error': str(exc),
+            }
+
     if output_format == 'json':
-        _print_json(_report_to_json(report))
+        _print_json(_report_to_json(report, verification=verification_result))
     else:
-        _print_review_markdown(report)
+        _print_review_markdown(report, verification=verification_result)
 
     verdict = str(getattr(report.verdict, 'value', report.verdict))
     if report.error is not None:
@@ -1820,7 +1857,7 @@ def cmd_review(args: argparse.Namespace) -> None:
     sys.exit(0)
 
 
-def _report_to_json(report) -> dict:
+def _report_to_json(report, *, verification: dict | None = None) -> dict:
     """Convert ReviewReport to JSON-serializable dict."""
     verdict = str(report.verdict.value) if hasattr(report.verdict, 'value') else str(report.verdict)
     error_message = ''
@@ -1874,6 +1911,9 @@ def _report_to_json(report) -> dict:
             ],
         }
 
+    if verification is not None:
+        output['verification'] = verification
+
     if report.error is not None:
         output['error'] = report.error
     elif verdict == 'failed':
@@ -1886,7 +1926,7 @@ def _report_to_json(report) -> dict:
     return output
 
 
-def _print_review_markdown(report) -> None:
+def _print_review_markdown(report, *, verification: dict | None = None) -> None:
     """Pretty-print review report to terminal."""
     marker = _SYM_OK if report.passed else _SYM_FAIL
     print(f'{marker} Verdict: {report.verdict}')
@@ -1941,6 +1981,25 @@ def _print_review_markdown(report) -> None:
             loc = f' ({f.path}:{f.line})' if f.path else ''
             print(f'   - [fixed] [{f.severity}]{loc} {f.summary}')
         print()
+
+    if verification is not None:
+        if verification.get('ok'):
+            v_summary = verification.get('summary') or {}
+            v_backend = verification.get('verifier_backend', 'unknown')
+            cross_tag = 'cross-model' if verification.get('cross_model') else 'same-agent cold context'
+            print(
+                f'Verification ({v_backend}, {cross_tag}): '
+                f'{v_summary.get("confirmed", 0)} confirmed, '
+                f'{v_summary.get("disputed", 0)} disputed, '
+                f'{v_summary.get("uncertain", 0)} uncertain'
+            )
+            for att in verification.get('attestations') or []:
+                ev = f' ({att["evidence"]})' if att.get('evidence') else ''
+                print(f'   - [{att.get("stance", "uncertain")}] {att.get("finding_id", "")}{ev}: {att.get("rationale", "")}')
+            print()
+        else:
+            print(f'{_SYM_WARN} Verification failed: {verification.get("error", "unknown error")}')
+            print()
 
     if report.can_continue:
         print('Note: more rounds are available to address findings.')
@@ -2063,6 +2122,8 @@ def main() -> None:
     review_p.add_argument('--exit-code', action='store_true',
                           help='Exit 1 if review has concerns; setup/runtime errors exit 2')
     review_p.add_argument('--no-incremental', action='store_true', help='Review all current changes and replace prior findings')
+    review_p.add_argument('--verify-with', default=None,
+                          help='Run 1-pass Cold Falsification on reported findings using a second local CLI (auto, codex, claude-code, opencode, copilot)')
 
     # doctor subcommand
     doctor_p = sub.add_parser('doctor', help='Run non-LLM static checks on installed agent CLIs and reasoning flags')

@@ -1,4 +1,4 @@
-import type { FindingCounts, TrackedFinding } from '../findings'
+import type { AttestationCounts, FindingCounts, TrackedFinding } from '../findings'
 import type { RunSettings } from '../runSettings'
 
 export type ReviewFinding = {
@@ -106,6 +106,7 @@ export type TaskDetailResponse = {
   latest_review_result?: ReviewResult | null
   findings?: TrackedFinding[]
   finding_counts?: FindingCounts
+  attestation_counts?: AttestationCounts
   review_rounds?: ReviewRound[]
   runs?: ReviewRound[]
   checks?: CheckRun[]
@@ -120,6 +121,7 @@ export type TaskDetail = {
   latestReviewResult: ReviewResult | null
   findings: TrackedFinding[]
   findingCounts: FindingCounts
+  attestationCounts: AttestationCounts
   rounds: ReviewRound[]
   checks: CheckRun[]
   artifacts: ArtifactEntry[]

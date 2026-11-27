@@ -27,8 +27,9 @@ WORKFLOW:
 1. Optional: call check_agents() to inspect locally installed agent CLIs and reasoning levels (zero LLM calls).
 2. Call start_review(repo_path=..., exclude_agent=<your-own-agent>) to snapshot uncommitted local changes (or a GitHub PR) and launch a review on a second local CLI.
 3. Call wait_review(task_id=...) — it long-polls up to 25s and returns either progress (done=false) or structured findings (done=true). Repeat wait_review while done=false.
-4. After fixing confirmed issues, call start_review(task_id=..., repo_path=...) to run Round 2 on the updated working tree and track findings as new / persistent / unverified / likely_fixed.
-5. Use update_finding(task_id, finding_id, action='resolve'|'dismiss'|'reopen') for human dispositions, or abort_review(task_id) to cancel an active round.
+4. Optional: call verify_findings(task_id=...) to run 1-pass Cold Falsification on open findings with a different local CLI, attaching confirmed / disputed / uncertain evidence to each finding.
+5. After fixing confirmed issues, call start_review(task_id=..., repo_path=...) to run Round 2 on the updated working tree and track findings as new / persistent / unverified / likely_fixed.
+6. Use update_finding(task_id, finding_id, action='resolve'|'dismiss'|'reopen') for human dispositions, or abort_review(task_id) to cancel an active round or verification.
 
 RULES:
 - Pass exclude_agent (e.g. 'claude-code' or 'codex') so Mission Control picks a different installed CLI when available.
@@ -157,6 +158,39 @@ async def update_finding(
         task_id=task_id,
         finding_id=finding_id,
         action=action,
+    )
+    return _dumps(result)
+
+
+@mcp.tool()
+async def verify_findings(
+    task_id: Annotated[str, 'Task ID whose open findings should be verified.'],
+    backend: Annotated[
+        str | None,
+        "Optional explicit verifier CLI ('codex', 'claude-code', 'opencode', 'copilot', or 'auto'). Omit or pass 'auto' to pick a different CLI from the primary reviewer.",
+    ] = None,
+    model: Annotated[str | None, 'Optional verifier model ID override.'] = None,
+    reasoning: Annotated[str | None, "Optional verifier reasoning effort override (e.g. 'low', 'medium', 'high')."] = None,
+    finding_ids: Annotated[
+        list[str] | None,
+        'Optional subset of finding IDs to verify. Omit to verify all open findings on the task.',
+    ] = None,
+    language: Annotated[str, "Verification rationale language: 'en' (default) or 'zh-CN'."] = 'en',
+    wait_sec: Annotated[
+        int,
+        'Maximum seconds to wait for verification completion before returning (default 25, clamped 0..45).',
+    ] = 25,
+) -> str:
+    """Run 1-pass adversarial Cold Falsification on findings using a second local CLI on the same snapshot."""
+    result = await asyncio.to_thread(
+        get_service().verify_findings,
+        task_id=task_id,
+        backend=backend,
+        model=model,
+        reasoning=reasoning,
+        finding_ids=finding_ids,
+        language=language,
+        wait_sec=wait_sec,
     )
     return _dumps(result)
 

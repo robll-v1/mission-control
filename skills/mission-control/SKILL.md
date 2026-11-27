@@ -36,6 +36,8 @@ Mission Control snapshots the exact working tree (staged, unstaged, and untracke
    - `--focus "<area>"` — e.g. `"security, concurrency, edge cases"`
    - `--pr <github-pr-url>` — review a GitHub pull request instead of local changes
 
+   Need to reduce false positives on high-stakes diffs? Run `amc review --verify-with auto` (or MCP `verify_findings`) to run a 1-pass Cold Falsification check against the same frozen snapshot with a second local CLI (`confirmed` / `disputed` / `uncertain`, never auto-dismissing findings).
+
    The helper locates `amc` on `PATH` or falls back to `uvx --from agent-mission-control amc`, picks an installed reviewer CLI different from `--exclude`, and emits structured JSON to stdout.
 
 2. **Inspect the structured JSON receipt** (`verdict`, `passed`, `finding_count`, `findings[]`):

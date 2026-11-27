@@ -3,6 +3,7 @@ import {
   buildFixPrompt,
   findingLocationText,
   isClosedFinding,
+  latestAttestation,
   type FindingAction,
   type TrackedFinding,
 } from '../findings'
@@ -37,6 +38,13 @@ export function FindingCard({
   const closed = isClosedFinding(finding.status)
   const compact = !expanded && (finding.status === 'likely_fixed' || closed)
   const snippet = snippetState?.key === snippetKey ? snippetState.data : null
+  const attestation = latestAttestation(finding)
+
+  const attestationTone = (stance: string) => {
+    if (stance === 'confirmed') return 'ok'
+    if (stance === 'disputed') return 'warn'
+    return 'neutral'
+  }
 
   useEffect(() => {
     setSnippetState((prev) => (prev?.key === snippetKey ? prev : null))
@@ -96,6 +104,11 @@ export function FindingCard({
           {loc && <span className="wb-mono wb-ac wb-sm">{loc}</span>}
         </div>
         <div className="wb-finding-compact-right">
+          {attestation && (
+            <span className={`wb-status-pill wb-tone-${attestationTone(attestation.stance)}`}>
+              {labelFor(t.findings.attestationStance, attestation.stance)} · {attestation.backend}
+            </span>
+          )}
           <span className={`wb-status-pill wb-tone-${statusTone()}`}>{statusText()}</span>
           {finding.status === 'likely_fixed' && (
             <button
@@ -132,6 +145,11 @@ export function FindingCard({
           <h4 className="wb-finding-title">{finding.title}</h4>
         </div>
         <div className="wb-finding-badges">
+          {attestation && (
+            <span className={`wb-status-pill wb-tone-${attestationTone(attestation.stance)}`}>
+              {labelFor(t.findings.attestationStance, attestation.stance)} · {attestation.backend}
+            </span>
+          )}
           {finding.reopened && (
             <span className="wb-status-pill wb-tone-warn">{t.findings.reopened}</span>
           )}
@@ -190,6 +208,31 @@ export function FindingCard({
               <code className="wb-snippet-code wb-mono">{ln.text || ' '}</code>
             </div>
           ))}
+        </div>
+      )}
+
+      {attestation && (
+        <div className={`wb-attestation-box wb-attestation-${attestation.stance}`}>
+          <div className="wb-attestation-head wb-xs">
+            <span className="wb-b">
+              {labelFor(t.findings.attestationStance, attestation.stance)} · {attestation.backend}
+            </span>
+            {attestation.model && <span className="wb-mono wb-t3">{attestation.model}</span>}
+            {!attestation.cross_model && (
+              <span className="wb-t3">({t.findings.attestationSameModel})</span>
+            )}
+          </div>
+          {attestation.rationale && <p className="wb-xs wb-t2 wb-attestation-text">{attestation.rationale}</p>}
+          {attestation.evidence && (
+            <p className="wb-xs wb-t3 wb-mono wb-attestation-text">
+              {t.findings.attestationEvidence(attestation.evidence)}
+            </p>
+          )}
+          {attestation.trigger_path && (
+            <p className="wb-xs wb-t2 wb-mono wb-attestation-text">
+              {t.findings.attestationTrigger(attestation.trigger_path)}
+            </p>
+          )}
         </div>
       )}
 

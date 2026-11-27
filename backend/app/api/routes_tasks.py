@@ -13,6 +13,7 @@ from app.core.finding_tracker import FindingTracker
 from app.core.github_ingest import fetch_pull_request, is_github_pr_url
 from app.core.mission_engine import MissionEngine
 from app.core.models import FindingStatus, TaskStatus
+from app.core.verification_protocol import summarize_attestations
 from app.schemas.task import CreateTaskRequest
 from app.services.artifact_store import ArtifactStore
 from app.services.diff_service import DiffService
@@ -240,6 +241,7 @@ def get_task(
         'latest_review_result': task.latest_review_result.model_dump() if task.latest_review_result is not None else None,
         'findings': [finding.model_dump() for finding in tracked_findings],
         'finding_counts': FindingTracker.counts(tracked_findings),
+        'attestation_counts': summarize_attestations(tracked_findings),
         'review_rounds': [run.model_dump() for run in rounds],
         'runs': [run.model_dump() for run in rounds],
         'checks': [check.model_dump() for check in mission.db.list_check_runs(task_id)],
@@ -272,6 +274,7 @@ def list_task_findings(
     return {
         'findings': [f.model_dump() for f in filtered],
         'counts': FindingTracker.counts(all_findings),
+        'attestation_counts': summarize_attestations(all_findings),
     }
 
 
