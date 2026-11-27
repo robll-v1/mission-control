@@ -2,8 +2,10 @@ import { useEffect, useState } from 'react'
 import {
   buildFixPrompt,
   findingLocationText,
+  independentReporters,
   isClosedFinding,
-  latestAttestation,
+  isConsensusFinding,
+  latestFalsification,
   type FindingAction,
   type TrackedFinding,
 } from '../findings'
@@ -38,7 +40,9 @@ export function FindingCard({
   const closed = isClosedFinding(finding.status)
   const compact = !expanded && (finding.status === 'likely_fixed' || closed)
   const snippet = snippetState?.key === snippetKey ? snippetState.data : null
-  const attestation = latestAttestation(finding)
+  const reporters = independentReporters(finding)
+  const consensus = isConsensusFinding(finding)
+  const attestation = latestFalsification(finding)
 
   const attestationTone = (stance: string) => {
     if (stance === 'confirmed') return 'ok'
@@ -104,6 +108,15 @@ export function FindingCard({
           {loc && <span className="wb-mono wb-ac wb-sm">{loc}</span>}
         </div>
         <div className="wb-finding-compact-right">
+          {consensus ? (
+            <span className="wb-status-pill wb-tone-ok">
+              {t.findings.consensusBadge(reporters.length, reporters.join(' + '))}
+            </span>
+          ) : reporters.length === 1 ? (
+            <span className="wb-status-pill wb-tone-neutral">
+              {t.findings.uniqueReporter(reporters[0])}
+            </span>
+          ) : null}
           {attestation && (
             <span className={`wb-status-pill wb-tone-${attestationTone(attestation.stance)}`}>
               {labelFor(t.findings.attestationStance, attestation.stance)} · {attestation.backend}
@@ -145,6 +158,15 @@ export function FindingCard({
           <h4 className="wb-finding-title">{finding.title}</h4>
         </div>
         <div className="wb-finding-badges">
+          {consensus ? (
+            <span className="wb-status-pill wb-tone-ok">
+              {t.findings.consensusBadge(reporters.length, reporters.join(' + '))}
+            </span>
+          ) : reporters.length === 1 ? (
+            <span className="wb-status-pill wb-tone-neutral">
+              {t.findings.uniqueReporter(reporters[0])}
+            </span>
+          ) : null}
           {attestation && (
             <span className={`wb-status-pill wb-tone-${attestationTone(attestation.stance)}`}>
               {labelFor(t.findings.attestationStance, attestation.stance)} · {attestation.backend}

@@ -196,6 +196,49 @@ async def verify_findings(
 
 
 @mcp.tool()
+async def run_blind_jury(
+    task_id: Annotated[
+        str | None,
+        'Existing task_id to run blind dual-review on (optional if repo_path is given).',
+    ] = None,
+    repo_path: Annotated[
+        str | None,
+        'Path to local git repository (used to snapshot and create a task when task_id is omitted).',
+    ] = None,
+    pr_url: Annotated[str | None, 'Optional GitHub PR URL when creating a new task.'] = None,
+    base: Annotated[str | None, 'Optional base branch for local diff when creating a new task.'] = None,
+    backends: Annotated[
+        list[str] | None,
+        "Optional list of 2 distinct local CLIs (e.g. ['codex', 'claude-code']). Omit to auto-pick the top 2 installed CLIs.",
+    ] = None,
+    falsify_disagreements: Annotated[
+        bool,
+        'When true (default), automatically run 1-pass Cold Falsification on 1/2 unique findings using the other juror (0 extra tokens on 2/2 consensus items).',
+    ] = True,
+    focus: Annotated[str | None, 'Optional review focus area when creating a new task.'] = None,
+    language: Annotated[str, "Review output language: 'en' (default) or 'zh-CN'."] = 'en',
+    wait_sec: Annotated[
+        int,
+        'Maximum seconds to wait before returning progress (default 25, clamped 0..45).',
+    ] = 25,
+) -> str:
+    """Run same-snapshot blind dual-review across 2 distinct local CLIs with optional disagreement falsification."""
+    result = await asyncio.to_thread(
+        get_service().run_blind_jury,
+        task_id=task_id,
+        repo_path=repo_path,
+        pr_url=pr_url,
+        base=base,
+        backends=backends,
+        falsify_disagreements=falsify_disagreements,
+        focus=focus,
+        language=language,
+        wait_sec=wait_sec,
+    )
+    return _dumps(result)
+
+
+@mcp.tool()
 async def abort_review(
     task_id: Annotated[str, 'Task ID of the active review round to cancel.'],
 ) -> str:

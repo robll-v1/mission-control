@@ -1779,6 +1779,57 @@ def cmd_review(args: argparse.Namespace) -> None:
             _eprint(f'   Model: {engine.model}')
         if engine.reasoning:
             _eprint(f'   Reasoning: {engine.reasoning}')
+
+        if getattr(args, 'jury', False):
+            from app.adapters import AVAILABLE_BACKENDS, get_adapter
+            from app.services.blind_jury_service import BlindJuryService
+
+            raw_jb = (getattr(args, 'jury_backends', None) or '').strip()
+            jury_backends = [b.strip() for b in raw_jb.split(',') if b.strip()] if raw_jb else None
+            falsify = not bool(getattr(args, 'no_falsify_disagreements', False))
+            task = engine.create_task(
+                repo_path,
+                pr_url=pr_url,
+                base=base,
+                review_focus=args.focus or '',
+            )
+            adapters_map = {name: get_adapter(name) for name in AVAILABLE_BACKENDS}
+            mission_obj = getattr(engine, '_engine', None) or getattr(engine, '_mission')
+            jury_svc = BlindJuryService(
+                db=engine._db,
+                mission=mission_obj,
+                worktrees=engine._worktrees,
+                artifacts=engine._artifacts,
+                contexts=engine._contexts,
+                adapters=adapters_map,
+                execution=engine._execution,
+                adapter_factory=lambda name, *, model=None, variant=None, reasoning=None: get_adapter(
+                    name, model=model, variant=variant, reasoning=reasoning,
+                ),
+            )
+            _eprint('Running same-snapshot Blind Dual-Review Jury...')
+            jury_res = jury_svc.run_jury_sync(
+                task.id,
+                backends=jury_backends,
+                falsify_disagreements=falsify,
+                timeout_sec=timeout,
+            )
+            if output_format == 'json':
+                _print_json(jury_res)
+            else:
+                marker = _SYM_OK if jury_res.get('passed') else _SYM_FAIL
+                print(f'{marker} Blind Jury Verdict: {jury_res.get("verdict", "failed")}')
+                print(f'   Jurors: {", ".join(jury_res.get("jurors") or [])}')
+                if jury_res.get('summary'):
+                    print(f'   {jury_res["summary"]}')
+                if jury_res.get('error'):
+                    print(f'{_SYM_WARN} Error: {jury_res["error"]}')
+            if not jury_res.get('ok'):
+                sys.exit(2)
+            if args.exit_code and not jury_res.get('passed'):
+                sys.exit(1)
+            sys.exit(0)
+
         report = engine.review(
             repo_path,
             pr_url=pr_url,
@@ -1817,9 +1868,10 @@ def cmd_review(args: argparse.Namespace) -> None:
         _eprint(f'Running Cold Falsification verification (verifier: {verify_with})...')
         try:
             adapters_map = {name: get_adapter(name) for name in AVAILABLE_BACKENDS}
+            mission_obj = getattr(engine, '_engine', None) or getattr(engine, '_mission')
             verifier = VerificationService(
                 db=engine._db,
-                mission=engine._mission,
+                mission=mission_obj,
                 worktrees=engine._worktrees,
                 artifacts=engine._artifacts,
                 adapters=adapters_map,
@@ -1910,6 +1962,16 @@ def _report_to_json(report, *, verification: dict | None = None) -> dict:
                 for f in report.unverified_findings
             ],
         }
+
+    if getattr(report, 'raw_verdict', None) is not None:
+        raw_v = report.raw_verdict
+        output['raw_verdict'] = str(raw_v.value) if hasattr(raw_v, 'value') else str(raw_v)
+    if getattr(report, 'round_plan', None) is not None:
+        output['round_plan'] = report.round_plan.to_dict()
+    if getattr(report, 'disposition', None) is not None:
+        output['disposition'] = report.disposition.to_dict()
+    if getattr(report, 'continuation', None) is not None:
+        output['continuation'] = report.continuation.to_dict()
 
     if verification is not None:
         output['verification'] = verification
@@ -2124,6 +2186,12 @@ def main() -> None:
     review_p.add_argument('--no-incremental', action='store_true', help='Review all current changes and replace prior findings')
     review_p.add_argument('--verify-with', default=None,
                           help='Run 1-pass Cold Falsification on reported findings using a second local CLI (auto, codex, claude-code, opencode, copilot)')
+    review_p.add_argument('--jury', action='store_true',
+                          help='Run same-snapshot Blind Dual-Review across 2 distinct local CLIs with targeted disagreement Cold Falsification')
+    review_p.add_argument('--jury-backends', default=None,
+                          help='Comma-separated pair of juror backends for --jury (e.g. codex,claude-code; omit to auto-pick top 2 installed CLIs)')
+    review_p.add_argument('--no-falsify-disagreements', action='store_true',
+                          help='With --jury, skip Cold Falsification on 1/2 unique findings')
 
     # doctor subcommand
     doctor_p = sub.add_parser('doctor', help='Run non-LLM static checks on installed agent CLIs and reasoning flags')

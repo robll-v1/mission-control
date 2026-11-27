@@ -134,6 +134,7 @@ export function WorkbenchApp() {
   const [startingSpecByTask, setStartingSpecByTask] = useState<Record<string, PendingRoundSpec>>({})
   const [runningValidation, setRunningValidation] = useState(false)
   const [verifyingFindings, setVerifyingFindings] = useState(false)
+  const [runningJury, setRunningJury] = useState(false)
   const [diffState, setDiffState] = useState<{ taskId: string; data: DiffResponse | null; loading: boolean }>({
     taskId: '',
     data: null,
@@ -657,6 +658,26 @@ export function WorkbenchApp() {
     }
   }
 
+  const handleRunBlindJury = async () => {
+    if (!selectedTaskId || runningJury) return
+    setRunningJury(true)
+    try {
+      const res = await api<{ jurors: string[] }>(`/api/tasks/${selectedTaskId}/jury`, {
+        method: 'POST',
+        body: JSON.stringify({
+          language: language === 'zh-CN' ? 'zh-CN' : 'en',
+        }),
+      })
+      setNotice({ tone: 'info', text: (m) => m.findings.juryStarted((res.jurors || []).join(' + ')) })
+      void loadTask(selectedTaskId, { silent: true })
+      void refreshTasks({ silent: true })
+    } catch (err) {
+      setNotice({ tone: 'error', text: errorMessage(err, (m) => m.findings.juryFailed) })
+    } finally {
+      setRunningJury(false)
+    }
+  }
+
   const handleRunChecks = async (mode: 'standard' | 'full') => {
     if (!selectedTaskId || runningValidation) return
     setRunningValidation(true)
@@ -675,7 +696,10 @@ export function WorkbenchApp() {
   }
 
   const isVerifyingSelected = Boolean(
-    selectedTask && selectedTask.status === 'validating' && selectedTask.current_stage === 'verifying_findings',
+    selectedTask &&
+      selectedTask.status === 'validating' &&
+      (selectedTask.current_stage === 'verifying_findings' ||
+        selectedTask.current_stage === 'blind_jury_running'),
   )
   const isStartingSelected = Boolean(selectedTask && startingTaskIds.includes(selectedTask.id))
   const isSelectedActive = Boolean(
@@ -980,6 +1004,17 @@ export function WorkbenchApp() {
                           onRunNow={() => void startRound(selectedTask.id)}
                         />
                       </div>
+                    )}
+
+                    {!isSelectedActive && backends.length >= 2 && (
+                      <button
+                        type="button"
+                        className="wb-btn wb-btn-secondary wb-btn-sm"
+                        disabled={runningJury}
+                        onClick={() => void handleRunBlindJury()}
+                      >
+                        {runningJury ? t.findings.runningJury : t.findings.blindJury}
+                      </button>
                     )}
 
                     {!isSelectedActive && findingCounts.open > 0 && (

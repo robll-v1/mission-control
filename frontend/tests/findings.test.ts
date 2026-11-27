@@ -9,8 +9,11 @@ import {
   computeFindingCounts,
   filterFindings,
   findingLocationText,
+  independentReporters,
   isClosedFinding,
+  isConsensusFinding,
   latestAttestation,
+  latestFalsification,
   type TrackedFinding,
 } from '../src/findings.ts'
 
@@ -168,4 +171,64 @@ test('latestAttestation and computeAttestationCounts summarize verification stan
     unattested: 1,
     cross_model_verified: 2,
   })
+})
+
+test('independentReporters, isConsensusFinding, and latestFalsification distinguish blind jury consensus from falsification', () => {
+  const consensusFinding: TrackedFinding = {
+    ...SAMPLE[0],
+    attestations: [
+      {
+        id: 'ir1',
+        task_id: 't1',
+        finding_id: 'f1',
+        kind: 'independent_review',
+        stance: 'confirmed',
+        backend: 'codex',
+        cross_model: true,
+        rationale: 'Reported independently by codex during blind dual-review jury.',
+      },
+      {
+        id: 'ir2',
+        task_id: 't1',
+        finding_id: 'f1',
+        kind: 'independent_review',
+        stance: 'confirmed',
+        backend: 'claude-code',
+        cross_model: true,
+        rationale: 'Reported independently by claude-code during blind dual-review jury.',
+      },
+    ],
+  }
+  assert.deepEqual(independentReporters(consensusFinding), ['codex', 'claude-code'])
+  assert.equal(isConsensusFinding(consensusFinding), true)
+  assert.equal(latestFalsification(consensusFinding), null)
+
+  const uniqueWithFalsification: TrackedFinding = {
+    ...SAMPLE[1],
+    attestations: [
+      {
+        id: 'ir3',
+        task_id: 't1',
+        finding_id: 'f2',
+        kind: 'independent_review',
+        stance: 'confirmed',
+        backend: 'codex',
+        cross_model: false,
+        rationale: 'Reported independently by codex.',
+      },
+      {
+        id: 'fal1',
+        task_id: 't1',
+        finding_id: 'f2',
+        kind: 'falsification',
+        stance: 'disputed',
+        backend: 'claude-code',
+        cross_model: true,
+        rationale: 'Connection is closed in caller context manager.',
+      },
+    ],
+  }
+  assert.deepEqual(independentReporters(uniqueWithFalsification), ['codex'])
+  assert.equal(isConsensusFinding(uniqueWithFalsification), false)
+  assert.equal(latestFalsification(uniqueWithFalsification)?.id, 'fal1')
 })

@@ -69,13 +69,16 @@ Or add to `.mcp.json` / Cursor MCP config:
 }
 ```
 
-Exposes 6 tools (`check_agents`, `start_review`, `wait_review`, `verify_findings`, `update_finding`, `abort_review`) backed by your local CLIs and the same SQLite database as `amc start` (open the Web Workbench anytime to inspect the exact MCP tasks, diffs, and cross-model verification evidence).
+Exposes 7 tools (`check_agents`, `start_review`, `wait_review`, `verify_findings`, `run_blind_jury`, `update_finding`, `abort_review`) backed by your local CLIs and the same SQLite database as `amc start` (open the Web Workbench anytime to inspect the exact MCP tasks, diffs, 2/2 blind-jury consensus, and cross-model falsification evidence).
 
 ### Option C: CLI or Local Web Workbench (zero-clone with `uvx`)
 
 ```bash
 # Review uncommitted local changes (+ optional 1-pass Cold Falsification on a 2nd CLI)
 uvx agent-mission-control review --backend codex --reasoning high --verify-with auto --format json --exit-code
+
+# Or run a Same-Snapshot Blind Dual-Review Jury (2 distinct CLIs in parallel + targeted falsification on 1/2 disagreements)
+uvx agent-mission-control review --jury --format json --exit-code
 
 # Or launch the local Web Workbench (bundled React UI, no Node.js needed)
 uvx agent-mission-control start
@@ -186,7 +189,7 @@ Default reasoning is always **`Model default`** (`null` — no reasoning flag pa
 
 ```bash
 # CLI
-amc review [PR_URL] [--repo PATH] [--backend codex|claude-code|opencode|copilot] [--model MODEL] [--reasoning LEVEL] [--verify-with auto|BACKEND] [--focus TEXT] [--format json] [--exit-code]
+amc review [PR_URL] [--repo PATH] [--backend codex|claude-code|opencode|copilot] [--model MODEL] [--reasoning LEVEL] [--verify-with auto|BACKEND] [--jury [--jury-backends A,B]] [--focus TEXT] [--format json] [--exit-code]
 amc start [--port 8000] [--no-browser]   # amc status / amc stop / amc doctor / amc init [--global]
 ```
 
