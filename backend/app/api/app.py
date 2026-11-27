@@ -37,6 +37,7 @@ from app.core.recovery import recover_stale_tasks
 from app.core.validation import ValidationService
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
+from app.services.blind_jury_service import BlindJuryService
 from app.services.diff_service import DiffService
 from app.services.summary_service import SummaryService
 from app.services.verification_service import VerificationService
@@ -73,6 +74,18 @@ verification = VerificationService(
     mission=engine,
     worktrees=worktrees,
     artifacts=artifacts,
+    adapters=adapters,
+    execution=execution,
+    adapter_factory=lambda name, *, model=None, variant=None, reasoning=None: get_adapter(
+        name, model=model, variant=variant, reasoning=reasoning,
+    ),
+)
+blind_jury = BlindJuryService(
+    db=db,
+    mission=engine,
+    worktrees=worktrees,
+    artifacts=artifacts,
+    contexts=contexts,
     adapters=adapters,
     execution=execution,
     adapter_factory=lambda name, *, model=None, variant=None, reasoning=None: get_adapter(

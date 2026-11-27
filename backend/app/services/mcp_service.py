@@ -31,6 +31,7 @@ from app.core.reviewer_selection import normalize_agent_name, select_reviewer_ba
 from app.core.verification_protocol import summarize_attestations
 from app.core.worktree import WorktreeManager
 from app.services.artifact_store import ArtifactStore
+from app.services.blind_jury_service import BlindJuryService
 from app.services.local_review_service import build_local_review_source
 from app.services.review_result_service import ReviewResultService
 from app.services.verification_service import VerificationService
@@ -170,6 +171,7 @@ class McpReviewService:
         pr_fetcher: Callable[[str], Any] = fetch_pull_request,
         poll_interval_sec: float = 0.25,
         verification: VerificationService | None = None,
+        blind_jury: BlindJuryService | None = None,
     ):
         self.db = db
         self.mission = mission
@@ -187,6 +189,17 @@ class McpReviewService:
             mission=mission,
             worktrees=worktrees,
             artifacts=artifacts,
+            adapters=execution.adapters,
+            execution=execution,
+            adapter_factory=execution.adapter_factory,
+            detect_all_fn=self._detect_all,
+        )
+        self.blind_jury = blind_jury or BlindJuryService(
+            db=db,
+            mission=mission,
+            worktrees=worktrees,
+            artifacts=artifacts,
+            contexts=contexts,
             adapters=execution.adapters,
             execution=execution,
             adapter_factory=execution.adapter_factory,
@@ -882,10 +895,88 @@ class McpReviewService:
             'next_step': f"Call wait_review(task_id='{clean_id}') to wait for verification results.",
         }
 
-    # ── Tool 6: abort_review ─────────────────────────────────────────
+    # ── Tool 6: run_blind_jury ───────────────────────────────────────
+
+    def run_blind_jury(
+        self,
+        *,
+        task_id: str | None = None,
+        repo_path: str | None = None,
+        pr_url: str | None = None,
+        base: str | None = None,
+        backends: list[str] | None = None,
+        falsify_disagreements: bool = True,
+        focus: str | None = None,
+        language: str = 'en',
+        wait_sec: int = 25,
+    ) -> dict[str, Any]:
+        """Run same-snapshot Blind Dual-Review + optional targeted disagreement Cold Falsification."""
+        try:
+            clean_lang = normalize_review_language(language)
+        except ValueError as exc:
+            return _error_payload('invalid_language', str(exc))
+
+        clean_id = (task_id or '').strip() or None
+        if clean_id is None:
+            raw_repo = (repo_path or '').strip()
+            if not raw_repo:
+                return _error_payload('invalid_arguments', 'Either task_id or repo_path is required.')
+            resolved_repo = Path(raw_repo).expanduser().resolve()
+            if not resolved_repo.exists() or not resolved_repo.is_dir():
+                return _error_payload('invalid_repo_path', f'repo_path does not exist or is not a directory: {raw_repo}')
+            try:
+                juror_a, _juror_b = self.blind_jury._resolve_jurors(backends)
+            except ValueError as exc:
+                return _error_payload('invalid_jury_request', str(exc))
+            except RuntimeError as exc:
+                return _error_payload('jury_requires_two_backends', str(exc))
+            created = self._create_task(
+                repo_path=str(resolved_repo),
+                pr_url=(pr_url or '').strip() or None,
+                base=(base or '').strip() or None,
+                backend=juror_a,
+                model=None,
+                reasoning=None,
+                language=clean_lang,
+                review_focus=(focus or '').strip(),
+            )
+            if isinstance(created, dict):
+                return created
+            clean_id = created.id
+
+        clamped_wait = max(0, min(int(wait_sec), _MAX_WAIT_SEC))
+        try:
+            started = self.blind_jury.start_jury(
+                clean_id,
+                backends=backends,
+                falsify_disagreements=falsify_disagreements,
+                language=clean_lang,
+            )
+        except KeyError as exc:
+            return _error_payload('task_not_found', str(exc))
+        except ValueError as exc:
+            return _error_payload('invalid_jury_request', str(exc))
+        except RuntimeError as exc:
+            return _error_payload('jury_unavailable', str(exc))
+
+        with self._lock:
+            self._owned_task_ids.add(clean_id)
+
+        if clamped_wait > 0:
+            finished = self.blind_jury.wait(clean_id, timeout=float(clamped_wait))
+            if finished is not None:
+                return {**finished, 'done': True}
+
+        return {
+            **started,
+            'done': False,
+            'next_step': f"Call wait_review(task_id='{clean_id}') to wait for blind jury results.",
+        }
+
+    # ── Tool 7: abort_review ─────────────────────────────────────────
 
     def abort_review(self, *, task_id: str) -> dict[str, Any]:
-        """Abort an in-flight preflight/review round or verification and terminate its process tree."""
+        """Abort an in-flight preflight/review round, verification, or blind jury."""
         clean_id = (task_id or '').strip()
         if not clean_id:
             return _error_payload('invalid_task_id', 'task_id is required.')
@@ -908,7 +999,11 @@ class McpReviewService:
             ):
                 time.sleep(0.02)
 
-        aborted = self.execution.abort_task(clean_id) or self.verification.abort_verification(clean_id)
+        aborted = (
+            self.execution.abort_task(clean_id)
+            or self.verification.abort_verification(clean_id)
+            or self.blind_jury.abort_jury(clean_id)
+        )
         if aborted and launch is not None:
             launch.finished.wait(timeout=3.0)
 
@@ -924,7 +1019,7 @@ class McpReviewService:
     # ── Lifecycle teardown ───────────────────────────────────────────
 
     def shutdown(self) -> None:
-        """Abort only active reviews/verifications launched by this MCP server process."""
+        """Abort only active reviews/verifications/juries launched by this MCP process."""
         with self._lock:
             owned = list(self._owned_task_ids)
             launches = [self._launches[tid] for tid in owned if tid in self._launches]
@@ -934,6 +1029,8 @@ class McpReviewService:
                     self.execution.abort_task(tid)
                 if self.verification.is_verifying(tid):
                     self.verification.abort_verification(tid)
+                if self.blind_jury.is_running(tid):
+                    self.blind_jury.abort_jury(tid)
             except Exception:
                 pass
         for launch in launches:

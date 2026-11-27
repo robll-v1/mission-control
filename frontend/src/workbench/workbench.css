@@ -627,7 +627,7 @@ html[data-ui='next'] body {
   gap: 4px;
 }
 .wb-attestation-confirmed { border-left-color: var(--wb-ok); }
-.wb-attestation-disputed { border-left-color: var(--wb-warn); }
+.wb-attestation-disputed { border-left-color: var(--wb-med); }
 .wb-attestation-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .wb-attestation-text { margin: 0; white-space: pre-wrap; }
 .wb-snippet {

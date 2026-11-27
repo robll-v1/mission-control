@@ -168,6 +168,34 @@ export function latestAttestation(finding: TrackedFinding): FindingAttestation |
   return list[list.length - 1]
 }
 
+export function independentReporters(finding: TrackedFinding): string[] {
+  const list = finding.attestations
+  if (!list || list.length === 0) return []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const att of list) {
+    if (att.kind === 'independent_review' && att.backend && !seen.has(att.backend)) {
+      seen.add(att.backend)
+      out.push(att.backend)
+    }
+  }
+  return out
+}
+
+export function isConsensusFinding(finding: TrackedFinding): boolean {
+  return independentReporters(finding).length >= 2
+}
+
+export function latestFalsification(finding: TrackedFinding): FindingAttestation | null {
+  const list = finding.attestations
+  if (!list || list.length === 0) return null
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const att = list[i]
+    if (!att.kind || att.kind === 'falsification') return att
+  }
+  return null
+}
+
 export function computeAttestationCounts(findings: TrackedFinding[]): AttestationCounts {
   const counts: AttestationCounts = {
     confirmed: 0,

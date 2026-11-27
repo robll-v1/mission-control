@@ -10,6 +10,7 @@ from app.core.execution import (
     ExecutionService,
     PullRequestRefreshError,
 )
+from app.services.blind_jury_service import BlindJuryService
 from app.services.verification_service import VerificationService
 
 
@@ -21,6 +22,11 @@ def get_execution() -> ExecutionService:
 def get_verification() -> VerificationService:
     from app.api.app import verification
     return verification
+
+
+def get_blind_jury() -> BlindJuryService:
+    from app.api.app import blind_jury
+    return blind_jury
 
 
 router = APIRouter(prefix='/api/tasks', tags=['control'])
@@ -126,13 +132,51 @@ def verify_task_findings(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+class BlindJuryRequest(BaseModel):
+    backends: list[str] | None = None
+    falsify_disagreements: bool = True
+    language: str | None = DEFAULT_REVIEW_LANGUAGE
+
+    @field_validator('language')
+    @classmethod
+    def _validate_language(cls, value: str | None) -> str:
+        return normalize_review_language(value, strict=True)
+
+
+@router.post('/{task_id}/jury')
+def start_task_blind_jury(
+    task_id: str,
+    request: BlindJuryRequest | None = None,
+    blind_jury: BlindJuryService = Depends(get_blind_jury),
+):
+    req = request or BlindJuryRequest()
+    try:
+        return blind_jury.start_jury(
+            task_id,
+            backends=req.backends,
+            falsify_disagreements=req.falsify_disagreements,
+            language=req.language or DEFAULT_REVIEW_LANGUAGE,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.post('/{task_id}/abort')
 def abort_task(
     task_id: str,
     execution: ExecutionService = Depends(get_execution),
     verification: VerificationService = Depends(get_verification),
+    blind_jury: BlindJuryService = Depends(get_blind_jury),
 ):
-    ok = execution.abort_task(task_id) or verification.abort_verification(task_id)
+    ok = (
+        execution.abort_task(task_id)
+        or verification.abort_verification(task_id)
+        or blind_jury.abort_jury(task_id)
+    )
     if not ok:
         raise HTTPException(status_code=409, detail='task is not actively running')
     return {'ok': True}

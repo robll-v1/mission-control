@@ -69,13 +69,16 @@ claude mcp add mission-control -- uvx agent-mission-control mcp
 }
 ```
 
-提供 6 个正交工具（`check_agents`、`start_review`、`wait_review`、`verify_findings`、`update_finding`、`abort_review`），直接驱动本机 CLI 并与 `amc start` 共享同一个 SQLite 数据库（随时打开 Web 工作台即可查看 MCP 发起的任务、Diff 与跨模型冷证伪证据）。
+提供 7 个正交工具（`check_agents`、`start_review`、`wait_review`、`verify_findings`、`run_blind_jury`、`update_finding`、`abort_review`），直接驱动本机 CLI 并与 `amc start` 共享同一个 SQLite 数据库（随时打开 Web 工作台即可查看 MCP 发起的任务、Diff、2/2 双模型盲审共识与跨模型冷证伪证据）。
 
 ### 方式 C：CLI 或本地 Web 工作台（`uvx` 零克隆启动）
 
 ```bash
 # 终端审查未提交改动（可选 --verify-with auto 用第二个本地 CLI 对发现项做冷证伪）
 uvx agent-mission-control review --backend codex --reasoning high --verify-with auto --format json --exit-code
+
+# 或直接运行同快照双模型盲审（2 个不同本地 CLI 并行独立审，仅对 1/2 独有分歧定向冷证伪）
+uvx agent-mission-control review --jury --format json --exit-code
 
 # 或直接启动本地 Web 工作台（内置 React 静态包，无需 Node.js）
 uvx agent-mission-control start
@@ -186,7 +189,7 @@ cd frontend && npm ci && npx tsc --noEmit && npm test && npm run build
 
 ```bash
 # CLI
-amc review [PR_URL] [--repo PATH] [--backend codex|claude-code|opencode|copilot] [--model MODEL] [--reasoning LEVEL] [--verify-with auto|BACKEND] [--focus TEXT] [--format json] [--exit-code]
+amc review [PR_URL] [--repo PATH] [--backend codex|claude-code|opencode|copilot] [--model MODEL] [--reasoning LEVEL] [--verify-with auto|BACKEND] [--jury [--jury-backends A,B]] [--focus TEXT] [--format json] [--exit-code]
 amc start [--port 8000] [--no-browser]   # amc status / amc stop / amc doctor / amc init [--global]
 ```
 

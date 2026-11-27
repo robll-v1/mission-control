@@ -21,7 +21,12 @@ from app.core.context_compiler import ContextCompiler
 from app.core.config import UNSET, _UnsetType, resolve_backend_config
 from app.core.db import Database
 from app.core.execution import ExecutionService
-from app.core.finding_tracker import FindingTracker, compute_fingerprint, normalize_finding_path
+from app.core.finding_tracker import (
+    FindingTracker,
+    compute_fingerprint,
+    diff_modified_ranges,
+    normalize_finding_path,
+)
 from app.core.github_ingest import fetch_pull_request, is_github_pr_url
 from app.core.mission_engine import MissionEngine
 from app.core.models import (
@@ -36,6 +41,13 @@ from app.core.models import (
     TrackedFinding,
 )
 from app.core.proc import run_text
+from app.core.round_plan import (
+    ContinuationDecision,
+    RoundDisposition,
+    RoundPlan,
+    compute_round_disposition,
+    evaluate_continuation,
+)
 from app.core.paths import (
     get_db_path,
     get_runtime_dir,
@@ -79,10 +91,16 @@ class ReviewReport:
     finding_statuses: list[FindingStatus] = field(default_factory=list)
     resolved_findings: list[StoredFinding] = field(default_factory=list)
     unverified_findings: list[StoredFinding] = field(default_factory=list)
+    likely_fixed_findings: list[StoredFinding] = field(default_factory=list)
     is_incremental: bool = False
     previous_sha: str | None = None
     inferred_focus: str = ''
     metrics: dict[str, object] = field(default_factory=dict)
+    # Decoupled round-plan / disposition / continuation contracts
+    raw_verdict: ReviewVerdict | None = None
+    round_plan: RoundPlan | None = None
+    disposition: RoundDisposition | None = None
+    continuation: ContinuationDecision | None = None
 
 
 class ReviewEngine:
@@ -480,40 +498,27 @@ class ReviewEngine:
         max_rounds: int = 1,
         timeout_sec: float = 600,
         incremental: bool = True,
+        continuation_policy: str = 'stop_on_aggregate_clear',
     ) -> ReviewReport:
-        """One-shot review: create task → execute → return structured result.
-
-        Args:
-            repo_path: Path to local git repository.
-            pr_url: GitHub PR URL (optional). If omitted, reviews local diff.
-            base: Base branch for local-diff mode (default: auto-detect main/master).
-            review_focus: What to focus the review on.
-            context: Optional dict with intent, requirements, constraints.
-            max_rounds: Maximum review rounds (default 1).
-            timeout_sec: Per-round timeout in seconds.
-            incremental: Use incremental review (skip already-reviewed code). Default True.
-
-        Returns:
-            ReviewReport with verdict, findings, and metadata.
-        """
+        """One-shot review: freeze RoundPlan → execute → reconcile disposition → evaluate continuation."""
         start_time = time.time()
         repo = Path(repo_path).resolve()
         resolved = self._resolve_review_config(str(repo))
         self.backend_name = str(resolved['backend'])
         self.model = resolved['model']
 
-        # --- Incremental: detect last reviewed SHA & prior open findings ---
-        # SQLite is the sole source of truth; legacy `<repo>/.amc/reviews/` is
-        # only read (never written) when SQLite has no prior local_diff review
-        # for this repository.
+        # --- Step 1: Plan baseline explicitly before task creation ---
+        candidate_base = base
         previous_sha: str | None = None
         previous_findings: list[StoredFinding] = []
         is_incremental = False
+        base_reason = 'pull_request' if pr_url else ('explicit_base' if base else 'auto_detected_branch')
         if incremental and not pr_url:
             previous_sha, previous_findings = self._load_prior_local_state(repo)
             if previous_sha:
                 is_incremental = True
                 base = previous_sha
+                base_reason = 'incremental_prior_baseline'
 
         # --- Context auto-inference ---
         inferred_focus = review_focus
@@ -536,7 +541,30 @@ class ReviewEngine:
                 error={'code': 'create_failed', 'message': str(exc), 'recoverable': False},
             )
 
+        # Freeze immutable RoundPlan BEFORE dispatching any review round (breaks 1 <-> 5).
+        round_plan = RoundPlan(
+            candidate_base=candidate_base,
+            selected_base=task.pr_base_ref or base,
+            base_reason=base_reason,
+            target_revision=task.local_snapshot_sha or task.pr_head_sha,
+            changed_files=tuple(task.review_paths),
+            selected_backend=self.backend_name,
+            selection_reason='explicit' if self._explicit_backend else 'configured_default',
+            incremental_active=is_incremental,
+            prior_baseline_sha=previous_sha,
+            prior_finding_count=len(previous_findings),
+        )
+        self._engine.append_event(
+            task_id=task.id,
+            kind='review.plan_frozen',
+            payload=round_plan.to_dict(),
+        )
+
         rounds_executed = 0
+        result: ReviewResult | None = None
+        disposition: RoundDisposition | None = None
+        continuation: ContinuationDecision | None = None
+
         for round_idx in range(max_rounds):
             try:
                 self.start_review(task.id)
@@ -551,6 +579,7 @@ class ReviewEngine:
                     rounds_executed=rounds_executed,
                     duration_sec=time.time() - start_time,
                     error={'code': 'timeout', 'message': f'Round {round_idx + 1} timed out after {timeout_sec}s', 'recoverable': True},
+                    round_plan=round_plan,
                 )
             except Exception as exc:
                 return ReviewReport(
@@ -560,15 +589,39 @@ class ReviewEngine:
                     rounds_executed=rounds_executed,
                     duration_sec=time.time() - start_time,
                     error={'code': 'execution_error', 'message': str(exc), 'recoverable': False},
+                    round_plan=round_plan,
                 )
 
-            # Check result
+            # Separate raw round verdict -> reconciled disposition -> explicit continuation (breaks 4 <-> 6).
             result = self.get_result(task.id)
-            if result and result.verdict == ReviewVerdict.CLEAR:
-                break  # Passed, no more rounds needed
+            if result is None:
+                break
+
+            target_rev = (task.local_snapshot_sha or task.pr_head_sha) if task else round_plan.target_revision
+            diff_state = (
+                diff_modified_ranges(str(repo), previous_sha, target_rev)
+                if (is_incremental and previous_findings and previous_sha and target_rev and previous_sha != target_rev)
+                else None
+            )
+            disposition = compute_round_disposition(
+                result,
+                is_incremental=is_incremental,
+                previous_findings=previous_findings,
+                diff_state=diff_state,
+            )
+            continuation = evaluate_continuation(
+                disposition=disposition,
+                rounds_executed=rounds_executed,
+                max_rounds=max_rounds,
+                has_error=False,
+                policy=continuation_policy,
+            )
+            if not continuation.should_continue:
+                break
 
         # Build final report
-        result = self.get_result(task.id)
+        if result is None:
+            result = self.get_result(task.id)
         if result is None:
             return ReviewReport(
                 task_id=task.id,
@@ -577,53 +630,56 @@ class ReviewEngine:
                 rounds_executed=rounds_executed,
                 duration_sec=time.time() - start_time,
                 error={'code': 'no_result', 'message': 'Review completed but no result extracted', 'recoverable': True},
+                round_plan=round_plan,
             )
 
-        passed = result.verdict == ReviewVerdict.CLEAR
+        if disposition is None:
+            target_rev = (task.local_snapshot_sha or task.pr_head_sha) if task else round_plan.target_revision
+            diff_state = (
+                diff_modified_ranges(str(repo), previous_sha, target_rev)
+                if (is_incremental and previous_findings and previous_sha and target_rev and previous_sha != target_rev)
+                else None
+            )
+            disposition = compute_round_disposition(
+                result,
+                is_incremental=is_incremental,
+                previous_findings=previous_findings,
+                diff_state=diff_state,
+            )
+        if continuation is None:
+            continuation = evaluate_continuation(
+                disposition=disposition,
+                rounds_executed=rounds_executed,
+                max_rounds=max_rounds,
+                has_error=False,
+                policy=continuation_policy,
+            )
+
         latest_runs = self._db.list_runs(task.id)
         latest_run = latest_runs[-1] if latest_runs else None
         metrics: dict[str, object] = dict(latest_run.metrics) if latest_run and latest_run.metrics else {}
 
-        # --- Finding dedup against prior local state (SQLite or read-only legacy import) ---
-        finding_statuses: list[FindingStatus] = []
+        unverified_findings = list(disposition.unverified_findings)
+        likely_fixed_findings = list(disposition.likely_fixed_findings)
+        finding_statuses = list(disposition.all_statuses)
         resolved_findings: list[StoredFinding] = []
-        unverified_findings: list[StoredFinding] = []
-
-        if is_incremental and previous_findings:
-            new_stored = [
-                StoredFinding(
-                    severity=f.severity,
-                    path=f.path or '',
-                    line=f.line,
-                    summary=f.summary,
-                )
-                for f in result.findings
-            ]
-            comparison = self._compare_stored_findings(new_stored, previous_findings)
-            finding_statuses = comparison['new'] + comparison['persistent'] + comparison['unverified']
-            unverified_findings = [fs.finding for fs in comparison['unverified']]
-
-        report_verdict = result.verdict
-        report_passed = passed
-        report_summary = result.summary
-        report_severity_counts = dict(result.severity_counts)
-        for finding in unverified_findings:
-            report_severity_counts[finding.severity] = report_severity_counts.get(finding.severity, 0) + 1
-        if unverified_findings:
-            if result.verdict == ReviewVerdict.CLEAR:
-                report_verdict = ReviewVerdict.CONCERNS
-                report_passed = False
-            report_summary = (
-                f'{report_summary}\n\n{len(unverified_findings)} earlier finding(s) were not covered by this incremental review and remain unverified.'
-            ).strip()
+        report_verdict = disposition.aggregate_verdict
+        report_passed = disposition.passed
+        report_summary = (
+            f'{result.summary}\n\n{disposition.summary_note}'.strip()
+            if disposition.summary_note
+            else result.summary
+        )
+        report_severity_counts = dict(disposition.severity_counts)
         can_continue = not report_passed and rounds_executed < max_rounds
 
-        # Persist final tracked findings (including retained unverified findings)
+        # Persist final tracked findings (including retained unverified & likely_fixed findings)
         # into SQLite as the sole source of truth (never writing `.amc/reviews/`).
         self._persist_sdk_review_state(
             task=task,
             result=result,
             retained_findings=unverified_findings,
+            likely_fixed_findings=likely_fixed_findings,
         )
 
         return ReviewReport(
@@ -640,10 +696,15 @@ class ReviewEngine:
             finding_statuses=finding_statuses,
             resolved_findings=resolved_findings,
             unverified_findings=unverified_findings,
+            likely_fixed_findings=likely_fixed_findings,
             is_incremental=is_incremental,
             previous_sha=previous_sha,
             inferred_focus=inferred_focus,
             metrics=metrics,
+            raw_verdict=disposition.raw_verdict,
+            round_plan=round_plan,
+            disposition=disposition,
+            continuation=continuation,
         )
 
     # ------------------------------------------------------------------
@@ -886,9 +947,10 @@ class ReviewEngine:
             # CLEAR/CONCERNS) run instead of mutable `prev_task.local_snapshot_sha`
             # (which an aborted round's pre-prepare refresh can overwrite).
             prev_sha = prev_task.local_head_sha
+            all_runs = self._db.list_runs(prev_task.id)
             completed_runs = [
                 r
-                for r in self._db.list_runs(prev_task.id)
+                for r in all_runs
                 if r.status == 'completed'
                 and r.review_revision
                 and (
@@ -896,8 +958,12 @@ class ReviewEngine:
                     or r.review_result.verdict in {ReviewVerdict.CLEAR, ReviewVerdict.CONCERNS}
                 )
             ]
+            candidate_sha: str | None = None
             if completed_runs:
                 candidate_sha = completed_runs[-1].review_revision
+            elif not all_runs and prev_task.local_snapshot_sha:
+                candidate_sha = prev_task.local_snapshot_sha
+            if candidate_sha:
                 check = run_text(
                     ['git', 'cat-file', '-e', f'{candidate_sha}^{{commit}}'],
                     cwd=resolved_repo,
@@ -952,6 +1018,7 @@ class ReviewEngine:
         task: Task,
         result: ReviewResult,
         retained_findings: list[StoredFinding],
+        likely_fixed_findings: list[StoredFinding] | None = None,
     ) -> None:
         """Persist task's final ReviewResult and tracked findings into SQLite."""
         with self._db.locked():
@@ -1008,6 +1075,30 @@ class ReviewEngine:
                         last_round=1,
                         status=TrackedFindingStatus.UNVERIFIED,
                         system_status=TrackedFindingStatus.UNVERIFIED,
+                        user_status=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            for idx, fixed in enumerate(likely_fixed_findings or []):
+                fp = compute_fingerprint(fixed.path, '', fixed.summary)
+                if fp in used_fps:
+                    continue
+                used_fps.add(fp)
+                to_save.append(
+                    TrackedFinding(
+                        task_id=task.id,
+                        fingerprint=fp,
+                        category='',
+                        severity=fixed.severity,
+                        path=normalize_finding_path(fixed.path),
+                        line=fixed.line if (fixed.line is not None and fixed.line > 0) else None,
+                        title=fixed.summary,
+                        detail=fixed.summary,
+                        first_round=1,
+                        last_round=1,
+                        status=TrackedFindingStatus.LIKELY_FIXED,
+                        system_status=TrackedFindingStatus.LIKELY_FIXED,
                         user_status=None,
                         created_at=now,
                         updated_at=now,
